@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-core = "0.3.32"
+oneshot = { version = "0.2.1", features = ["async", "std"] }
+pin-project = "1.1.13"
+smol = "2.0.2"
 snafu = "0.9.0"
 tracing = "0.1.44"
 tracing-error = "0.2.1"
