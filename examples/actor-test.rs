@@ -25,11 +25,11 @@ fn setup_tracing() {
 struct Alice;
 impl Actor for Alice {
     const MAIL_BOX_SIZE: usize = 0;
-    async fn enter(&mut self, ctl: &mut Control) {
+    async fn enter(&mut self, ctl: &mut Control<Self>) {
         let bob = ctl.summon(Bob);
         let reply = bob.send(Hej(5)).await.unwrap();
         let reply = reply.await.unwrap();
-        println!("I got {reply}");
+        info!("I got {reply}");
     }
 }
 
@@ -43,7 +43,7 @@ struct Hej(i32);
 impl Receive<Hej> for Bob {
     type Retval = i32;
 
-    async fn receive(&mut self, msg: Hej, _ctl: &mut Control) -> Self::Retval {
+    async fn receive(&mut self, msg: Hej, _ctl: &mut Control<Self>) -> Self::Retval {
         msg.0 * msg.0
     }
 }
