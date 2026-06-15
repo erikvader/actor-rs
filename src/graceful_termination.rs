@@ -94,3 +94,8 @@ impl Drop for GracefulTermination {
         }
     }
 }
+
+pub fn dummy() -> InactiveSignalStream {
+    let (_, rcv) = async_broadcast::broadcast(1);
+    rcv.deactivate()
+}

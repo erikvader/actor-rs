@@ -1,4 +1,5 @@
 pub mod actor;
-mod graceful_termination;
+pub mod graceful_termination;
 mod heart;
+pub mod multi_lock;
 pub mod whatever;

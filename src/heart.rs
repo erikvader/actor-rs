@@ -7,6 +7,7 @@ use smol::{
 
 #[derive(Clone)]
 pub struct Rune {
+    #[allow(dead_code)]
     inner: Sender<()>,
 }
 

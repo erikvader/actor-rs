@@ -1,6 +1,6 @@
 use crate::{
-    graceful_termination::{GracefulTermination, InactiveSignalStream, SignalStream},
-    heart::{self, Rune},
+    graceful_termination::InactiveSignalStream,
+    heart::{self, Heart, Rune},
 };
 use ::smol::{
     LocalExecutor, block_on,
@@ -52,21 +52,29 @@ fn summon<A>(
     ex: Rc<LocalExecutor<'static>>,
     rune: Rune,
     signals: InactiveSignalStream,
-) -> Address<A>
+) -> (Address<A>, RemoteAddress<A>)
 where
     A: Actor + 'static,
 {
-    let (snd, rcv) = if A::MAIL_BOX_SIZE == 0 {
-        channel::unbounded()
+    let ((local_snd, local_rcv), (remote_snd, remote_rcv)) = if A::MAIL_BOX_SIZE == 0 {
+        (channel::unbounded(), channel::unbounded())
     } else {
-        channel::bounded(A::MAIL_BOX_SIZE)
+        (
+            channel::bounded(A::MAIL_BOX_SIZE),
+            channel::bounded(A::MAIL_BOX_SIZE),
+        )
     };
-    let home = Address::new(snd);
+
+    let home = Address::new(local_snd);
+    let remote_home = RemoteAddress::new(remote_snd); // TODO: save this in control as well?
     let ctl2 = Control::new(Rc::downgrade(&ex), rune, home.downgrade(), signals);
 
-    ex.spawn(actor_runner(actor, rcv, ctl2)).detach();
+    // TODO: this doesn't propagate panics, do i want it to? Should the rune get poisoned? Should
+    // something await all Tasks? Send them to the heart and await all of them there?
+    ex.spawn(actor_runner(actor, local_rcv, remote_rcv, ctl2))
+        .detach();
 
-    home
+    (home, remote_home)
 }
 
 impl<A: Actor> Control<A> {
@@ -78,7 +86,7 @@ impl<A: Actor> Control<A> {
             .ex
             .upgrade()
             .expect("the executor is always alive here, it's what is running this function");
-        summon(actor, ex, self.rune.clone(), self.signals.clone())
+        summon(actor, ex, self.rune.clone(), self.signals.clone()).0 // TODO: create a summon_remote
     }
 
     fn new(
@@ -122,12 +130,11 @@ pub trait Receive<T>: Actor {
     async fn receive(&mut self, msg: T, ctl: &mut Control<Self>) -> Self::Retval;
 }
 
+type BoxedFuture<'a, T = ()> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type BoxedRemoteFuture<'a, T = ()> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 trait Deliverable<A: Actor + ?Sized> {
-    fn deliver<'a>(
-        self: Box<Self>,
-        actor: &'a mut A,
-        ctl: &'a mut Control<A>,
-    ) -> Pin<Box<dyn Future<Output = ()> + 'a>>;
+    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a>;
 }
 
 struct Package<T, R> {
@@ -140,11 +147,7 @@ where
     A: Receive<T>,
     T: 'static,
 {
-    fn deliver<'a>(
-        self: Box<Self>,
-        actor: &'a mut A,
-        ctl: &'a mut Control<A>,
-    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a> {
         Box::pin(async move {
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
@@ -153,10 +156,14 @@ where
 }
 
 type ErasedDeliverable<A> = Box<dyn Deliverable<A>>;
+type ErasedRemoteDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 
-// TODO: remote address
 pub struct Address<A: Actor + ?Sized> {
     sender: Sender<ErasedDeliverable<A>>,
+}
+
+pub struct RemoteAddress<A: Actor + ?Sized> {
+    sender: Sender<ErasedRemoteDeliverable<A>>,
 }
 
 pub struct WeakAddress<A: Actor + ?Sized> {
@@ -164,6 +171,14 @@ pub struct WeakAddress<A: Actor + ?Sized> {
 }
 
 impl<A: Actor> Clone for Address<A> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+impl<A: Actor> Clone for RemoteAddress<A> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
@@ -206,6 +221,24 @@ impl<R> Future for Reply<R> {
     }
 }
 
+impl<A: Actor> RemoteAddress<A> {
+    fn new(sender: Sender<ErasedRemoteDeliverable<A>>) -> Self {
+        Self { sender }
+    }
+
+    pub async fn send<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
+    where
+        T: Send + 'static,
+        A: Receive<T>,
+        A::Retval: Send + 'static,
+    {
+        let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
+        let erased = Box::new(Package { msg, returner });
+        self.sender.send(erased).await.map_err(|_| SendError)?;
+        Ok(Reply { recv: ret_rcv })
+    }
+}
+
 impl<A: Actor> Address<A> {
     fn new(sender: Sender<ErasedDeliverable<A>>) -> Self {
         Self { sender }
@@ -239,26 +272,30 @@ impl<A: Actor> WeakAddress<A> {
 // TODO: trace this up
 async fn actor_runner<A: Actor>(
     mut actor: A,
-    rcv: Receiver<ErasedDeliverable<A>>,
+    local_rcv: Receiver<ErasedDeliverable<A>>,
+    remote_rcv: Receiver<ErasedRemoteDeliverable<A>>,
     mut ctl: Control<A>,
 ) {
     actor.enter(&mut ctl).await;
 
     enum Event<A> {
         Delivery(ErasedDeliverable<A>),
+        RemoteDelivery(ErasedRemoteDeliverable<A>),
         Signal,
     }
     let events = ctl
         .signals
         .activate_cloned()
         .map(|_| Event::Signal)
-        .or(rcv.map(Event::Delivery));
+        .or(local_rcv.map(Event::Delivery))
+        .or(remote_rcv.map(Event::RemoteDelivery));
     smol::pin!(events);
 
     while let Some(event) = events.next().await {
         match event {
             Event::Signal => actor.interrupt(&mut ctl).await,
             Event::Delivery(delivery) => delivery.deliver(&mut actor, &mut ctl).await,
+            Event::RemoteDelivery(delivery) => delivery.deliver(&mut actor, &mut ctl).await,
         }
 
         if ctl.state == State::Exiting {
@@ -269,19 +306,100 @@ async fn actor_runner<A: Actor>(
     actor.leave(&mut ctl).await;
 }
 
-// TODO: sub stages
-pub fn stage_play(initial: impl Actor + 'static) {
-    let grace = GracefulTermination::new().expect("this should just work");
-    let ex = Rc::new(LocalExecutor::new());
-    let (heart, rune) = heart::create();
+pub struct Stage {
+    ex: Rc<LocalExecutor<'static>>,
+    heart: Heart,
+    rune: Rune,
+    signal_stream: InactiveSignalStream,
+}
 
-    summon(
-        initial,
-        Rc::clone(&ex),
-        rune,
-        grace.inactive_signal_stream(),
-    );
-    block_on(ex.run(heart));
+impl Stage {
+    pub fn new(signal_stream: InactiveSignalStream) -> Self {
+        let (heart, rune) = heart::create();
+        Self {
+            ex: Rc::new(LocalExecutor::new()),
+            heart,
+            rune,
+            signal_stream,
+        }
+    }
 
-    assert_eq!(Rc::strong_count(&ex), 1);
+    pub fn new_no_signals() -> Self {
+        Self::new(crate::graceful_termination::dummy())
+    }
+
+    pub fn cast<A: Actor + 'static>(&self, actor: A) -> Address<A> {
+        summon(
+            actor,
+            Rc::clone(&self.ex),
+            self.rune.clone(),
+            self.signal_stream.clone(),
+        )
+        .0
+    }
+
+    pub fn cast_remote<A: Actor + 'static>(&self, actor: A) -> RemoteAddress<A> {
+        summon(
+            actor,
+            Rc::clone(&self.ex),
+            self.rune.clone(),
+            self.signal_stream.clone(),
+        )
+        .1
+    }
+
+    pub fn play(self) {
+        fn take_essentials_drop_the_rest(this: Stage) -> (Heart, Rc<LocalExecutor<'static>>) {
+            (this.heart, this.ex)
+        }
+        let (heart, ex) = take_essentials_drop_the_rest(self);
+        block_on(ex.run(heart));
+        assert_eq!(Rc::strong_count(&ex), 1);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    struct Alice;
+    impl Actor for Alice {
+        const MAIL_BOX_SIZE: usize = 16;
+    }
+    impl Receive<i32> for Alice {
+        type Retval = i32;
+
+        async fn receive(&mut self, msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
+            msg * msg
+        }
+    }
+
+    struct Bob {
+        alice: RemoteAddress<Alice>,
+    }
+    impl Actor for Bob {
+        const MAIL_BOX_SIZE: usize = 16;
+        async fn enter(&mut self, _ctl: &mut Control<Self>) {
+            let reply = self.alice.send(5).await.unwrap();
+            let reply = reply.await.unwrap();
+            // BUG: this panic is not propagated to the main thread, so the test is marked as passed
+            // even though it isn't
+            assert_eq!(reply, 25);
+        }
+    }
+
+    #[test]
+    fn test_remote() {
+        let main_stage = Stage::new_no_signals();
+        let alice_adr = main_stage.cast_remote(Alice);
+
+        let t1 = std::thread::spawn(|| {
+            let stage = Stage::new_no_signals();
+            stage.cast(Bob { alice: alice_adr });
+            stage.play();
+        });
+
+        main_stage.play();
+        t1.join().unwrap();
+    }
 }
