@@ -155,6 +155,22 @@ where
     }
 }
 
+struct OneWayTicket<T> {
+    msg: T,
+}
+
+impl<T, A> Deliverable<A> for OneWayTicket<T>
+where
+    A: Receive<T, Retval = ()>,
+    T: 'static,
+{
+    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a> {
+        Box::pin(async move {
+            actor.receive(self.msg, ctl).await;
+        })
+    }
+}
+
 type ErasedDeliverable<A> = Box<dyn Deliverable<A>>;
 type ErasedRemoteDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 
@@ -162,6 +178,7 @@ pub struct Address<A: Actor + ?Sized> {
     sender: Sender<ErasedDeliverable<A>>,
 }
 
+// TODO: create a weak variant?
 pub struct RemoteAddress<A: Actor + ?Sized> {
     sender: Sender<ErasedRemoteDeliverable<A>>,
 }
@@ -256,6 +273,17 @@ impl<A: Actor> Address<A> {
         Ok(Reply { recv: ret_rcv })
     }
 
+    // TODO: create for RemoteAddress as well
+    pub async fn send_oneway<T>(&self, msg: T) -> Result<(), SendError>
+    where
+        T: 'static,
+        A: Receive<T, Retval = ()>,
+    {
+        let erased = Box::new(OneWayTicket { msg });
+        self.sender.send(erased).await.map_err(|_| SendError)?;
+        Ok(())
+    }
+
     pub fn downgrade(&self) -> WeakAddress<A> {
         WeakAddress {
             sender: self.sender.downgrade(),
@@ -283,6 +311,7 @@ async fn actor_runner<A: Actor>(
         RemoteDelivery(ErasedRemoteDeliverable<A>),
         Signal,
     }
+
     let events = ctl
         .signals
         .activate_cloned()
@@ -328,6 +357,7 @@ impl Stage {
         Self::new(crate::graceful_termination::dummy())
     }
 
+    // TODO: take a span as argument and make sure it is always entered?
     pub fn cast<A: Actor + 'static>(&self, actor: A) -> Address<A> {
         summon(
             actor,
