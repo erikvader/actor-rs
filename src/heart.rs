@@ -1,21 +1,18 @@
-use futures_core::{FusedFuture, FusedStream};
+use async_channel as channel;
+use futures_core::{FusedFuture, FusedStream, Stream};
 use pin_project::pin_project;
-use smol::{
-    channel::{self, Receiver, Sender},
-    stream::Stream,
-};
 
 #[derive(Clone)]
 pub struct Rune {
     #[allow(dead_code)]
-    inner: Sender<()>,
+    inner: channel::Sender<()>,
 }
 
 /// insipiration: https://dishonored.fandom.com/wiki/The_Heart
 #[pin_project]
 pub struct Heart {
     #[pin]
-    inner: Receiver<()>,
+    inner: channel::Receiver<()>,
 }
 
 pub fn create() -> (Heart, Rune) {

@@ -21,6 +21,7 @@ fn setup_tracing() {
         .with(ErrorLayer::default())
         .with(filter)
         .init();
+    // TODO: tracing-panic?
 }
 
 struct Alice;

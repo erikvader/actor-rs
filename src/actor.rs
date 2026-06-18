@@ -2,21 +2,17 @@ use crate::{
     graceful_termination::InactiveSignalStream,
     heart::{self, Heart, Rune},
 };
-use ::smol::{
-    LocalExecutor, block_on,
-    channel::{Receiver, Sender},
-    prelude::*,
-    stream::StreamExt,
-};
+use async_channel as channel;
+use async_executor::LocalExecutor;
+use futures_concurrency::future::FutureGroup;
+use futures_core::future::LocalBoxFuture;
+use futures_lite::{future::block_on, prelude::*};
 use pin_project::pin_project;
-use smol::{
-    channel::{self, WeakSender},
-    ready,
-};
 use snafu::prelude::*;
 use std::{
-    pin::Pin,
+    pin::{Pin, pin},
     rc::{Rc, Weak},
+    task::ready,
 };
 
 pub trait Actor {
@@ -130,11 +126,12 @@ pub trait Receive<T>: Actor {
     async fn receive(&mut self, msg: T, ctl: &mut Control<Self>) -> Self::Retval;
 }
 
-type BoxedFuture<'a, T = ()> = Pin<Box<dyn Future<Output = T> + 'a>>;
-type BoxedRemoteFuture<'a, T = ()> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
 trait Deliverable<A: Actor + ?Sized> {
-    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a>;
+    fn deliver<'a>(
+        self: Box<Self>,
+        actor: &'a mut A,
+        ctl: &'a mut Control<A>,
+    ) -> LocalBoxFuture<'a, ()>;
 }
 
 struct Package<T, R> {
@@ -147,7 +144,11 @@ where
     A: Receive<T>,
     T: 'static,
 {
-    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a> {
+    fn deliver<'a>(
+        self: Box<Self>,
+        actor: &'a mut A,
+        ctl: &'a mut Control<A>,
+    ) -> LocalBoxFuture<'a, ()> {
         Box::pin(async move {
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
@@ -164,7 +165,11 @@ where
     A: Receive<T, Retval = ()>,
     T: 'static,
 {
-    fn deliver<'a>(self: Box<Self>, actor: &'a mut A, ctl: &'a mut Control<A>) -> BoxedFuture<'a> {
+    fn deliver<'a>(
+        self: Box<Self>,
+        actor: &'a mut A,
+        ctl: &'a mut Control<A>,
+    ) -> LocalBoxFuture<'a, ()> {
         Box::pin(async move {
             actor.receive(self.msg, ctl).await;
         })
@@ -175,16 +180,16 @@ type ErasedDeliverable<A> = Box<dyn Deliverable<A>>;
 type ErasedRemoteDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 
 pub struct Address<A: Actor + ?Sized> {
-    sender: Sender<ErasedDeliverable<A>>,
+    sender: channel::Sender<ErasedDeliverable<A>>,
 }
 
 // TODO: create a weak variant?
 pub struct RemoteAddress<A: Actor + ?Sized> {
-    sender: Sender<ErasedRemoteDeliverable<A>>,
+    sender: channel::Sender<ErasedRemoteDeliverable<A>>,
 }
 
 pub struct WeakAddress<A: Actor + ?Sized> {
-    sender: WeakSender<ErasedDeliverable<A>>,
+    sender: channel::WeakSender<ErasedDeliverable<A>>,
 }
 
 impl<A: Actor> Clone for Address<A> {
@@ -239,7 +244,7 @@ impl<R> Future for Reply<R> {
 }
 
 impl<A: Actor> RemoteAddress<A> {
-    fn new(sender: Sender<ErasedRemoteDeliverable<A>>) -> Self {
+    fn new(sender: channel::Sender<ErasedRemoteDeliverable<A>>) -> Self {
         Self { sender }
     }
 
@@ -257,7 +262,7 @@ impl<A: Actor> RemoteAddress<A> {
 }
 
 impl<A: Actor> Address<A> {
-    fn new(sender: Sender<ErasedDeliverable<A>>) -> Self {
+    fn new(sender: channel::Sender<ErasedDeliverable<A>>) -> Self {
         Self { sender }
     }
 
@@ -300,8 +305,8 @@ impl<A: Actor> WeakAddress<A> {
 // TODO: trace this up
 async fn actor_runner<A: Actor>(
     mut actor: A,
-    local_rcv: Receiver<ErasedDeliverable<A>>,
-    remote_rcv: Receiver<ErasedRemoteDeliverable<A>>,
+    local_rcv: channel::Receiver<ErasedDeliverable<A>>,
+    remote_rcv: channel::Receiver<ErasedRemoteDeliverable<A>>,
     mut ctl: Control<A>,
 ) {
     actor.enter(&mut ctl).await;
@@ -311,20 +316,25 @@ async fn actor_runner<A: Actor>(
         RemoteDelivery(ErasedRemoteDeliverable<A>),
         Signal,
     }
+    let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
+    let local_stream = local_rcv.map(Event::Delivery);
+    let remote_stream = remote_rcv.map(Event::RemoteDelivery);
+    // TODO: concurrentstream?
+    let mut reply_stream = FutureGroup::<std::future::Ready<Event<A>>>::new();
 
-    let events = ctl
-        .signals
-        .activate_cloned()
-        .map(|_| Event::Signal)
-        .or(local_rcv.map(Event::Delivery))
-        .or(remote_rcv.map(Event::RemoteDelivery));
-    smol::pin!(events);
+    let events = signal_stream;
+    // TODO: race these
+    // .or(local_stream)
+    // .or(remote_stream)
+    // .or(&mut reply_stream);
+    let mut events = pin!(events);
 
-    while let Some(event) = events.next().await {
-        match event {
-            Event::Signal => actor.interrupt(&mut ctl).await,
-            Event::Delivery(delivery) => delivery.deliver(&mut actor, &mut ctl).await,
-            Event::RemoteDelivery(delivery) => delivery.deliver(&mut actor, &mut ctl).await,
+    loop {
+        match events.next().await {
+            Some(Event::Signal) => actor.interrupt(&mut ctl).await,
+            Some(Event::Delivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
+            Some(Event::RemoteDelivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
+            None => break,
         }
 
         if ctl.state == State::Exiting {

@@ -4,15 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-broadcast = "0.7.2"
-futures-core = "0.3.32"
+async-broadcast = { version = "0.7.2", default-features = false }
+async-channel = { version = "2.5.0", default-features = false }
+async-executor = { version = "1.14.0", default-features = false }
+futures-concurrency = { version = "7.7.1", default-features = false, features = ["std"] }
+futures-core = { version = "0.3.32", default-features = false }
+futures-lite = { version = "2.6.1", default-features = false }
 oneshot = { version = "0.2.1", features = ["async", "std"] }
-pin-project = "1.1.13"
-signal-hook = "0.4.4"
-smol = "2.0.2"
-snafu = "0.9.0"
-tracing = "0.1.44"
-tracing-error = "0.2.1"
+pin-project = { version = "1.1.13", default-features = false }
+signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
+snafu = { version = "0.9.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1.44", default-features = false }
+tracing-error = { version = "0.2.1", default-features = false }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"
+
+[patch.crates-io]
+#NOTE: a patched version without buffy StreamExt::or so it's not accidentally used
+futures-lite = {path="../futures-lite"}
