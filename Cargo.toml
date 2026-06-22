@@ -7,9 +7,10 @@ edition = "2024"
 async-broadcast = { version = "0.7.2", default-features = false }
 async-channel = { version = "2.5.0", default-features = false }
 async-executor = { version = "1.14.0", default-features = false }
+async-io = { version = "2.6.0", default-features = false }
 futures-concurrency = { version = "7.7.1", default-features = false, features = ["std"] }
 futures-core = { version = "0.3.32", default-features = false }
-futures-lite = { version = "2.6.1", default-features = false }
+futures-util = { version = "0.3.32", default-features = false }
 oneshot = { version = "0.2.1", features = ["async", "std"] }
 pin-project = { version = "1.1.13", default-features = false }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
@@ -18,8 +19,12 @@ tracing = { version = "0.1.44", default-features = false }
 tracing-error = { version = "0.2.1", default-features = false }
 
 [dev-dependencies]
+futures-test = { version = "0.3.32", default-features = false }
 tracing-subscriber = "0.3.23"
 
 [patch.crates-io]
-#NOTE: a patched version without buffy StreamExt::or so it's not accidentally used
+#NOTE: i dont like this crate: it has bugs like polling depleted streams more than once,
+#it is missing things that should be there, like Fuse not implementing FusedStream. Even
+#though i like the simplified API over futures, i will not use it since its so buggy. For
+#example, the StreamExt::race never terminates.
 futures-lite = {path="../futures-lite"}

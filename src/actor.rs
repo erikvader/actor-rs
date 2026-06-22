@@ -1,12 +1,14 @@
 use crate::{
     graceful_termination::InactiveSignalStream,
     heart::{self, Heart, Rune},
+    stream_utils::{StreamExt as _, YieldPolicy, yield_guard},
 };
 use async_channel as channel;
 use async_executor::LocalExecutor;
-use futures_concurrency::future::FutureGroup;
+use async_io::block_on;
+use futures_concurrency::stream::Merge;
 use futures_core::future::LocalBoxFuture;
-use futures_lite::{future::block_on, prelude::*};
+use futures_util::StreamExt as _;
 use pin_project::pin_project;
 use snafu::prelude::*;
 use std::{
@@ -17,6 +19,7 @@ use std::{
 
 pub trait Actor {
     const MAIL_BOX_SIZE: usize;
+    const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
 
     #[allow(async_fn_in_trait, unused_variables)]
     async fn enter(&mut self, ctl: &mut Control<Self>) {}
@@ -29,10 +32,14 @@ pub trait Actor {
 pub struct Control<A: Actor + ?Sized> {
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
     // pretty much mean all actors can borrow stack data from the main function.
+    // NOTE: weak so the executor can drop itself even if there are actors still alive
     ex: Weak<LocalExecutor<'static>>,
     state: State,
     rune: Rune,
+    // NOTE: weak so the actor doesn't keep itself alive
     home: WeakAddress<A>,
+    // NOTE: being inactive doesn't count towards this channel getting closed, so it won't get
+    // closed on accident by only having inactive receivers
     signals: InactiveSignalStream,
 }
 
@@ -224,7 +231,8 @@ pub struct SendError;
 #[snafu(display("Could not receive reply, actor dead :("))]
 pub struct ReplyError;
 
-#[pin_project(!Unpin)]
+#[must_use = "this does nothing unless polled"]
+#[pin_project]
 pub struct Reply<R> {
     #[pin]
     recv: oneshot::AsyncReceiver<R>,
@@ -316,31 +324,37 @@ async fn actor_runner<A: Actor>(
         RemoteDelivery(ErasedRemoteDeliverable<A>),
         Signal,
     }
-    let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
-    let local_stream = local_rcv.map(Event::Delivery);
-    let remote_stream = remote_rcv.map(Event::RemoteDelivery);
-    // TODO: concurrentstream?
-    let mut reply_stream = FutureGroup::<std::future::Ready<Event<A>>>::new();
+    let mut events = {
+        let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
 
-    let events = signal_stream;
-    // TODO: race these
-    // .or(local_stream)
-    // .or(remote_stream)
-    // .or(&mut reply_stream);
-    let mut events = pin!(events);
+        let local_stream = local_rcv.map(Event::Delivery);
+        let remote_stream = remote_rcv.map(Event::RemoteDelivery);
 
-    loop {
-        match events.next().await {
-            Some(Event::Signal) => actor.interrupt(&mut ctl).await,
-            Some(Event::Delivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
-            Some(Event::RemoteDelivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
-            None => break,
+        let events = (local_stream, remote_stream).merge();
+        let events = events.addon(signal_stream);
+        pin!(events)
+    };
+
+    yield_guard(A::YIELD_POLICY, async |yielder| {
+        loop {
+            match events.as_mut().next().await {
+                Some(Event::Signal) => actor.interrupt(&mut ctl).await,
+                Some(Event::Delivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
+                Some(Event::RemoteDelivery(delivery)) => {
+                    delivery.deliver(&mut actor, &mut ctl).await
+                }
+                None => break,
+            }
+
+            // TODO: how to soft exit? Close directly in the controller probably?
+            if ctl.state == State::Exiting {
+                break;
+            }
+
+            yielder.point().await;
         }
-
-        if ctl.state == State::Exiting {
-            break;
-        }
-    }
+    })
+    .await;
 
     actor.leave(&mut ctl).await;
 }
@@ -423,7 +437,7 @@ mod test {
             let reply = self.alice.send(5).await.unwrap();
             let reply = reply.await.unwrap();
             // BUG: this panic is not propagated to the main thread, so the test is marked as passed
-            // even though it isn't
+            // even if it fails
             assert_eq!(reply, 25);
         }
     }
