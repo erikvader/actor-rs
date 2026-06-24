@@ -29,7 +29,7 @@ impl Actor for Alice {
     const MAIL_BOX_SIZE: usize = 0;
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let bob = ctl.summon(Bob);
-        let reply = bob.send(Hej(5)).await.unwrap();
+        let reply = bob.send_receive(Hej(5)).await.unwrap();
         let reply = reply.await.unwrap();
         info!("I got {reply}");
     }

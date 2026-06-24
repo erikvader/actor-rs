@@ -1,3 +1,4 @@
+// TODO: https://share.gemini.google/H0auw7f0ZqFC
 use crate::{
     graceful_termination::InactiveSignalStream,
     heart::{self, Heart, Rune},
@@ -8,17 +9,18 @@ use async_executor::LocalExecutor;
 use async_io::block_on;
 use futures_concurrency::stream::Merge;
 use futures_core::future::LocalBoxFuture;
-use futures_util::StreamExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use pin_project::pin_project;
 use snafu::prelude::*;
+use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
     pin::{Pin, pin},
     rc::{Rc, Weak},
     task::ready,
 };
 
-pub trait Actor {
-    const MAIL_BOX_SIZE: usize;
+pub trait Actor: Sized + 'static {
+    const MAIL_BOX_SIZE: usize = 0;
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
 
     #[allow(async_fn_in_trait, unused_variables)]
@@ -29,7 +31,11 @@ pub trait Actor {
     async fn interrupt(&mut self, ctl: &mut Control<Self>) {}
 }
 
-pub struct Control<A: Actor + ?Sized> {
+// NOTE: for static assertions
+struct DummyActor;
+impl Actor for DummyActor {}
+
+pub struct Control<A: Actor> {
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
     // pretty much mean all actors can borrow stack data from the main function.
     // NOTE: weak so the executor can drop itself even if there are actors still alive
@@ -50,14 +56,14 @@ enum State {
     Exiting,
 }
 
-fn summon<A>(
+fn summon_raw<A>(
     actor: A,
-    ex: Rc<LocalExecutor<'static>>,
+    ex: Weak<LocalExecutor<'static>>,
     rune: Rune,
     signals: InactiveSignalStream,
-) -> (Address<A>, RemoteAddress<A>)
+) -> (impl Future, Address<A>, RemoteAddress<A>)
 where
-    A: Actor + 'static,
+    A: Actor,
 {
     let ((local_snd, local_rcv), (remote_snd, remote_rcv)) = if A::MAIL_BOX_SIZE == 0 {
         (channel::unbounded(), channel::unbounded())
@@ -70,26 +76,38 @@ where
 
     let home = Address::new(local_snd);
     let remote_home = RemoteAddress::new(remote_snd); // TODO: save this in control as well?
-    let ctl2 = Control::new(Rc::downgrade(&ex), rune, home.downgrade(), signals);
+    let ctl2 = Control::new(ex, rune, home.downgrade(), signals);
 
+    let fut = actor_runner(actor, local_rcv, remote_rcv, ctl2);
+    (fut, home, remote_home)
+}
+
+fn summon_task<A>(
+    actor: A,
+    ex: Rc<LocalExecutor<'static>>,
+    rune: Rune,
+    signal: InactiveSignalStream,
+) -> (Address<A>, RemoteAddress<A>)
+where
+    A: Actor,
+{
+    let (fut, adr, rem_adr) = summon_raw(actor, Rc::downgrade(&ex), rune, signal);
     // TODO: this doesn't propagate panics, do i want it to? Should the rune get poisoned? Should
     // something await all Tasks? Send them to the heart and await all of them there?
-    ex.spawn(actor_runner(actor, local_rcv, remote_rcv, ctl2))
-        .detach();
-
-    (home, remote_home)
+    ex.spawn(fut).detach();
+    (adr, rem_adr)
 }
 
 impl<A: Actor> Control<A> {
     pub fn summon<A2>(&self, actor: A2) -> Address<A2>
     where
-        A2: Actor + 'static,
+        A2: Actor,
     {
         let ex = self
             .ex
             .upgrade()
             .expect("the executor is always alive here, it's what is running this function");
-        summon(actor, ex, self.rune.clone(), self.signals.clone()).0 // TODO: create a summon_remote
+        summon_task(actor, ex, self.rune.clone(), self.signals.clone()).0 // TODO: create a summon_remote
     }
 
     fn new(
@@ -126,6 +144,7 @@ impl<A: Actor> Control<A> {
     }
 }
 
+// NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 pub trait Receive<T>: Actor {
     type Retval;
 
@@ -133,7 +152,7 @@ pub trait Receive<T>: Actor {
     async fn receive(&mut self, msg: T, ctl: &mut Control<Self>) -> Self::Retval;
 }
 
-trait Deliverable<A: Actor + ?Sized> {
+trait Deliverable<A: Actor> {
     fn deliver<'a>(
         self: Box<Self>,
         actor: &'a mut A,
@@ -156,10 +175,11 @@ where
         actor: &'a mut A,
         ctl: &'a mut Control<A>,
     ) -> LocalBoxFuture<'a, ()> {
-        Box::pin(async move {
+        async move {
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
-        })
+        }
+        .boxed_local()
     }
 }
 
@@ -177,25 +197,59 @@ where
         actor: &'a mut A,
         ctl: &'a mut Control<A>,
     ) -> LocalBoxFuture<'a, ()> {
-        Box::pin(async move {
-            actor.receive(self.msg, ctl).await;
-        })
+        actor.receive(self.msg, ctl).boxed_local()
+    }
+}
+
+struct DelayedPackage<T, A: Actor, W> {
+    msg: T,
+    // TODO: will this work as remote?
+    return_address: Address<A>,
+    wrapper: W,
+}
+
+impl<SndMsg, RcvMsg, RcvAct, SndAct, Wrap> Deliverable<RcvAct>
+    for DelayedPackage<SndMsg, SndAct, Wrap>
+where
+    Wrap: FnOnce(RcvAct::Retval) -> RcvMsg + 'static,
+    RcvAct: Receive<SndMsg>,
+    SndAct: Receive<RcvMsg, Retval = ()>,
+    RcvMsg: 'static,
+    SndMsg: 'static,
+{
+    fn deliver<'a>(
+        self: Box<Self>,
+        actor: &'a mut RcvAct,
+        ctl: &'a mut Control<RcvAct>,
+    ) -> LocalBoxFuture<'a, ()> {
+        async move {
+            let ret = actor.receive(self.msg, ctl).await;
+            let ret = (self.wrapper)(ret);
+            // TODO: the return values should probably not be ignored anymore since it's no longer
+            // the plan to normalize dropping the Reply struct
+            let _: Result<_, _> = self.return_address.send_off(ret).await;
+        }
+        .boxed_local()
     }
 }
 
 type ErasedDeliverable<A> = Box<dyn Deliverable<A>>;
 type ErasedRemoteDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 
-pub struct Address<A: Actor + ?Sized> {
+pub struct Address<A: Actor> {
     sender: channel::Sender<ErasedDeliverable<A>>,
 }
 
+assert_not_impl_any!(Address<DummyActor>: Send, Sync);
+
 // TODO: create a weak variant?
-pub struct RemoteAddress<A: Actor + ?Sized> {
+pub struct RemoteAddress<A: Actor> {
     sender: channel::Sender<ErasedRemoteDeliverable<A>>,
 }
 
-pub struct WeakAddress<A: Actor + ?Sized> {
+assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
+
+pub struct WeakAddress<A: Actor> {
     sender: channel::WeakSender<ErasedDeliverable<A>>,
 }
 
@@ -256,11 +310,11 @@ impl<A: Actor> RemoteAddress<A> {
         Self { sender }
     }
 
-    pub async fn send<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
+    pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
     where
         T: Send + 'static,
         A: Receive<T>,
-        A::Retval: Send + 'static,
+        A::Retval: Send,
     {
         let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
         let erased = Box::new(Package { msg, returner });
@@ -274,11 +328,10 @@ impl<A: Actor> Address<A> {
         Self { sender }
     }
 
-    pub async fn send<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
+    pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
     where
         T: 'static,
         A: Receive<T>,
-        A::Retval: 'static,
     {
         let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
         let erased = Box::new(Package { msg, returner });
@@ -287,12 +340,34 @@ impl<A: Actor> Address<A> {
     }
 
     // TODO: create for RemoteAddress as well
-    pub async fn send_oneway<T>(&self, msg: T) -> Result<(), SendError>
+    pub async fn send_off<T>(&self, msg: T) -> Result<(), SendError>
     where
         T: 'static,
         A: Receive<T, Retval = ()>,
     {
         let erased = Box::new(OneWayTicket { msg });
+        self.sender.send(erased).await.map_err(|_| SendError)?;
+        Ok(())
+    }
+
+    // TODO: create for RemoteAddress as well
+    pub async fn send_relay<M, M2, A2>(
+        &self,
+        msg: M,
+        address: Address<A2>,
+        wrapper: impl FnOnce(A::Retval) -> M2 + 'static,
+    ) -> Result<(), SendError>
+    where
+        M: 'static,
+        M2: 'static,
+        A: Receive<M>,
+        A2: Receive<M2, Retval = ()>,
+    {
+        let erased = Box::new(DelayedPackage {
+            msg,
+            return_address: address,
+            wrapper,
+        });
         self.sender.send(erased).await.map_err(|_| SendError)?;
         Ok(())
     }
@@ -382,8 +457,8 @@ impl Stage {
     }
 
     // TODO: take a span as argument and make sure it is always entered?
-    pub fn cast<A: Actor + 'static>(&self, actor: A) -> Address<A> {
-        summon(
+    pub fn cast<A: Actor>(&self, actor: A) -> Address<A> {
+        summon_task(
             actor,
             Rc::clone(&self.ex),
             self.rune.clone(),
@@ -392,8 +467,8 @@ impl Stage {
         .0
     }
 
-    pub fn cast_remote<A: Actor + 'static>(&self, actor: A) -> RemoteAddress<A> {
-        summon(
+    pub fn cast_remote<A: Actor>(&self, actor: A) -> RemoteAddress<A> {
+        summon_task(
             actor,
             Rc::clone(&self.ex),
             self.rune.clone(),
@@ -434,7 +509,7 @@ mod test {
     impl Actor for Bob {
         const MAIL_BOX_SIZE: usize = 16;
         async fn enter(&mut self, _ctl: &mut Control<Self>) {
-            let reply = self.alice.send(5).await.unwrap();
+            let reply = self.alice.send_receive(5).await.unwrap();
             let reply = reply.await.unwrap();
             // BUG: this panic is not propagated to the main thread, so the test is marked as passed
             // even if it fails
