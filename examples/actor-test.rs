@@ -26,7 +26,6 @@ fn setup_tracing() {
 
 struct Alice;
 impl Actor for Alice {
-    const MAIL_BOX_SIZE: usize = 0;
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let bob = ctl.summon(Bob);
         let reply = bob.send_receive(Hej(5)).await.unwrap();
@@ -36,9 +35,7 @@ impl Actor for Alice {
 }
 
 struct Bob;
-impl Actor for Bob {
-    const MAIL_BOX_SIZE: usize = 0;
-}
+impl Actor for Bob {}
 
 struct Hej(i32);
 

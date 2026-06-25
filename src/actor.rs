@@ -1,4 +1,3 @@
-// TODO: https://share.gemini.google/H0auw7f0ZqFC
 use crate::{
     graceful_termination::InactiveSignalStream,
     heart::{self, Heart, Rune},
@@ -7,18 +6,20 @@ use crate::{
 use async_channel as channel;
 use async_executor::LocalExecutor;
 use async_io::block_on;
-use futures_concurrency::stream::Merge;
 use futures_core::future::LocalBoxFuture;
 use futures_util::{FutureExt as _, StreamExt as _};
 use pin_project::pin_project;
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
+    marker::PhantomData,
     pin::{Pin, pin},
     rc::{Rc, Weak},
     task::ready,
 };
 
+// NOTE: this is Sized because that is required when using Self in function arguments
+// NOTE: this is 'static because basically every usage of an Actor requires 'static
 pub trait Actor: Sized + 'static {
     const MAIL_BOX_SIZE: usize = 0;
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
@@ -61,25 +62,22 @@ fn summon_raw<A>(
     ex: Weak<LocalExecutor<'static>>,
     rune: Rune,
     signals: InactiveSignalStream,
-) -> (impl Future, Address<A>, RemoteAddress<A>)
+) -> (impl Future, Address<A>)
 where
     A: Actor,
 {
-    let ((local_snd, local_rcv), (remote_snd, remote_rcv)) = if A::MAIL_BOX_SIZE == 0 {
-        (channel::unbounded(), channel::unbounded())
+    let (local_snd, local_rcv) = if A::MAIL_BOX_SIZE == 0 {
+        channel::unbounded()
     } else {
-        (
-            channel::bounded(A::MAIL_BOX_SIZE),
-            channel::bounded(A::MAIL_BOX_SIZE),
-        )
+        channel::bounded(A::MAIL_BOX_SIZE)
     };
 
-    let home = Address::new(local_snd);
-    let remote_home = RemoteAddress::new(remote_snd); // TODO: save this in control as well?
+    // SAFETY: it's always safe to create a brand new one
+    let home = unsafe { Address::new(local_snd) };
     let ctl2 = Control::new(ex, rune, home.downgrade(), signals);
 
-    let fut = actor_runner(actor, local_rcv, remote_rcv, ctl2);
-    (fut, home, remote_home)
+    let fut = actor_runner(actor, local_rcv, ctl2);
+    (fut, home)
 }
 
 fn summon_task<A>(
@@ -87,15 +85,15 @@ fn summon_task<A>(
     ex: Rc<LocalExecutor<'static>>,
     rune: Rune,
     signal: InactiveSignalStream,
-) -> (Address<A>, RemoteAddress<A>)
+) -> Address<A>
 where
     A: Actor,
 {
-    let (fut, adr, rem_adr) = summon_raw(actor, Rc::downgrade(&ex), rune, signal);
+    let (fut, adr) = summon_raw(actor, Rc::downgrade(&ex), rune, signal);
     // TODO: this doesn't propagate panics, do i want it to? Should the rune get poisoned? Should
     // something await all Tasks? Send them to the heart and await all of them there?
     ex.spawn(fut).detach();
-    (adr, rem_adr)
+    adr
 }
 
 impl<A: Actor> Control<A> {
@@ -107,7 +105,7 @@ impl<A: Actor> Control<A> {
             .ex
             .upgrade()
             .expect("the executor is always alive here, it's what is running this function");
-        summon_task(actor, ex, self.rune.clone(), self.signals.clone()).0 // TODO: create a summon_remote
+        summon_task(actor, ex, self.rune.clone(), self.signals.clone())
     }
 
     fn new(
@@ -127,11 +125,10 @@ impl<A: Actor> Control<A> {
 
     pub fn ask_to_leave(&mut self) {
         self.state = State::Closing;
-        self.home
-            .upgrade()
-            .expect("this will never fail on its own actor")
-            .sender
-            .close();
+        // NOTE: this will only fail if already closed
+        if let Some(adr) = self.home.upgrade() {
+            adr.sender.close();
+        }
     }
 
     pub fn drag_out(&mut self) {
@@ -152,12 +149,191 @@ pub trait Receive<T>: Actor {
     async fn receive(&mut self, msg: T, ctl: &mut Control<Self>) -> Self::Retval;
 }
 
+type ErasedDeliverable<A> = Box<dyn Deliverable<A> + Send>;
+
+mod private {
+    pub trait Sealed {}
+}
+
+pub trait Scope: private::Sealed + 'static {}
+
+pub struct Local(PhantomData<Rc<()>>);
+impl private::Sealed for Local {}
+impl Scope for Local {}
+assert_not_impl_any!(Local: Send, Sync);
+
+pub struct Remote;
+impl private::Sealed for Remote {}
+impl Scope for Remote {}
+assert_impl_all!(Remote: Send, Sync);
+
+pub struct GenericAddress<A: Actor, S: Scope> {
+    sender: channel::Sender<ErasedDeliverable<A>>,
+    _scope: PhantomData<S>,
+}
+
+pub type Address<A> = GenericAddress<A, Local>;
+assert_not_impl_any!(Address<DummyActor>: Send, Sync);
+
+pub type RemoteAddress<A> = GenericAddress<A, Remote>;
+assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
+
+pub struct GenericWeakAddress<A: Actor, S: Scope> {
+    sender: channel::WeakSender<ErasedDeliverable<A>>,
+    _scope: PhantomData<S>,
+}
+
+pub type WeakAddress<A> = GenericWeakAddress<A, Local>;
+assert_not_impl_any!(WeakAddress<DummyActor>: Send, Sync);
+
+pub type RemoteWeakAddress<A> = GenericWeakAddress<A, Remote>;
+assert_impl_all!(RemoteWeakAddress<DummyActor>: Send, Sync);
+
+impl<A: Actor, S: Scope> Clone for GenericAddress<A, S> {
+    fn clone(&self) -> Self {
+        let c = self.sender.clone();
+        // SAFETY: this gets the same scope as the original
+        unsafe { Self::new(c) }
+    }
+}
+
+impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
+    fn clone(&self) -> Self {
+        let c = self.sender.clone();
+        // SAFETY: this gets the same scope as the original
+        unsafe { Self::new(c) }
+    }
+}
+
+impl<A: Actor, S: Scope> GenericAddress<A, S> {
+    unsafe fn new(sender: channel::Sender<ErasedDeliverable<A>>) -> Self {
+        Self {
+            sender,
+            _scope: PhantomData,
+        }
+    }
+
+    pub fn downgrade(&self) -> GenericWeakAddress<A, S> {
+        let c = self.sender.downgrade();
+        // SAFETY: this gets the same scope as the original
+        unsafe { GenericWeakAddress::new(c) }
+    }
+}
+
+impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
+    unsafe fn new(sender: channel::WeakSender<ErasedDeliverable<A>>) -> Self {
+        Self {
+            sender,
+            _scope: PhantomData,
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<GenericAddress<A, S>> {
+        self.sender
+            .upgrade()
+            // SAFETY: this gets the same scope as the original
+            .map(|sender| unsafe { GenericAddress::new(sender) })
+    }
+}
+
+impl<A: Actor> Address<A> {
+    pub fn remote(&self) -> RemoteAddress<A> {
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way around
+        let c = self.sender.clone();
+        unsafe { RemoteAddress::new(c) }
+    }
+}
+
+impl<A: Actor> WeakAddress<A> {
+    pub fn remote(&self) -> RemoteWeakAddress<A> {
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way around
+        let c = self.sender.clone();
+        unsafe { RemoteWeakAddress::new(c) }
+    }
+}
+
+#[allow(
+    private_bounds,
+    reason = "CanSendImpl and all types it is using should be private"
+)]
+pub trait CanSend<A, T>: CanSendPriv<A, T> {}
+impl<A, T, X> CanSend<A, T> for X where X: CanSendPriv<A, T> {}
+
+trait CanSendPriv<A, T>: Scope {
+    fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A>
+    where
+        A: Receive<T>;
+    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
+    where
+        A: Receive<T, Retval = ()>;
+}
+
+impl<A, T> CanSendPriv<A, T> for Remote
+where
+    T: Send + 'static,
+    A: Receive<T>,
+    A::Retval: Send,
+{
+    fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A> {
+        Box::new(p)
+    }
+
+    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
+    where
+        A: Receive<T, Retval = ()>,
+    {
+        Box::new(t)
+    }
+}
+
+impl<A, T> CanSendPriv<A, T> for Local
+where
+    A: Receive<T>,
+    T: 'static,
+{
+    fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A> {
+        Box::new(UnsafeSendWrapper(p))
+    }
+
+    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
+    where
+        A: Receive<T, Retval = ()>,
+    {
+        Box::new(UnsafeSendWrapper(t))
+    }
+}
+
 trait Deliverable<A: Actor> {
     fn deliver<'a>(
         self: Box<Self>,
         actor: &'a mut A,
         ctl: &'a mut Control<A>,
     ) -> LocalBoxFuture<'a, ()>;
+}
+
+#[repr(transparent)]
+struct UnsafeSendWrapper<D>(D);
+// SAFETY: one of these can only be sent by a local address, which means the sender has never left
+// the current thread, which means it's safe to send non-send data on it.
+unsafe impl<D> Send for UnsafeSendWrapper<D> {}
+
+impl<A, D> Deliverable<A> for UnsafeSendWrapper<D>
+where
+    A: Actor,
+    D: Deliverable<A>,
+{
+    fn deliver<'a>(
+        self: Box<Self>,
+        actor: &'a mut A,
+        ctl: &'a mut Control<A>,
+    ) -> LocalBoxFuture<'a, ()> {
+        let raw = Box::into_raw(self);
+        let inner_raw = raw as *mut D;
+        // SAFETY: the wrapper is repr(transparent), so its guaranteed to have the same size and
+        // alignment, making this cast safe.
+        let inner_box = unsafe { Box::from_raw(inner_raw) };
+        inner_box.deliver(actor, ctl)
+    }
 }
 
 struct Package<T, R> {
@@ -201,82 +377,6 @@ where
     }
 }
 
-struct DelayedPackage<T, A: Actor, W> {
-    msg: T,
-    // TODO: will this work as remote?
-    return_address: Address<A>,
-    wrapper: W,
-}
-
-impl<SndMsg, RcvMsg, RcvAct, SndAct, Wrap> Deliverable<RcvAct>
-    for DelayedPackage<SndMsg, SndAct, Wrap>
-where
-    Wrap: FnOnce(RcvAct::Retval) -> RcvMsg + 'static,
-    RcvAct: Receive<SndMsg>,
-    SndAct: Receive<RcvMsg, Retval = ()>,
-    RcvMsg: 'static,
-    SndMsg: 'static,
-{
-    fn deliver<'a>(
-        self: Box<Self>,
-        actor: &'a mut RcvAct,
-        ctl: &'a mut Control<RcvAct>,
-    ) -> LocalBoxFuture<'a, ()> {
-        async move {
-            let ret = actor.receive(self.msg, ctl).await;
-            let ret = (self.wrapper)(ret);
-            // TODO: the return values should probably not be ignored anymore since it's no longer
-            // the plan to normalize dropping the Reply struct
-            let _: Result<_, _> = self.return_address.send_off(ret).await;
-        }
-        .boxed_local()
-    }
-}
-
-type ErasedDeliverable<A> = Box<dyn Deliverable<A>>;
-type ErasedRemoteDeliverable<A> = Box<dyn Deliverable<A> + Send>;
-
-pub struct Address<A: Actor> {
-    sender: channel::Sender<ErasedDeliverable<A>>,
-}
-
-assert_not_impl_any!(Address<DummyActor>: Send, Sync);
-
-// TODO: create a weak variant?
-pub struct RemoteAddress<A: Actor> {
-    sender: channel::Sender<ErasedRemoteDeliverable<A>>,
-}
-
-assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
-
-pub struct WeakAddress<A: Actor> {
-    sender: channel::WeakSender<ErasedDeliverable<A>>,
-}
-
-impl<A: Actor> Clone for Address<A> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
-}
-
-impl<A: Actor> Clone for RemoteAddress<A> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
-}
-
-impl<A: Actor> Clone for WeakAddress<A> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Snafu)]
 #[snafu(display("Could not send message, actor dead :("))]
 pub struct SendError;
@@ -305,108 +405,50 @@ impl<R> Future for Reply<R> {
     }
 }
 
-impl<A: Actor> RemoteAddress<A> {
-    fn new(sender: channel::Sender<ErasedRemoteDeliverable<A>>) -> Self {
-        Self { sender }
-    }
-
-    pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
-    where
-        T: Send + 'static,
-        A: Receive<T>,
-        A::Retval: Send,
-    {
-        let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
-        let erased = Box::new(Package { msg, returner });
-        self.sender.send(erased).await.map_err(|_| SendError)?;
-        Ok(Reply { recv: ret_rcv })
-    }
-}
-
-impl<A: Actor> Address<A> {
-    fn new(sender: channel::Sender<ErasedDeliverable<A>>) -> Self {
-        Self { sender }
-    }
-
+impl<A: Actor, S: Scope> GenericAddress<A, S> {
     pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
     where
         T: 'static,
         A: Receive<T>,
+        S: CanSend<A, T>,
     {
         let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
-        let erased = Box::new(Package { msg, returner });
+        let package = Package { msg, returner };
+        let erased = S::erase_package(package);
         self.sender.send(erased).await.map_err(|_| SendError)?;
         Ok(Reply { recv: ret_rcv })
     }
 
-    // TODO: create for RemoteAddress as well
-    pub async fn send_off<T>(&self, msg: T) -> Result<(), SendError>
+    pub async fn send<T>(&self, msg: T) -> Result<(), SendError>
     where
         T: 'static,
         A: Receive<T, Retval = ()>,
+        S: CanSend<A, T>,
     {
-        let erased = Box::new(OneWayTicket { msg });
+        let ticket = OneWayTicket { msg };
+        let erased = S::erase_ticket(ticket);
         self.sender.send(erased).await.map_err(|_| SendError)?;
         Ok(())
-    }
-
-    // TODO: create for RemoteAddress as well
-    pub async fn send_relay<M, M2, A2>(
-        &self,
-        msg: M,
-        address: Address<A2>,
-        wrapper: impl FnOnce(A::Retval) -> M2 + 'static,
-    ) -> Result<(), SendError>
-    where
-        M: 'static,
-        M2: 'static,
-        A: Receive<M>,
-        A2: Receive<M2, Retval = ()>,
-    {
-        let erased = Box::new(DelayedPackage {
-            msg,
-            return_address: address,
-            wrapper,
-        });
-        self.sender.send(erased).await.map_err(|_| SendError)?;
-        Ok(())
-    }
-
-    pub fn downgrade(&self) -> WeakAddress<A> {
-        WeakAddress {
-            sender: self.sender.downgrade(),
-        }
-    }
-}
-
-impl<A: Actor> WeakAddress<A> {
-    pub fn upgrade(&self) -> Option<Address<A>> {
-        self.sender.upgrade().map(|sender| Address::new(sender))
     }
 }
 
 // TODO: trace this up
 async fn actor_runner<A: Actor>(
     mut actor: A,
-    local_rcv: channel::Receiver<ErasedDeliverable<A>>,
-    remote_rcv: channel::Receiver<ErasedRemoteDeliverable<A>>,
+    rcv: channel::Receiver<ErasedDeliverable<A>>,
     mut ctl: Control<A>,
 ) {
     actor.enter(&mut ctl).await;
 
     enum Event<A> {
         Delivery(ErasedDeliverable<A>),
-        RemoteDelivery(ErasedRemoteDeliverable<A>),
         Signal,
     }
     let mut events = {
         let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
 
-        let local_stream = local_rcv.map(Event::Delivery);
-        let remote_stream = remote_rcv.map(Event::RemoteDelivery);
-
-        let events = (local_stream, remote_stream).merge();
-        let events = events.addon(signal_stream);
+        let delivery_stream = rcv.map(Event::Delivery);
+        let events = delivery_stream.addon(signal_stream);
         pin!(events)
     };
 
@@ -415,13 +457,9 @@ async fn actor_runner<A: Actor>(
             match events.as_mut().next().await {
                 Some(Event::Signal) => actor.interrupt(&mut ctl).await,
                 Some(Event::Delivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
-                Some(Event::RemoteDelivery(delivery)) => {
-                    delivery.deliver(&mut actor, &mut ctl).await
-                }
                 None => break,
             }
 
-            // TODO: how to soft exit? Close directly in the controller probably?
             if ctl.state == State::Exiting {
                 break;
             }
@@ -464,17 +502,6 @@ impl Stage {
             self.rune.clone(),
             self.signal_stream.clone(),
         )
-        .0
-    }
-
-    pub fn cast_remote<A: Actor>(&self, actor: A) -> RemoteAddress<A> {
-        summon_task(
-            actor,
-            Rc::clone(&self.ex),
-            self.rune.clone(),
-            self.signal_stream.clone(),
-        )
-        .1
     }
 
     pub fn play(self) {
@@ -492,9 +519,7 @@ mod test {
     use super::*;
 
     struct Alice;
-    impl Actor for Alice {
-        const MAIL_BOX_SIZE: usize = 16;
-    }
+    impl Actor for Alice {}
     impl Receive<i32> for Alice {
         type Retval = i32;
 
@@ -507,7 +532,6 @@ mod test {
         alice: RemoteAddress<Alice>,
     }
     impl Actor for Bob {
-        const MAIL_BOX_SIZE: usize = 16;
         async fn enter(&mut self, _ctl: &mut Control<Self>) {
             let reply = self.alice.send_receive(5).await.unwrap();
             let reply = reply.await.unwrap();
@@ -520,12 +544,15 @@ mod test {
     #[test]
     fn test_remote() {
         let main_stage = Stage::new_no_signals();
-        let alice_adr = main_stage.cast_remote(Alice);
+        let alice_adr = main_stage.cast(Alice);
 
-        let t1 = std::thread::spawn(|| {
-            let stage = Stage::new_no_signals();
-            stage.cast(Bob { alice: alice_adr });
-            stage.play();
+        let t1 = std::thread::spawn({
+            let alice_adr = alice_adr.remote();
+            || {
+                let stage = Stage::new_no_signals();
+                stage.cast(Bob { alice: alice_adr });
+                stage.play();
+            }
         });
 
         main_stage.play();
