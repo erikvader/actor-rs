@@ -50,7 +50,6 @@ pub trait Actor: Sized + 'static {
 struct DummyActor;
 impl Actor for DummyActor {}
 
-// TODO: create a function to spawn tasks and save them in a futuregroup
 pub struct Control<A: Actor> {
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
     // pretty much mean all actors can borrow stack data from the main function.
@@ -159,10 +158,21 @@ impl<A: Actor> Control<A> {
         self.state = State::HardExiting;
     }
 
-    // NOTE: this is returning the weak one since this actor could be in soft exit state, in which
-    // case it's not possible to get a non-weak address.
-    pub fn address(&self) -> WeakAddress<A> {
+    pub fn weak_address(&self) -> WeakAddress<A> {
         self.home.clone()
+    }
+
+    pub fn address(&self) -> Result<Address<A>, WeAreExiting> {
+        match self.home.upgrade() {
+            Some(x) => Ok(x),
+            None => {
+                assert!(
+                    self.is_exiting(),
+                    "i's an error if this fails while running"
+                );
+                Err(WeAreExiting)
+            }
+        }
     }
 
     pub fn is_exiting(&self) -> bool {
@@ -196,6 +206,10 @@ impl<A: Actor> Control<A> {
         self.new_tasks.push(task);
     }
 }
+
+#[derive(Debug, Snafu)]
+#[snafu(display("This can't be done if we are exiting"))]
+pub struct WeAreExiting;
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 pub trait Receive<T>: Actor {
@@ -324,7 +338,7 @@ trait CanSendPriv<A, T>: Scope {
         A: Receive<T>;
     fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
     where
-        A: Receive<T, Retval = ()>;
+        A: Receive<T>;
 }
 
 impl<A, T> CanSendPriv<A, T> for Remote
@@ -339,7 +353,7 @@ where
 
     fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
     where
-        A: Receive<T, Retval = ()>,
+        A: Receive<T>,
     {
         Box::new(t)
     }
@@ -356,7 +370,7 @@ where
 
     fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
     where
-        A: Receive<T, Retval = ()>,
+        A: Receive<T>,
     {
         Box::new(UnsafeSendWrapper(t))
     }
@@ -424,7 +438,7 @@ struct OneWayTicket<T> {
 
 impl<T, A> Deliverable<A> for OneWayTicket<T>
 where
-    A: Receive<T, Retval = ()>,
+    A: Receive<T>,
     T: 'static,
 {
     fn deliver<'a>(
@@ -432,7 +446,10 @@ where
         actor: &'a mut A,
         ctl: &'a mut Control<A>,
     ) -> LocalBoxFuture<'a, ()> {
-        actor.receive(self.msg, ctl).boxed_local()
+        async move {
+            let _ret = actor.receive(self.msg, ctl).await;
+        }
+        .boxed_local()
     }
 }
 
@@ -481,7 +498,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     pub async fn send<T>(&self, msg: T) -> Result<(), SendError>
     where
         T: 'static,
-        A: Receive<T, Retval = ()>,
+        A: Receive<T>,
         S: CanSend<A, T>,
     {
         let ticket = OneWayTicket { msg };
@@ -489,12 +506,32 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         self.sender.send(erased).await.map_err(|_| SendError)?;
         Ok(())
     }
+
+    pub fn erase<T>(&self) -> ErasedAddress<T>
+    where
+        T: 'static,
+        A: Receive<T>,
+        S: CanSend<A, T>,
+    {
+        let cloned = self.clone();
+        ErasedAddress {
+            thunk: Box::new(move |msg| {
+                let cloned = cloned.clone();
+                async move { cloned.send(msg).await }.boxed_local()
+            }),
+        }
+    }
 }
 
-// TODO:
-// pub struct Accepts<T, S: Scope> {
-//     address: Box<dyn CanReceive<T>>,
-// }
+pub struct ErasedAddress<T> {
+    thunk: Box<dyn Fn(T) -> LocalBoxFuture<'static, Result<(), SendError>>>,
+}
+
+impl<T> ErasedAddress<T> {
+    pub async fn send(&self, msg: T) -> Result<(), SendError> {
+        (self.thunk)(msg).await
+    }
+}
 
 // TODO: trace this up
 async fn actor_runner<A: Actor>(
