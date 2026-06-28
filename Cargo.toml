@@ -5,10 +5,10 @@ edition = "2024"
 
 [dependencies]
 async-broadcast = { version = "0.7.2", default-features = false }
-async-channel = { version = "2.5.0", default-features = false }
+async-channel = "2.5.0"
 async-executor = { version = "1.14.0", default-features = false }
 async-io = { version = "2.6.0", default-features = false }
-#TODO: remove and use futuresunordered instead? Use this in the bin later on?
+blocking = { version = "1.6.2", default-features = false }
 futures-concurrency = { version = "7.7.1", default-features = false, features = ["std"] }
 futures-core = { version = "0.3.32", default-features = false }
 futures-util = { version = "0.3.32", default-features = false, features = ["alloc"] }

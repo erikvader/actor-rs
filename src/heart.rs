@@ -4,20 +4,34 @@ use pin_project::pin_project;
 
 #[derive(Clone)]
 pub struct Rune {
-    #[allow(dead_code)]
     inner: channel::Sender<()>,
+}
+
+impl Rune {
+    #[expect(dead_code, reason = "not used yet")]
+    pub fn kill_heart(&self) {
+        self.inner.close();
+    }
 }
 
 /// insipiration: https://dishonored.fandom.com/wiki/The_Heart
 #[pin_project]
+#[derive(Clone)]
 pub struct Heart {
     #[pin]
     inner: channel::Receiver<()>,
 }
 
-pub fn create() -> (Heart, Rune) {
-    let (s, r) = channel::bounded(1);
-    (Heart { inner: r }, Rune { inner: s })
+impl Heart {
+    pub fn is_dead(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub fn await_blocking(&self) {
+        if self.inner.recv_blocking().is_ok() {
+            panic!("this is not supposed to happen, nothing will ever be sent here")
+        }
+    }
 }
 
 impl Future for Heart {
@@ -45,4 +59,10 @@ impl FusedFuture for Heart {
     fn is_terminated(&self) -> bool {
         self.inner.is_terminated()
     }
+}
+
+pub fn create() -> (Heart, Rune) {
+    // NOTE: i'm hoping that an unbounded channel takes less space than a bounded(1)
+    let (s, r) = channel::unbounded();
+    (Heart { inner: r }, Rune { inner: s })
 }
