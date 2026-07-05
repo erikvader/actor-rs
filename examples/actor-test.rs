@@ -12,6 +12,9 @@ fn setup_tracing() {
     use tracing_subscriber::prelude::*;
 
     // TODO: detect ansi color support like anstream::auto() and set with with_ansi
+    // https://docs.rs/anstream/latest/anstream/struct.AutoStream.html#method.choice
+    // I guess this should look at the global value and let clap or something set that global when
+    // appropriate flags or config are given
     let fmt = tracing_subscriber::fmt::layer().pretty();
 
     let filter = Targets::new().with_default(LevelFilter::TRACE);
@@ -52,7 +55,7 @@ fn main() -> Result<(), Whatever> {
     setup_tracing();
     let grace = GracefulTermination::new().expect("this should just work");
     let stage = Stage::new(grace.inactive_signal_stream());
-    stage.cast(Alice);
+    stage.summon(Alice);
     stage.play();
     Ok(())
 }
