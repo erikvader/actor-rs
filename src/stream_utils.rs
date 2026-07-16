@@ -41,6 +41,14 @@ impl<S, F> WithFutures<S, F> {
     pub fn mut_pin_group(self: Pin<&mut Self>) -> Pin<&mut FutureGroup<F>> {
         self.project().group
     }
+
+    pub fn ref_pin_group(self: Pin<&Self>) -> Pin<&FutureGroup<F>> {
+        self.project_ref().group
+    }
+
+    pub fn ref_pin_me(self: Pin<&Self>) -> Pin<&S> {
+        self.project_ref().stream
+    }
 }
 
 impl<S, F> Stream for WithFutures<S, F>
@@ -109,9 +117,18 @@ pub struct Addon<A, M> {
     me: M,
 }
 
-impl<S, R> Addon<S, R> {
+impl<A, R> Addon<A, R> {
     pub fn mut_pin_me(self: Pin<&mut Self>) -> Pin<&mut R> {
         self.project().me
+    }
+
+    pub fn ref_pin_me(self: Pin<&Self>) -> Pin<&R> {
+        self.project_ref().me
+    }
+
+    // TODO: do these read-only ones really need to be pin?
+    pub fn ref_pin_addon(self: Pin<&Self>) -> Pin<&A> {
+        self.project_ref().addon
     }
 }
 

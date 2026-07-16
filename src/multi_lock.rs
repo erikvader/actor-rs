@@ -1,5 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Useful tool to let multiple threads initialize their own actors and share their addresses
+/// amongst them.
 pub struct MultiLock<T> {
     inner: Arc<(Condvar, Mutex<(usize, T)>)>,
 }
@@ -11,7 +13,7 @@ impl<T> MultiLock<T> {
         }
     }
 
-    pub fn set_map<R>(self, setter: impl FnOnce(&mut T), mapper: impl FnOnce(&T) -> R) -> R {
+    pub fn share<R>(self, setter: impl FnOnce(&mut T), mapper: impl FnOnce(&T) -> R) -> R {
         let (condis, mutis) = &*self.inner;
         let mut guard = mutis.lock().unwrap();
         guard.0 += 1;
@@ -49,11 +51,11 @@ mod test {
             let multi = MultiLock::new(Data { data1: 0, data2: 0 });
             let multi2 = multi.clone();
             s.spawn(move || {
-                let data2 = multi2.set_map(|data| data.data1 = 5, |data| data.data2);
+                let data2 = multi2.share(|data| data.data1 = 5, |data| data.data2);
                 assert_eq!(data2, 7);
             });
             s.spawn(|| {
-                let data1 = multi.set_map(|data| data.data2 = 7, |data| data.data1);
+                let data1 = multi.share(|data| data.data2 = 7, |data| data.data1);
                 assert_eq!(data1, 5);
             });
         });

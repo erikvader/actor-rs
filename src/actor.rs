@@ -1,11 +1,11 @@
 use crate::{
     actor::unsafe_wrapper::UnsafeSendWrapper,
     graceful_termination::InactiveSignalStream,
-    heart::{self, Heart, Rune},
+    heart::{self, Heart, PanicError, Rune},
     stream_utils::{StreamExt as _, YieldPolicy, yield_guard},
 };
 use async_channel as channel;
-use async_executor::{LocalExecutor, Task};
+use async_executor::{FallibleTask, LocalExecutor};
 use async_io::block_on;
 use futures_core::future::LocalBoxFuture;
 use futures_util::{FutureExt as _, StreamExt as _};
@@ -17,14 +17,20 @@ use std::{
     marker::PhantomData,
     pin::{Pin, pin},
     rc::{Rc, Weak},
+    sync::{Arc, atomic::AtomicU64},
     task::ready,
 };
+use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, warn};
 
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
 pub trait Actor: Sized + 'static {
     const MAIL_BOX_SIZE: usize = 0;
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
+
+    fn span(&self, parent: Span) -> Span {
+        parent
+    }
 
     #[expect(
         async_fn_in_trait,
@@ -45,7 +51,9 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn interrupt(&mut self, ctl: &mut Control<Self>) {}
+    async fn interrupt(&mut self, ctl: &mut Control<Self>) {
+        warn!("Ignoring an interrupt");
+    }
 
     #[expect(
         async_fn_in_trait,
@@ -53,7 +61,11 @@ pub trait Actor: Sized + 'static {
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
     // TODO: associate each task with a key or something? Theres no way to know which task was done
-    async fn task_done(&mut self, ctl: &mut Control<Self>) {}
+    async fn task_done(&mut self, ctl: &mut Control<Self>, panicked: bool) {
+        if panicked {
+            panic!("A background task panicked");
+        }
+    }
 }
 
 // NOTE: for static assertions
@@ -72,9 +84,11 @@ pub struct Control<A: Actor> {
     // NOTE: being inactive doesn't count towards this channel getting closed, so it won't get
     // closed on accident by only having inactive receivers
     signals: InactiveSignalStream,
-    new_tasks: Vec<Task<()>>,
+    new_tasks: Vec<FallibleTask<()>>,
     task_heart: Heart,
     task_rune: Rune,
+    idgen: IdGenerator,
+    thread_root_span: Span,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,16 +98,40 @@ enum State {
     HardExiting,
 }
 
+pub type Id = u64;
+
+#[derive(Clone)]
+struct IdGenerator {
+    counter: Arc<AtomicU64>,
+}
+
+impl IdGenerator {
+    fn new() -> Self {
+        Self {
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn generate(&self) -> Id {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+type AdrSnd<A> = channel::Sender<ErasedDeliverable<A>>;
+type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
+
 #[derive(Clone)]
 struct ActorBuilder<A: Actor> {
     actor: A,
     ex: Rc<LocalExecutor<'static>>,
     rune: Rune,
     signals: InactiveSignalStream,
+    idgen: IdGenerator,
+    thread_root_span: Span,
 }
 
-type AdrSnd<A> = channel::Sender<ErasedDeliverable<A>>;
-type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
+const GROUP_KEY: &str = "group";
 
 impl<A: Actor> ActorBuilder<A> {
     fn new(
@@ -101,12 +139,16 @@ impl<A: Actor> ActorBuilder<A> {
         ex: Rc<LocalExecutor<'static>>,
         rune: Rune,
         signals: InactiveSignalStream,
+        idgen: IdGenerator,
+        thread_root_span: Span,
     ) -> Self {
         Self {
             actor,
             ex,
             rune,
             signals,
+            idgen,
+            thread_root_span,
         }
     }
 
@@ -118,27 +160,58 @@ impl<A: Actor> ActorBuilder<A> {
         }
     }
 
-    fn raw(self, (snd, rcv): (AdrSnd<A>, AdrRcv<A>)) -> (impl Future, Address<A>) {
+    fn create_root_span(id: Id, parent: Span) -> Span {
+        // TODO: should i prefix all of these with actor. to namespace them?
+        span!(parent: parent, Level::DEBUG, "actor", id = id, {GROUP_KEY} = field::Empty, "type" = std::any::type_name::<A>())
+    }
+
+    fn raw(
+        self,
+        (snd, rcv): (AdrSnd<A>, AdrRcv<A>),
+        id: Id,
+        group_id: Option<Id>,
+    ) -> (impl Future<Output = ()>, Address<A>) {
         // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
         // sender from another address.
         let home = unsafe { Address::new(snd) };
+
+        let span = {
+            let span = Self::create_root_span(id, self.thread_root_span.clone());
+            if let Some(group_id) = group_id {
+                span.record(GROUP_KEY, group_id);
+            }
+            self.actor.span(span)
+        };
 
         let ctl = Control::new(
             Rc::downgrade(&self.ex),
             self.rune,
             home.downgrade(),
             self.signals,
+            self.idgen,
+            self.thread_root_span,
         );
 
-        let fut = actor_runner(self.actor, rcv, ctl);
+        let fut = actor_runner(self.actor, rcv, ctl).instrument(span);
         (fut, home)
+    }
+
+    #[cfg(test)]
+    fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
+        let id = self.idgen.generate();
+        debug!(
+            id,
+            "type" = std::any::type_name::<A>(),
+            "Non-spawn new actor"
+        );
+        self.raw(Self::create_channel(), id, None)
     }
 
     fn spawn(self) -> Address<A> {
         let ex = Rc::clone(&self.ex);
-        let (fut, adr) = self.raw(Self::create_channel());
-        // TODO: this doesn't propagate panics, do i want it to? Should the rune get poisoned? Should
-        // something await all Tasks? Send them to the heart and await all of them there?
+        let id = self.idgen.generate();
+        let (fut, adr) = self.raw(Self::create_channel(), id, None);
+        debug!(id, "type" = std::any::type_name::<A>(), "Spawn new actor");
         ex.spawn(fut).detach();
         adr
     }
@@ -149,15 +222,21 @@ impl<A: Actor> ActorBuilder<A> {
     {
         let ex = Rc::clone(&self.ex);
         let channel = Self::create_channel();
+        let group_id = self.idgen.generate();
+        debug!(
+            group_id,
+            additional,
+            "type" = std::any::type_name::<A>(),
+            "Spawn new multiplex actor"
+        );
 
         for _ in 0..additional {
-            let (fut, _) = self.clone().raw(channel.clone());
+            let id = self.idgen.generate();
+            let (fut, _) = self.clone().raw(channel.clone(), id, Some(group_id));
             ex.spawn(fut).detach();
         }
 
-        let (fut, adr) = self.raw(channel);
-        // TODO: this doesn't propagate panics, do i want it to? Should the rune get poisoned? Should
-        // something await all Tasks? Send them to the heart and await all of them there?
+        let (fut, adr) = self.raw(channel, group_id, Some(group_id));
         ex.spawn(fut).detach();
         adr
     }
@@ -173,7 +252,15 @@ impl<A: Actor> Control<A> {
             .upgrade()
             .expect("the executor is always alive here, it's what is running this function");
 
-        ActorBuilder::new(actor, ex, self.actor_rune.clone(), self.signals.clone()).spawn()
+        ActorBuilder::new(
+            actor,
+            ex,
+            self.actor_rune.clone(),
+            self.signals.clone(),
+            self.idgen.clone(),
+            self.thread_root_span.clone(),
+        )
+        .spawn()
     }
 
     fn new(
@@ -181,6 +268,8 @@ impl<A: Actor> Control<A> {
         rune: Rune,
         home: WeakAddress<A>,
         signals: InactiveSignalStream,
+        idgen: IdGenerator,
+        thread_root_span: Span,
     ) -> Self {
         let (task_heart, task_rune) = heart::create();
         Self {
@@ -192,10 +281,13 @@ impl<A: Actor> Control<A> {
             new_tasks: Vec::new(),
             task_heart,
             task_rune,
+            idgen,
+            thread_root_span,
         }
     }
 
     pub fn soft_exit(&mut self) {
+        debug!("Soft exit commanded");
         self.state = State::SoftExiting;
         // NOTE: this will only fail if already closed
         if let Some(adr) = self.home.upgrade() {
@@ -205,6 +297,7 @@ impl<A: Actor> Control<A> {
     }
 
     pub fn hard_exit(&mut self) {
+        debug!("Hard exit commanded");
         self.soft_exit();
         self.state = State::HardExiting;
     }
@@ -234,7 +327,8 @@ impl<A: Actor> Control<A> {
             .ex
             .upgrade()
             .expect("the executor is always alive here")
-            .spawn(future(self.task_heart.clone()));
+            .spawn(future(self.task_heart.clone()))
+            .fallible();
 
         self.new_tasks.push(task);
     }
@@ -246,7 +340,8 @@ impl<A: Actor> Control<A> {
         let task = blocking::unblock({
             let heart = self.task_heart.clone();
             move || thunk(heart)
-        });
+        })
+        .fallible();
         self.new_tasks.push(task);
     }
 }
@@ -336,6 +431,14 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         let c = self.sender.downgrade();
         // SAFETY: this gets the same scope as the original
         unsafe { GenericWeakAddress::new(c) }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub async fn closed(&self) {
+        self.sender.closed().await
     }
 }
 
@@ -632,7 +735,7 @@ struct ErasedAddress {
 pub struct SecretAddress<T> {
     thunk: Box<dyn Fn(T) -> LocalBoxFuture<'static, Result<(), SendError>>>,
 }
-// TODO: do i even need a secret address that is Send?
+// TODO: do i even need a secret address that is Send? Create if so
 assert_not_impl_any!(SecretAddress<()>: Send, Sync);
 
 impl<T> SecretAddress<T> {
@@ -641,17 +744,17 @@ impl<T> SecretAddress<T> {
     }
 }
 
-// TODO: trace this up
 async fn actor_runner<A: Actor>(
     mut actor: A,
     rcv: channel::Receiver<ErasedDeliverable<A>>,
     mut ctl: Control<A>,
 ) {
-    actor.enter(&mut ctl).await;
+    debug!("Enter");
+    actor.enter(&mut ctl).instrument(debug_span!("enter")).await;
 
     enum Event<A> {
         Delivery(ErasedDeliverable<A>),
-        TaskDone,
+        TaskDone(bool),
         Signal,
     }
     let mut events = {
@@ -664,11 +767,47 @@ async fn actor_runner<A: Actor>(
 
     yield_guard(A::YIELD_POLICY, async |yielder| {
         loop {
+            // NOTE: I use these long and ugly call chains to get lazy evaluation without using any
+            // enabled! macros.
+            trace!(
+                tasks.len = events.as_ref().ref_pin_me().ref_pin_group().len(),
+                events.len = events
+                    .as_ref()
+                    .ref_pin_me()
+                    .ref_pin_me()
+                    .get_ref()
+                    .get_ref()
+                    .len(),
+                signals.len = events.as_ref().ref_pin_addon().get_ref().get_ref().len(),
+                "Awaiting next event"
+            );
+
             match events.as_mut().next().await {
-                Some(Event::Signal) => actor.interrupt(&mut ctl).await,
-                Some(Event::Delivery(delivery)) => delivery.deliver(&mut actor, &mut ctl).await,
-                Some(Event::TaskDone) => actor.task_done(&mut ctl).await,
-                None => break,
+                Some(Event::Signal) => {
+                    trace!("Signal event");
+                    actor
+                        .interrupt(&mut ctl)
+                        .instrument(debug_span!("interrupt"))
+                        .await
+                }
+                Some(Event::Delivery(delivery)) => {
+                    trace!("Delivery event");
+                    delivery
+                        .deliver(&mut actor, &mut ctl)
+                        .instrument(debug_span!("deliver")) // TODO: add the debug repr of delivery?
+                        .await
+                }
+                Some(Event::TaskDone(panicked)) => {
+                    trace!("Task done event");
+                    actor
+                        .task_done(&mut ctl, panicked)
+                        .instrument(debug_span!("task_done", panicked))
+                        .await
+                }
+                None => {
+                    trace!("No more events, breaking loop");
+                    break;
+                }
             }
 
             for task in ctl.new_tasks.drain(..) {
@@ -676,10 +815,15 @@ async fn actor_runner<A: Actor>(
                     .as_mut()
                     .mut_pin_me()
                     .mut_pin_group()
-                    .insert(task.map(|_| Event::TaskDone));
+                    // NOTE: I never cancel tasks, so it being none must mean it panicked
+                    .insert(task.map(|res| Event::TaskDone(res.is_none())));
             }
 
             if ctl.state == State::HardExiting {
+                // NOTE: it would be nice if cancel could be explicitly called on all background
+                // tasks here, but FutureGroup doesn't allow that. They will be cancelled when the
+                // group drops in any case.
+                debug!("Hard exit, breaking loop");
                 break;
             }
 
@@ -689,105 +833,176 @@ async fn actor_runner<A: Actor>(
     })
     .await;
 
-    actor.leave(&mut ctl).await;
+    debug!("Leave");
+    actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
+    debug!("Died");
 }
 
+#[derive(Clone)]
+pub struct StageCore {
+    signal_stream: InactiveSignalStream,
+    idgen: IdGenerator,
+}
+assert_impl_all!(StageCore: Send, Sync);
+
 pub struct Stage {
+    // TODO: this could probably be a `Rc<dyn futures_task::LocalSpawn>`, then a stage could accept
+    // any spawner/executor
     ex: Rc<LocalExecutor<'static>>,
     heart: Heart,
     rune: Rune,
     signal_stream: InactiveSignalStream,
+    idgen: IdGenerator,
+    thread_root_span: Span,
 }
+assert_not_impl_any!(Stage: Send, Sync);
 
 impl Stage {
-    pub fn new(signal_stream: InactiveSignalStream) -> Self {
+    pub fn new_from_core(core: StageCore) -> Self {
         let (heart, rune) = heart::create();
         Self {
             ex: Rc::new(LocalExecutor::new()),
             heart,
             rune,
-            signal_stream,
+            signal_stream: core.signal_stream,
+            idgen: core.idgen,
+            thread_root_span: Span::current(),
         }
+    }
+
+    pub fn new(signal_stream: InactiveSignalStream) -> Self {
+        Self::new_from_core(StageCore {
+            signal_stream,
+            idgen: IdGenerator::new(),
+        })
     }
 
     pub fn new_no_signals() -> Self {
         Self::new(crate::graceful_termination::dummy())
     }
 
-    // TODO: take a span as argument and make sure it is always entered?
-    pub fn summon<A: Actor>(&self, actor: A) -> Address<A> {
+    pub fn core(&self) -> StageCore {
+        StageCore {
+            signal_stream: self.signal_stream.clone(),
+            idgen: self.idgen.clone(),
+        }
+    }
+
+    fn actor_builder<A: Actor>(&self, actor: A) -> ActorBuilder<A> {
         ActorBuilder::new(
             actor,
             Rc::clone(&self.ex),
             self.rune.clone(),
             self.signal_stream.clone(),
+            self.idgen.clone(),
+            self.thread_root_span.clone(),
         )
-        .spawn()
+    }
+
+    pub fn summon<A: Actor>(&self, actor: A) -> Address<A> {
+        self.actor_builder(actor).spawn()
     }
 
     pub fn summon_multiplex<A: Actor + Clone>(&self, actor: A, additional: usize) -> Address<A> {
-        let builder = ActorBuilder::new(
-            actor,
-            Rc::clone(&self.ex),
-            self.rune.clone(),
-            self.signal_stream.clone(),
-        );
-
-        builder.spawn_multiplex(additional)
+        self.actor_builder(actor).spawn_multiplex(additional)
     }
 
-    pub fn play(self) {
+    pub fn play(self) -> Result<(), PanicError> {
         fn take_essentials_drop_the_rest(this: Stage) -> (Heart, Rc<LocalExecutor<'static>>) {
             (this.heart, this.ex)
         }
         let (heart, ex) = take_essentials_drop_the_rest(self);
-        block_on(ex.run(heart));
+
+        debug!(num_actors = heart.rune_count(), "Action!");
+        let res = block_on(ex.run(heart));
         assert_eq!(Rc::strong_count(&ex), 1);
+        debug!(?res, "Play exited");
+        res
     }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
-    struct Alice;
-    impl Actor for Alice {}
-    impl Receive<i32> for Alice {
-        type Retval = i32;
+    mod simple {
+        use std::task::Poll;
 
-        async fn receive(&mut self, msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
-            msg * msg
+        use futures_test::task::noop_context;
+
+        use super::*;
+
+        #[test]
+        fn terminate_when_all_addresses_gone() {
+            let stage = Stage::new_no_signals();
+            let (fut, _) = stage.actor_builder(DummyActor).no_spawn();
+            let fut = pin!(fut);
+            let poll = fut.poll(&mut noop_context());
+            assert_eq!(poll, Poll::Ready(()));
+        }
+
+        #[test]
+        fn terminate_when_all_addresses_gone_after_one_poll_ready() {
+            let stage = Stage::new_no_signals();
+            let (fut, adr) = stage.actor_builder(DummyActor).no_spawn();
+            let mut fut = pin!(fut);
+            assert_eq!(fut.as_mut().poll(&mut noop_context()), Poll::Pending);
+
+            drop(adr);
+            assert_eq!(fut.poll(&mut noop_context()), Poll::Ready(()));
         }
     }
 
-    struct Bob {
-        alice: RemoteAddress<Alice>,
-    }
-    impl Actor for Bob {
-        async fn enter(&mut self, _ctl: &mut Control<Self>) {
-            let reply = self.alice.send_receive(5).await.unwrap();
-            let reply = reply.await.unwrap();
-            // BUG: this panic is not propagated to the main thread, so the test is marked as passed
-            // even if it fails
-            assert_eq!(reply, 25);
-        }
-    }
+    mod multi_thread {
+        use tracing::info;
 
-    #[test]
-    fn test_remote() {
-        let main_stage = Stage::new_no_signals();
-        let alice_adr = main_stage.summon(Alice);
+        use super::*;
+        use crate::{test_utils::init_tracing, utils::thread_info_span};
 
-        let t1 = std::thread::spawn({
-            let alice_adr = alice_adr.remote();
-            || {
-                let stage = Stage::new_no_signals();
-                stage.summon(Bob { alice: alice_adr });
-                stage.play();
+        struct Alice;
+        impl Actor for Alice {}
+        impl Receive<i32> for Alice {
+            type Retval = i32;
+
+            async fn receive(&mut self, msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
+                msg * msg
             }
-        });
+        }
 
-        main_stage.play();
-        t1.join().unwrap();
+        struct Bob {
+            alice: RemoteAddress<Alice>,
+        }
+        impl Actor for Bob {
+            async fn enter(&mut self, _ctl: &mut Control<Self>) {
+                info!("sending to alice");
+                let reply = self.alice.send_receive(5).await.unwrap();
+                let reply = reply.await.unwrap();
+                assert_eq!(reply, 25);
+            }
+        }
+
+        #[test]
+        fn remote() {
+            init_tracing();
+            let _span = thread_info_span().entered();
+            let main_stage = Stage::new_no_signals();
+            let alice_adr = main_stage.summon(Alice);
+
+            let t1 = std::thread::spawn({
+                let alice_adr = alice_adr.remote();
+                let core = main_stage.core();
+                || {
+                    let _span = thread_info_span().entered();
+                    let stage = Stage::new_from_core(core);
+                    stage.summon(Bob { alice: alice_adr });
+                    stage.play().unwrap();
+                }
+            });
+
+            drop(alice_adr);
+            main_stage.play().unwrap();
+            // TODO: why does it say value Any {..}?
+            t1.join().unwrap();
+        }
     }
 }

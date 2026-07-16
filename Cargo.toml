@@ -30,9 +30,9 @@ tracing-error = { version = "0.2.1", default-features = false }
 futures-test = "0.3.32"
 tracing-subscriber = "0.3.23"
 
-[patch.crates-io]
+# [patch.crates-io]
 #NOTE: i dont like this crate: it has bugs like polling depleted streams more than once,
 #it is missing things that should be there, like Fuse not implementing FusedStream. Even
 #though i like the simplified API over futures, i will not use it since its so buggy. For
 #example, the StreamExt::race never terminates.
-futures-lite = {path="../futures-lite"}
+# futures-lite = {path="../futures-lite"}
