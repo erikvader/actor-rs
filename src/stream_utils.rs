@@ -8,7 +8,6 @@ use futures_concurrency::future::FutureGroup;
 use futures_core::{FusedStream, Stream};
 use pin_project::pin_project;
 
-// TODO: remove?
 // NOTE: this can't be a simple futures_util::stream::select since it will ignore the futuregroup if
 // it has been empty even once.
 #[must_use = "this does nothing without being polled"]
@@ -42,18 +41,22 @@ impl<S, F> WithFutures<S, F> {
         self.project().group
     }
 
-    pub fn ref_pin_group(self: Pin<&Self>) -> Pin<&FutureGroup<F>> {
-        self.project_ref().group
+    pub fn group_ref(&self) -> &FutureGroup<F> {
+        &self.group
     }
 
-    pub fn ref_pin_me(self: Pin<&Self>) -> Pin<&S> {
-        self.project_ref().stream
+    pub fn stream_ref(&self) -> &S {
+        &self.stream
+    }
+
+    pub fn mut_group(&mut self) -> &mut FutureGroup<F> {
+        &mut self.group
     }
 }
 
 impl<S, F> Stream for WithFutures<S, F>
 where
-    S: Stream + FusedStream,
+    S: FusedStream,
     F: Future<Output = S::Item>,
 {
     type Item = S::Item;
@@ -108,27 +111,29 @@ where
     }
 }
 
+// NOTE: this could've almost been a futures_util::select_with_strategy, but it can't since I want
+// this combinator to terminate when the stream is empty, regardless of the state of the addon, and
+// select_with_strategy will poll both streams to completion.
 #[must_use = "this does nothing without being polled"]
 #[pin_project]
 pub struct Addon<A, M> {
     #[pin]
     addon: A,
     #[pin]
-    me: M,
+    main: M,
 }
 
 impl<A, R> Addon<A, R> {
-    pub fn mut_pin_me(self: Pin<&mut Self>) -> Pin<&mut R> {
-        self.project().me
+    pub fn mut_pin_main(self: Pin<&mut Self>) -> Pin<&mut R> {
+        self.project().main
     }
 
-    pub fn ref_pin_me(self: Pin<&Self>) -> Pin<&R> {
-        self.project_ref().me
+    pub fn main_ref(&self) -> &R {
+        &self.main
     }
 
-    // TODO: do these read-only ones really need to be pin?
-    pub fn ref_pin_addon(self: Pin<&Self>) -> Pin<&A> {
-        self.project_ref().addon
+    pub fn addon_ref(&self) -> &A {
+        &self.addon
     }
 }
 
@@ -144,53 +149,26 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.project();
+
+        // NOTE: I try to mimic the futures_util::stream::Fuse and keep the stream alive instead of
+        // dropping it like futures_util::future::Fuse when it is done, since streams usually are
+        // long-lived and can implement Sink and stuff. I could've also taken a normal stream as
+        // argument and kept track of the done state using a bool, but that felt weird since there
+        // is a fusedstream trait, it's just that I haven't seen it used as a bound in other crates,
+        // so it's maybe not idomatic? I have only seen it required, i think, on the select macro, i
+        // think. But I like it since it avoids unnecessary fuses.
         if !this.addon.is_terminated()
             && let Poll::Ready(Some(i)) = this.addon.poll_next(cx)
         {
             return Poll::Ready(Some(i));
         }
 
-        this.me.poll_next(cx)
+        this.main.poll_next(cx)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         // TODO: add the size hint of all members together
-        self.me.size_hint()
-    }
-}
-
-// TODO: remove?
-#[must_use = "this does nothing without being polled"]
-#[pin_project]
-pub struct TerminationWatch<S, F> {
-    #[pin]
-    stream: S,
-    callback: Option<F>,
-}
-
-impl<S, F> Stream for TerminationWatch<S, F>
-where
-    S: Stream,
-    F: FnOnce(),
-{
-    type Item = S::Item;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-        let res = this.stream.poll_next(cx);
-        if let Poll::Ready(None) = res
-            && let Some(cb) = this.callback.take()
-        {
-            cb();
-        }
-        res
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.stream.size_hint()
+        self.main.size_hint()
     }
 }
 
@@ -202,18 +180,7 @@ pub trait StreamExt: Stream {
         Self: Sized,
         R: FusedStream<Item = Self::Item>,
     {
-        Addon { addon, me: self }
-    }
-
-    /// Calls the provided closure when this stream is depleted.
-    fn termination_watch<F: FnOnce()>(self, callback: F) -> TerminationWatch<Self, F>
-    where
-        Self: Sized,
-    {
-        TerminationWatch {
-            stream: self,
-            callback: Some(callback),
-        }
+        Addon { addon, main: self }
     }
 
     /// Attaches a FutureGroup to this stream
@@ -245,7 +212,7 @@ pub struct Yielder<'a> {
 }
 
 impl Yielder<'_> {
-    pub async fn point(&self) {
+    pub async fn yield_point(&self) {
         std::future::poll_fn(|cx| {
             if let YieldPolicy::Every(max) = self.max {
                 self.count.update(|old| old + 1);
@@ -278,16 +245,112 @@ where
 }
 
 #[cfg(test)]
-mod test {
-    use futures_util::{StreamExt, stream};
-
+mod tests {
     use super::*;
+    use futures_test::assert_stream_pending;
+    use futures_test::{assert_stream_done, assert_stream_next, stream::StreamTestExt};
+    use futures_util::StreamExt as _;
+    use futures_util::future as fuf;
+    use futures_util::stream as fus;
 
-    #[test]
-    fn test_addon() {
-        let me = stream::iter(vec![3]);
-        let ad = stream::iter(vec![1, 2]).fuse();
-        // TODO: add:)
-        // let s = me.addon(ad).collect();
+    mod yielder {
+        use super::*;
+
+        #[test]
+        fn basic() {
+            let fut = yield_guard(YieldPolicy::Never, async |guard| {
+                guard.yield_point().await;
+            });
+        }
+    }
+
+    mod group {
+        use super::*;
+
+        #[test]
+        fn empty() {
+            let s = fus::empty::<()>();
+            let mut s = s.with_future_group::<fuf::Pending<_>>();
+            assert_stream_done!(s);
+        }
+
+        #[test]
+        fn behaves_normally_if_the_group_is_not_used() {
+            let s = fus::iter(vec![1, 2]).fuse();
+            let mut s = s.with_future_group::<fuf::Pending<_>>();
+            assert_stream_next!(s, 1);
+            assert_stream_next!(s, 2);
+            assert_stream_done!(s);
+        }
+
+        #[test]
+        fn fairness() {
+            let s = fus::iter(vec![1, 2]).fuse();
+            let mut s = s.with_future_group();
+            s.mut_group().insert(fuf::ready(3));
+            s.mut_group().insert(fuf::ready(4));
+            assert_stream_next!(s, 3);
+            assert_stream_next!(s, 1);
+            assert_stream_next!(s, 4);
+            assert_stream_next!(s, 2);
+            assert_stream_done!(s);
+        }
+
+        #[test]
+        fn add_future_after_group_has_been_polled() {
+            let s = fus::iter(vec![1, 2]).interleave_pending().fuse();
+            let mut s = s.with_future_group();
+            assert_stream_pending!(s); // NOTE: the group should have been polled here
+            assert_stream_next!(s, 1);
+            s.mut_group().insert(fuf::ready(3));
+            assert_stream_next!(s, 3);
+            assert_stream_pending!(s);
+            assert_stream_next!(s, 2);
+            assert_stream_pending!(s);
+            assert_stream_done!(s);
+        }
+
+        #[test]
+        fn empty_stream_non_empty_group() {
+            let s = fus::empty();
+            let mut s = s.with_future_group();
+            s.mut_group().insert(fuf::ready(1));
+            assert_stream_next!(s, 1);
+            assert_stream_done!(s);
+        }
+    }
+
+    mod addon {
+        use super::*;
+
+        #[test]
+        fn empty() {
+            let s1 = fus::empty::<()>();
+            let s2 = fus::empty();
+            let mut a = s1.addon(s2);
+            assert_stream_done!(a);
+        }
+
+        #[test]
+        fn addon_always_first() {
+            let s1 = fus::repeat(1);
+            let s2 = fus::repeat(2);
+            let mut a = s1.addon(s2);
+            assert_stream_next!(a, 2);
+            assert_stream_next!(a, 2);
+            assert_stream_next!(a, 2);
+        }
+
+        #[test]
+        fn done_if_main_is_done() {
+            let s1 = fus::iter(vec![1, 2]);
+            let s2 = fus::repeat(3).interleave_pending();
+            let mut a = s1.addon(s2);
+            assert_stream_next!(a, 1);
+            assert_stream_next!(a, 3);
+            assert_stream_next!(a, 2);
+            assert_stream_next!(a, 3);
+            assert_stream_done!(a);
+        }
     }
 }

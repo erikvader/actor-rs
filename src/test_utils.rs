@@ -1,4 +1,6 @@
+#[ctor::ctor(unsafe)]
 pub fn init_tracing() {
+    assert!(cfg!(test));
     use tracing_subscriber::prelude::*;
 
     let fmt = tracing_subscriber::fmt::layer().pretty().with_test_writer();
@@ -15,4 +17,38 @@ pub fn init_tracing() {
             prev_hook(arg);
         }));
     }
+}
+
+// NOTE: these are inspired by assert_stream_next etc from futures_test
+macro_rules! assert_future_pending {
+    ($fut:expr) => {{
+        use core::future::Future;
+        let fut = core::pin::Pin::new(&mut $fut);
+        let res = fut.poll(&mut futures_test::task::noop_context());
+        assert!(res.is_pending(), "Future is not pending");
+    }};
+}
+
+macro_rules! assert_future_ready {
+    ($fut:expr, $expected:expr) => {{
+        use core::future::Future;
+        let fut = core::pin::Pin::new(&mut $fut);
+        let res = fut.poll(&mut futures_test::task::noop_context());
+        match res {
+            core::task::Poll::Ready(res) => {
+                assert_eq!(res, $expected, "Ready value not equal the expected value");
+                res
+            }
+            core::task::Poll::Pending => panic!("Future is not ready"),
+        }
+    }};
+    ($fut:expr) => {{
+        use core::future::Future;
+        let fut = core::pin::Pin::new(&mut $fut);
+        let res = fut.poll(&mut futures_test::task::noop_context());
+        match res {
+            core::task::Poll::Ready(res) => res,
+            core::task::Poll::Pending => panic!("Future is not ready"),
+        }
+    }};
 }

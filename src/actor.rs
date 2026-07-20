@@ -13,7 +13,7 @@ use pin_project::pin_project;
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
 use std::{
-    any::Any,
+    any::{Any, type_name},
     marker::PhantomData,
     pin::{Pin, pin},
     rc::{Rc, Weak},
@@ -162,7 +162,7 @@ impl<A: Actor> ActorBuilder<A> {
 
     fn create_root_span(id: Id, parent: Span) -> Span {
         // TODO: should i prefix all of these with actor. to namespace them?
-        span!(parent: parent, Level::DEBUG, "actor", id = id, {GROUP_KEY} = field::Empty, "type" = std::any::type_name::<A>())
+        span!(parent: parent, Level::DEBUG, "actor", id = id, {GROUP_KEY} = field::Empty, "type" = type_name::<A>())
     }
 
     fn raw(
@@ -199,11 +199,7 @@ impl<A: Actor> ActorBuilder<A> {
     #[cfg(test)]
     fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
         let id = self.idgen.generate();
-        debug!(
-            id,
-            "type" = std::any::type_name::<A>(),
-            "Non-spawn new actor"
-        );
+        debug!(id, "type" = type_name::<A>(), "Non-spawn new actor");
         self.raw(Self::create_channel(), id, None)
     }
 
@@ -211,7 +207,7 @@ impl<A: Actor> ActorBuilder<A> {
         let ex = Rc::clone(&self.ex);
         let id = self.idgen.generate();
         let (fut, adr) = self.raw(Self::create_channel(), id, None);
-        debug!(id, "type" = std::any::type_name::<A>(), "Spawn new actor");
+        debug!(id, "type" = type_name::<A>(), "Spawn new actor");
         ex.spawn(fut).detach();
         adr
     }
@@ -226,7 +222,7 @@ impl<A: Actor> ActorBuilder<A> {
         debug!(
             group_id,
             additional,
-            "type" = std::any::type_name::<A>(),
+            "type" = type_name::<A>(),
             "Spawn new multiplex actor"
         );
 
@@ -323,6 +319,7 @@ impl<A: Actor> Control<A> {
     where
         F: AsyncFnOnce(Heart) + 'static,
     {
+        debug!("type" = type_name::<F>(), "Starting a job");
         let task = self
             .ex
             .upgrade()
@@ -337,6 +334,7 @@ impl<A: Actor> Control<A> {
     where
         F: FnOnce(Heart) + Send + 'static,
     {
+        debug!("type" = type_name::<F>(), "Starting a blocking job");
         let task = blocking::unblock({
             let heart = self.task_heart.clone();
             move || thunk(heart)
@@ -677,6 +675,12 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         A: Receive<T>,
         S: CanSend<A, T>,
     {
+        trace!(
+            "actor.rcv.type" = type_name::<A>(),
+            "msg.type" = type_name::<T>(),
+            "msg.return.type" = type_name::<A::Retval>(),
+            "Send and receive"
+        );
         let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
         let package = Package {
             msg,
@@ -694,6 +698,11 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         A: Receive<T>,
         S: CanSend<A, T>,
     {
+        trace!(
+            "actor.rcv.type" = type_name::<A>(),
+            "msg.type" = type_name::<T>(),
+            "Send"
+        );
         let ticket = OneWayTicket {
             msg,
             erased: self.erased(),
@@ -760,27 +769,26 @@ async fn actor_runner<A: Actor>(
     let mut events = {
         let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
         let delivery_stream = rcv.map(Event::Delivery);
-
         let events = delivery_stream.with_future_group().addon(signal_stream);
         pin!(events)
     };
 
     yield_guard(A::YIELD_POLICY, async |yielder| {
         loop {
-            // NOTE: I use these long and ugly call chains to get lazy evaluation without using any
-            // enabled! macros.
-            trace!(
-                tasks.len = events.as_ref().ref_pin_me().ref_pin_group().len(),
-                events.len = events
-                    .as_ref()
-                    .ref_pin_me()
-                    .ref_pin_me()
-                    .get_ref()
-                    .get_ref()
-                    .len(),
-                signals.len = events.as_ref().ref_pin_addon().get_ref().get_ref().len(),
-                "Awaiting next event"
-            );
+            {
+                let signal_stream = events.addon_ref().get_ref();
+                let task_group = events.main_ref().group_ref();
+                let delivery_stream = events.main_ref().stream_ref().get_ref();
+                let delivery_len = delivery_stream.len();
+                trace!(
+                    tasks.len = task_group.len(),
+                    events.len = delivery_len,
+                    signals.len = signal_stream.len(),
+                    addresses.count.estimation = delivery_stream.sender_count() - delivery_len,
+                    mailbox.len = A::MAIL_BOX_SIZE,
+                    "Awaiting next event"
+                );
+            }
 
             match events.as_mut().next().await {
                 Some(Event::Signal) => {
@@ -813,7 +821,7 @@ async fn actor_runner<A: Actor>(
             for task in ctl.new_tasks.drain(..) {
                 events
                     .as_mut()
-                    .mut_pin_me()
+                    .mut_pin_main()
                     .mut_pin_group()
                     // NOTE: I never cancel tasks, so it being none must mean it panicked
                     .insert(task.map(|res| Event::TaskDone(res.is_none())));
@@ -828,7 +836,7 @@ async fn actor_runner<A: Actor>(
             }
 
             // TODO: test that this even works
-            yielder.point().await;
+            yielder.yield_point().await;
         }
     })
     .await;
@@ -926,19 +934,14 @@ mod tests {
     use super::*;
 
     mod simple {
-        use std::task::Poll;
-
-        use futures_test::task::noop_context;
-
         use super::*;
 
         #[test]
         fn terminate_when_all_addresses_gone() {
             let stage = Stage::new_no_signals();
             let (fut, _) = stage.actor_builder(DummyActor).no_spawn();
-            let fut = pin!(fut);
-            let poll = fut.poll(&mut noop_context());
-            assert_eq!(poll, Poll::Ready(()));
+            let mut fut = pin!(fut);
+            assert_future_ready!(fut);
         }
 
         #[test]
@@ -946,10 +949,10 @@ mod tests {
             let stage = Stage::new_no_signals();
             let (fut, adr) = stage.actor_builder(DummyActor).no_spawn();
             let mut fut = pin!(fut);
-            assert_eq!(fut.as_mut().poll(&mut noop_context()), Poll::Pending);
+            assert_future_pending!(fut);
 
             drop(adr);
-            assert_eq!(fut.poll(&mut noop_context()), Poll::Ready(()));
+            assert_future_ready!(fut);
         }
     }
 
@@ -957,7 +960,7 @@ mod tests {
         use tracing::info;
 
         use super::*;
-        use crate::{test_utils::init_tracing, utils::thread_info_span};
+        use crate::utils::thread_info_span;
 
         struct Alice;
         impl Actor for Alice {}
@@ -983,7 +986,6 @@ mod tests {
 
         #[test]
         fn remote() {
-            init_tracing();
             let _span = thread_info_span().entered();
             let main_stage = Stage::new_no_signals();
             let alice_adr = main_stage.summon(Alice);
@@ -1001,7 +1003,6 @@ mod tests {
 
             drop(alice_adr);
             main_stage.play().unwrap();
-            // TODO: why does it say value Any {..}?
             t1.join().unwrap();
         }
     }
