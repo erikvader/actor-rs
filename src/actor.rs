@@ -22,6 +22,8 @@ use std::{
 };
 use tracing::{Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, warn};
 
+// TODO: this module needs to be split up into several submodules
+
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
 pub trait Actor: Sized + 'static {
@@ -371,6 +373,8 @@ pub struct AddressClosedError {
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 pub trait Receive<T>: Actor {
+    // NOTE: I'm pretty sure the 'static bound on the Actor trait is implying that this also must be
+    // 'static
     type Retval;
 
     #[expect(
@@ -439,6 +443,8 @@ impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
 }
 
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
+    // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
+    // which would enable !Send data change threads.
     unsafe fn new(sender: channel::Sender<ErasedDeliverable<A>>) -> Self {
         Self {
             sender,
@@ -462,6 +468,8 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 }
 
 impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
+    // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
+    // which would enable !Send data change threads.
     unsafe fn new(sender: channel::WeakSender<ErasedDeliverable<A>>) -> Self {
         Self {
             sender,
@@ -479,7 +487,8 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
 
 impl<A: Actor> Address<A> {
     pub fn remote(&self) -> RemoteAddress<A> {
-        // SAFETY: It's safe to go from a local address to a remote one, but not the other way around
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
+        // around, since a remote address can only send data that is Send.
         let c = self.sender.clone();
         unsafe { RemoteAddress::new(c) }
     }
@@ -487,7 +496,8 @@ impl<A: Actor> Address<A> {
 
 impl<A: Actor> WeakAddress<A> {
     pub fn remote(&self) -> RemoteWeakAddress<A> {
-        // SAFETY: It's safe to go from a local address to a remote one, but not the other way around
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
+        // around, since a remote address can only send data that is Send.
         let c = self.sender.clone();
         unsafe { RemoteWeakAddress::new(c) }
     }
@@ -507,6 +517,10 @@ trait CanSendPriv<A, T>: Scope {
     fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
     where
         A: Receive<T>;
+    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send>
+    where
+        Self: Sized,
+        A: Receive<T>;
 }
 
 impl<A, T> CanSendPriv<A, T> for Remote
@@ -524,6 +538,14 @@ where
         A: Receive<T>,
     {
         Box::new(t)
+    }
+
+    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send>
+    where
+        Self: Sized,
+        A: Receive<T>,
+    {
+        Box::new(a)
     }
 }
 
@@ -545,6 +567,19 @@ where
         // SAFETY: one of these can only be sent by a local address, which means the sender has
         // never left the current thread, which means it's safe to send non-send data on it.
         Box::new(unsafe { UnsafeSendWrapper::new(t) })
+    }
+
+    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send>
+    where
+        Self: Sized,
+        A: Receive<T>,
+    {
+        // SAFETY: This is only used to copy something that already was in a box<dyn ...>, so the
+        // thing has already been verified to be Send elsewhere. This is mainly here to only wrap in
+        // the unsafe send wrapper when necessary.
+        // TODO: maybe the argument to this function can be something else to make sure this
+        // function is only used in this safe scenario?
+        Box::new(unsafe { UnsafeSendWrapper::new(a) })
     }
 }
 
@@ -570,6 +605,8 @@ mod unsafe_wrapper {
     unsafe impl<D> Send for UnsafeSendWrapper<D> {}
 
     impl<D> UnsafeSendWrapper<D> {
+        // SAFETY: This makes !Send data appear as Send, so care should be taken to make sure this
+        // value doesn't change threads.
         pub unsafe fn new(data: D) -> Self {
             Self(data)
         }
@@ -580,6 +617,10 @@ mod unsafe_wrapper {
             // SAFETY: the wrapper is repr(transparent), so its guaranteed to have the same size and
             // alignment, making this cast safe.
             unsafe { Box::from_raw(inner_raw) }
+        }
+
+        pub fn inner(&self) -> &D {
+            &self.0
         }
     }
 }
@@ -733,17 +774,6 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         Ok(())
     }
 
-    pub fn secret<T>(&self) -> SecretAddress<T>
-    where
-        T: 'static,
-        A: Receive<T>,
-        S: CanSend<A, T>,
-    {
-        SecretAddress {
-            secret: Box::new(self.clone()),
-        }
-    }
-
     fn erased(&self) -> ErasedAddress {
         let clone = self.clone();
         ErasedAddress {
@@ -754,45 +784,102 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 }
 
+// TODO: it would be nice to have some kind of tests that makes sure some things CAN'T be done, i.e.
+// compilation failure.
+// TODO: merge these with the other impls for specific addresses?
+impl<A: Actor> GenericAddress<A, Remote> {
+    pub fn secret<T>(&self) -> SecretAddress<T>
+    where
+        T: Send + 'static,
+        A: Receive<T, Retval: Send>,
+    {
+        SecretAddress {
+            secret: Box::new(self.clone()),
+            _scope: PhantomData,
+        }
+    }
+}
+
+impl<A: Actor> GenericAddress<A, Local> {
+    pub fn secret<T>(&self) -> SecretAddress<T>
+    where
+        T: 'static,
+        A: Receive<T>,
+    {
+        SecretAddress {
+            // SAFETY: It's the phantomdata, i.e. T, that determines if this secret address can be
+            // sent between threads or not. For a remote address, only T: Send is safe since the
+            // address could, or is going to, change thread, and sending !Send data would not be
+            // good in that case. A local address can send T: !Send, since it has never and will
+            // never leave the current thread, the secret address will this never be able to leave
+            // the current thread either. It is safe though for a local address to send T: Send data
+            // too, but that will make the secret address Send, so the wrapped local address will
+            // thus be abe to move to another thread, but that is fine, since a local address can
+            // trivially be converted to a remote address, but not the other way around. It's safe
+            // to just take the local address and send it to another thread, because that is
+            // basically what conversion to remote is.
+            secret: Box::new(unsafe { UnsafeSendWrapper::new(self.clone()) }),
+            _scope: PhantomData,
+        }
+    }
+}
+
 struct ErasedAddress {
     _inner: Box<dyn Any + Send>,
 }
 
+impl<T> Clone for Box<dyn SecretSend<T> + Send> {
+    fn clone(&self) -> Self {
+        self.clone_secret_send()
+    }
+}
+
 trait SecretSend<T> {
-    fn send(&self, msg: T) -> LocalBoxFuture<'static, Result<(), SendError>>;
-    fn boxed_clone(&self) -> Box<dyn SecretSend<T>>;
+    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>>;
+    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send>;
 }
 
 impl<A, S, T> SecretSend<T> for GenericAddress<A, S>
 where
     A: Receive<T>,
-    S: CanSend<A, T>,
     T: 'static,
+    S: CanSend<A, T>,
 {
-    fn send(&self, msg: T) -> LocalBoxFuture<'static, Result<(), SendError>> {
-        let cloned = self.clone();
-        Box::new(async move { cloned.send(msg).await }).boxed_local()
+    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+        Box::new(self.send(msg)).boxed_local()
     }
 
-    fn boxed_clone(&self) -> Box<dyn SecretSend<T>>
-    where
-        Self: Clone,
-    {
-        Box::new(self.clone())
+    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
+        let clone: Self = self.clone();
+        S::erase_address(clone)
+    }
+}
+
+impl<T, SS> SecretSend<T> for UnsafeSendWrapper<SS>
+where
+    SS: SecretSend<T>,
+{
+    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+        self.inner().send(msg)
+    }
+
+    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
+        self.inner().clone_secret_send()
     }
 }
 
 pub struct SecretAddress<T> {
-    secret: Box<dyn SecretSend<T>>,
+    secret: Box<dyn SecretSend<T> + Send>,
+    _scope: PhantomData<T>,
 }
-// TODO: do i even need a secret address that is Send? Create if so. I guess that could be
-// accomplished by adding the scope as a type parameter
-assert_not_impl_any!(SecretAddress<()>: Send, Sync);
+assert_not_impl_any!(SecretAddress<Rc<()>>: Send);
+assert_impl_all!(SecretAddress<()>: Send);
 
 impl<T> Clone for SecretAddress<T> {
     fn clone(&self) -> Self {
         Self {
-            secret: self.secret.boxed_clone(),
+            secret: self.secret.clone(),
+            _scope: self._scope,
         }
     }
 }
