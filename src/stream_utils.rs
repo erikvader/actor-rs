@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     num::NonZeroU32,
     pin::{Pin, pin},
     task::Poll,
@@ -204,22 +205,34 @@ impl YieldPolicy {
     pub const fn default() -> Self {
         Self::Every(const { NonZeroU32::new(16).unwrap() })
     }
+
+    pub const fn always() -> Self {
+        Self::Every(const { NonZeroU32::new(1).unwrap() })
+    }
 }
 
 pub struct Yielder<'a> {
-    count: &'a std::cell::Cell<u32>,
-    max: YieldPolicy,
+    count: &'a Cell<Option<u32>>,
+    policy: YieldPolicy,
 }
 
 impl Yielder<'_> {
     pub async fn yield_point(&self) {
         std::future::poll_fn(|cx| {
-            if let YieldPolicy::Every(max) = self.max {
-                self.count.update(|old| old + 1);
-                if self.count.get() >= max.get() {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+            match self.policy {
+                YieldPolicy::Every(max) => {
+                    if let Some(mut count) = self.count.take() {
+                        count += 1;
+                        if count >= max.get() {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        self.count.set(Some(count));
+                    } else {
+                        self.count.set(Some(0));
+                    }
                 }
+                YieldPolicy::Never => (),
             }
             Poll::Ready(())
         })
@@ -227,17 +240,20 @@ impl Yielder<'_> {
     }
 }
 
-pub async fn yield_guard<F, R>(max: YieldPolicy, to_guard: F) -> R
+pub async fn yield_guard<F, R>(policy: YieldPolicy, to_guard: F) -> R
 where
     F: for<'a> AsyncFnOnce(Yielder<'a>) -> R,
 {
-    let count = std::cell::Cell::new(0);
-    let yielder = Yielder { count: &count, max };
+    let count = Cell::new(Some(0));
+    let yielder = Yielder {
+        count: &count,
+        policy,
+    };
     let mut fut = pin!(to_guard(yielder));
     std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
         Poll::Ready(x) => Poll::Ready(x),
         Poll::Pending => {
-            count.set(0);
+            count.update(|count| count.map(|_| 0));
             Poll::Pending
         }
     })
@@ -248,6 +264,7 @@ where
 mod tests {
     use super::*;
     use futures_test::assert_stream_pending;
+    use futures_test::future::FutureTestExt as _;
     use futures_test::{assert_stream_done, assert_stream_next, stream::StreamTestExt};
     use futures_util::StreamExt as _;
     use futures_util::future as fuf;
@@ -257,10 +274,110 @@ mod tests {
         use super::*;
 
         #[test]
-        fn basic() {
+        fn never() {
             let fut = yield_guard(YieldPolicy::Never, async |guard| {
                 guard.yield_point().await;
+                guard.yield_point().await;
+                guard.yield_point().await;
             });
+            let mut fut = pin!(fut);
+            assert_future_ready!(fut, ());
+        }
+
+        #[test]
+        fn always() {
+            let fut = yield_guard(YieldPolicy::always(), async |guard| {
+                guard.yield_point().await;
+                guard.yield_point().await;
+                guard.yield_point().await;
+            });
+            let mut fut = pin!(fut);
+            assert_future_pending!(fut);
+            assert_future_pending!(fut);
+            assert_future_pending!(fut);
+            assert_future_ready!(fut, ());
+        }
+
+        #[test]
+        fn every_other() {
+            let i = Cell::new(-99);
+            let fut = yield_guard(
+                YieldPolicy::Every(const { NonZeroU32::new(2).unwrap() }),
+                async |guard| {
+                    for j in 0..4 {
+                        i.set(j);
+                        guard.yield_point().await;
+                    }
+                },
+            );
+            let mut fut = pin!(fut);
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 1);
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 3);
+            assert_future_ready!(fut, ());
+            assert_eq!(i.get(), 3);
+        }
+
+        #[test]
+        fn restores_its_count_so_it_never_yields() {
+            let i = Cell::new(-99);
+            let fut = yield_guard(
+                YieldPolicy::Every(const { NonZeroU32::new(2).unwrap() }),
+                async |guard| {
+                    for j in 0..4 {
+                        i.set(j);
+                        fuf::ready(()).pending_once().await;
+
+                        i.set(-1);
+                        guard.yield_point().await;
+                    }
+                },
+            );
+            let mut fut = pin!(fut);
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 0);
+
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 1);
+
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 2);
+
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 3);
+
+            assert_future_ready!(fut, ());
+            assert_eq!(i.get(), -1);
+        }
+
+        #[test]
+        fn gets_reset_once() {
+            let i = Cell::new(-99);
+            let fut = yield_guard(
+                YieldPolicy::Every(const { NonZeroU32::new(2).unwrap() }),
+                async |guard| {
+                    i.set(1);
+                    guard.yield_point().await;
+
+                    i.set(2);
+                    fuf::ready(()).pending_once().await;
+
+                    i.set(3);
+                    guard.yield_point().await;
+
+                    i.set(4);
+                    guard.yield_point().await;
+                },
+            );
+            let mut fut = pin!(fut);
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 2);
+
+            assert_future_pending!(fut);
+            assert_eq!(i.get(), 4);
+
+            assert_future_ready!(fut, ());
         }
     }
 

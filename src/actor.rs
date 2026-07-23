@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
     task::ready,
 };
-use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, warn};
+use tracing::{Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, warn};
 
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
@@ -51,7 +51,7 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn interrupt(&mut self, ctl: &mut Control<Self>) {
+    async fn interrupted(&mut self, ctl: &mut Control<Self>) {
         warn!("Ignoring an interrupt");
     }
 
@@ -91,7 +91,7 @@ pub struct Control<A: Actor> {
     thread_root_span: Span,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
 enum State {
     Running,
     SoftExiting,
@@ -192,7 +192,7 @@ impl<A: Actor> ActorBuilder<A> {
             self.thread_root_span,
         );
 
-        let fut = actor_runner(self.actor, rcv, ctl).instrument(span);
+        let fut = actor_runner(self.actor, rcv, ctl, home.clone()).instrument(span);
         (fut, home)
     }
 
@@ -282,7 +282,11 @@ impl<A: Actor> Control<A> {
         }
     }
 
+    #[instrument(skip_all)]
     pub fn soft_exit(&mut self) {
+        if self.state >= State::SoftExiting {
+            return;
+        }
         debug!("Soft exit commanded");
         self.state = State::SoftExiting;
         // NOTE: this will only fail if already closed
@@ -292,10 +296,24 @@ impl<A: Actor> Control<A> {
         self.task_rune.kill_heart();
     }
 
+    #[instrument(skip_all)]
     pub fn hard_exit(&mut self) {
+        if self.state >= State::HardExiting {
+            return;
+        }
         debug!("Hard exit commanded");
         self.soft_exit();
         self.state = State::HardExiting;
+    }
+
+    #[instrument(skip_all)]
+    pub fn escalating_exit(&mut self) {
+        match self.state {
+            State::Running => self.soft_exit(),
+            State::SoftExiting => self.hard_exit(),
+            State::HardExiting => debug!("Already hard exiting"),
+        }
+        debug_assert!(self.is_exiting());
     }
 
     pub fn weak_address(&self) -> WeakAddress<A> {
@@ -303,15 +321,15 @@ impl<A: Actor> Control<A> {
     }
 
     pub fn address(&self) -> Result<Address<A>, AddressClosedError> {
-        // NOTE: This can fail if all addresses got dropped and/or a soft exit has been issued.
-        self.home.upgrade().ok_or(AddressClosedError)
+        // NOTE: This can fail if all addresses got dropped and/or a soft exit has been issued. It's
+        // guaranteed to not fail in enter and message handlers, unless soft exiting.
+        self.home.upgrade().context(AddressClosedSnafu {
+            exiting: self.is_exiting(),
+        })
     }
 
     pub fn is_exiting(&self) -> bool {
-        match self.state {
-            State::Running => false,
-            State::SoftExiting | State::HardExiting => true,
-        }
+        self.state >= State::SoftExiting
     }
 
     // TODO: somehow get some kind of identifier for this job
@@ -324,6 +342,7 @@ impl<A: Actor> Control<A> {
             .ex
             .upgrade()
             .expect("the executor is always alive here")
+            // TODO: what span do I want these in? thread_root_span?
             .spawn(future(self.task_heart.clone()))
             .fallible();
 
@@ -345,8 +364,10 @@ impl<A: Actor> Control<A> {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(display("The address is closed"))]
-pub struct AddressClosedError;
+#[snafu(display("The address is closed, exiting={exiting}"))]
+pub struct AddressClosedError {
+    exiting: bool,
+}
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 pub trait Receive<T>: Actor {
@@ -664,7 +685,7 @@ impl<R> Future for Reply<R> {
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
         let reply = ready!(this.recv.poll(cx));
-        std::task::Poll::Ready(reply.map_err(|_| ReplyError))
+        std::task::Poll::Ready(reply.ok().context(ReplySnafu))
     }
 }
 
@@ -688,7 +709,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
             erased: self.erased(),
         };
         let erased = S::erase_package(package);
-        self.sender.send(erased).await.map_err(|_| SendError)?;
+        self.sender.send(erased).await.ok().context(SendSnafu)?;
         Ok(Reply { recv: ret_rcv })
     }
 
@@ -708,7 +729,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
             erased: self.erased(),
         };
         let erased = S::erase_ticket(ticket);
-        self.sender.send(erased).await.map_err(|_| SendError)?;
+        self.sender.send(erased).await.ok().context(SendSnafu)?;
         Ok(())
     }
 
@@ -718,12 +739,8 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         A: Receive<T>,
         S: CanSend<A, T>,
     {
-        let cloned = self.clone();
         SecretAddress {
-            thunk: Box::new(move |msg| {
-                let cloned = cloned.clone();
-                async move { cloned.send(msg).await }.boxed_local()
-            }),
+            secret: Box::new(self.clone()),
         }
     }
 
@@ -741,15 +758,48 @@ struct ErasedAddress {
     _inner: Box<dyn Any + Send>,
 }
 
-pub struct SecretAddress<T> {
-    thunk: Box<dyn Fn(T) -> LocalBoxFuture<'static, Result<(), SendError>>>,
+trait SecretSend<T> {
+    fn send(&self, msg: T) -> LocalBoxFuture<'static, Result<(), SendError>>;
+    fn boxed_clone(&self) -> Box<dyn SecretSend<T>>;
 }
-// TODO: do i even need a secret address that is Send? Create if so
+
+impl<A, S, T> SecretSend<T> for GenericAddress<A, S>
+where
+    A: Receive<T>,
+    S: CanSend<A, T>,
+    T: 'static,
+{
+    fn send(&self, msg: T) -> LocalBoxFuture<'static, Result<(), SendError>> {
+        let cloned = self.clone();
+        Box::new(async move { cloned.send(msg).await }).boxed_local()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn SecretSend<T>>
+    where
+        Self: Clone,
+    {
+        Box::new(self.clone())
+    }
+}
+
+pub struct SecretAddress<T> {
+    secret: Box<dyn SecretSend<T>>,
+}
+// TODO: do i even need a secret address that is Send? Create if so. I guess that could be
+// accomplished by adding the scope as a type parameter
 assert_not_impl_any!(SecretAddress<()>: Send, Sync);
+
+impl<T> Clone for SecretAddress<T> {
+    fn clone(&self) -> Self {
+        Self {
+            secret: self.secret.boxed_clone(),
+        }
+    }
+}
 
 impl<T> SecretAddress<T> {
     pub async fn send(&self, msg: T) -> Result<(), SendError> {
-        (self.thunk)(msg).await
+        self.secret.send(msg).await
     }
 }
 
@@ -757,9 +807,11 @@ async fn actor_runner<A: Actor>(
     mut actor: A,
     rcv: channel::Receiver<ErasedDeliverable<A>>,
     mut ctl: Control<A>,
+    home_adr: Address<A>,
 ) {
     debug!("Enter");
     actor.enter(&mut ctl).instrument(debug_span!("enter")).await;
+    drop(home_adr); // NOTE: to make sure the address is alive during enter
 
     enum Event<A> {
         Delivery(ErasedDeliverable<A>),
@@ -773,7 +825,7 @@ async fn actor_runner<A: Actor>(
         pin!(events)
     };
 
-    yield_guard(A::YIELD_POLICY, async |yielder| {
+    yield_guard(A::YIELD_POLICY, async |guard| {
         loop {
             {
                 let signal_stream = events.addon_ref().get_ref();
@@ -785,7 +837,7 @@ async fn actor_runner<A: Actor>(
                     events.len = delivery_len,
                     signals.len = signal_stream.len(),
                     addresses.count.estimation = delivery_stream.sender_count() - delivery_len,
-                    mailbox.len = A::MAIL_BOX_SIZE,
+                    mailbox.size = A::MAIL_BOX_SIZE,
                     "Awaiting next event"
                 );
             }
@@ -794,7 +846,7 @@ async fn actor_runner<A: Actor>(
                 Some(Event::Signal) => {
                     trace!("Signal event");
                     actor
-                        .interrupt(&mut ctl)
+                        .interrupted(&mut ctl)
                         .instrument(debug_span!("interrupt"))
                         .await
                 }
@@ -836,7 +888,7 @@ async fn actor_runner<A: Actor>(
             }
 
             // TODO: test that this even works
-            yielder.yield_point().await;
+            guard.yield_point().await;
         }
     })
     .await;
@@ -919,10 +971,10 @@ impl Stage {
         fn take_essentials_drop_the_rest(this: Stage) -> (Heart, Rc<LocalExecutor<'static>>) {
             (this.heart, this.ex)
         }
-        let (heart, ex) = take_essentials_drop_the_rest(self);
+        let (mut heart, ex) = take_essentials_drop_the_rest(self);
 
         debug!(num_actors = heart.rune_count(), "Action!");
-        let res = block_on(ex.run(heart));
+        let res = block_on(ex.run(heart.wait()));
         assert_eq!(Rc::strong_count(&ex), 1);
         debug!(?res, "Play exited");
         res

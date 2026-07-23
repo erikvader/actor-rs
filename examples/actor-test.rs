@@ -6,16 +6,20 @@ use actor_rs::{
 use tracing::info;
 
 fn setup_tracing() {
+    use anstream::ColorChoice;
     use tracing::level_filters::LevelFilter;
     use tracing_error::ErrorLayer;
     use tracing_subscriber::filter::Targets;
     use tracing_subscriber::prelude::*;
 
-    // TODO: detect ansi color support like anstream::auto() and set with with_ansi
-    // https://docs.rs/anstream/latest/anstream/struct.AutoStream.html#method.choice
-    // I guess this should look at the global value and let clap or something set that global when
-    // appropriate flags or config are given
-    let fmt = tracing_subscriber::fmt::layer().pretty();
+    let use_ansi = matches!(
+        anstream::AutoStream::choice(&std::io::stdout()),
+        ColorChoice::AlwaysAnsi | ColorChoice::Always
+    );
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_ansi(use_ansi)
+        .pretty();
 
     let filter = Targets::new().with_default(LevelFilter::TRACE);
 
@@ -24,7 +28,17 @@ fn setup_tracing() {
         .with(ErrorLayer::default())
         .with(filter)
         .init();
-    // TODO: tracing-panic?
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |arg| {
+        let payload = arg.payload_as_str().unwrap_or("<some non-string payload>");
+        let location = arg
+            .location()
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "no location".to_string());
+        tracing::error!(target: "panic", location, "{payload}");
+        prev_hook(arg);
+    }));
 }
 
 struct Alice;

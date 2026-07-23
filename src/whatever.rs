@@ -9,7 +9,8 @@ pub use snafu::prelude::*;
 // NOTE: this is not at all the prettiest formatting, but it works
 // TODO: an alternative could be to create a custom snafu::Report that maybe only prints the
 // innermost span trace at the bottom, like how the backtrace works in the default snafu::Whatever
-// type. It could maybe log the error instead of printing to stderr?
+// type.
+// TODO: Custom report that logs the error instead of printing to stderr?
 #[snafu(display("{message}\n-> {location}\n{span_trace}"))]
 pub struct Whatever {
     #[snafu(source(from(Box<dyn Error + Send + Sync>, Some)))]
