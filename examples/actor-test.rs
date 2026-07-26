@@ -1,6 +1,6 @@
 use actor_rs::{
     actor::{Actor, Control, Receive, Stage},
-    graceful_termination::GracefulTermination,
+    signals::Signals,
     whatever::*,
 };
 use tracing::info;
@@ -67,9 +67,9 @@ impl Receive<Hej> for Bob {
 #[snafu::report]
 fn main() -> Result<(), Whatever> {
     setup_tracing();
-    let grace = GracefulTermination::new().expect("this should just work");
+    let grace = Signals::new().expect("this should just work");
     let stage = Stage::new(grace.inactive_signal_stream());
     stage.summon(Alice);
-    stage.play();
+    let _ = stage.play();
     Ok(())
 }

@@ -1,7 +1,7 @@
 use crate::{
     actor::unsafe_wrapper::UnsafeSendWrapper,
-    graceful_termination::InactiveSignalStream,
     heart::{self, Heart, PanicError, Rune},
+    signals::InactiveSignalStream,
     stream_utils::{StreamExt as _, YieldPolicy, yield_guard},
 };
 use async_channel as channel;
@@ -1025,7 +1025,7 @@ impl Stage {
     }
 
     pub fn new_no_signals() -> Self {
-        Self::new(crate::graceful_termination::dummy())
+        Self::new(crate::signals::dummy_signal_stream())
     }
 
     pub fn core(&self) -> StageCore {

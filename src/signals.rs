@@ -11,7 +11,7 @@ pub enum Signal {
     Term,
 }
 
-pub struct GracefulTermination {
+pub struct Signals {
     signals_handle: Handle,
     thread_handle: Option<std::thread::JoinHandle<()>>,
     recv: InactiveSignalStream,
@@ -20,7 +20,7 @@ pub struct GracefulTermination {
 pub type SignalStream = Receiver<Signal>;
 pub type InactiveSignalStream = InactiveReceiver<Signal>;
 
-impl GracefulTermination {
+impl Signals {
     pub fn new() -> std::io::Result<Self> {
         let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
         let signals_handle = signals.handle();
@@ -86,16 +86,18 @@ impl GracefulTermination {
     }
 }
 
-impl Drop for GracefulTermination {
+impl Drop for Signals {
     fn drop(&mut self) {
+        let _span = info_span!("drop").entered();
         self.signals_handle.close();
         if let Some(thread_handle) = self.thread_handle.take() {
+            debug!("Waiting for thread to die");
             let _: Result<_, _> = thread_handle.join();
         }
     }
 }
 
-pub fn dummy() -> InactiveSignalStream {
+pub fn dummy_signal_stream() -> InactiveSignalStream {
     let (_, rcv) = async_broadcast::broadcast(1);
     rcv.deactivate()
 }
