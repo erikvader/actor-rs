@@ -11,6 +11,7 @@ use crate::{
 
 pub struct Line(pub String);
 
+// TODO: make this take any readable thing
 pub struct Stdin {
     send_to: Option<SecretAddress<Line>>,
 }

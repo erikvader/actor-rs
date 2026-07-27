@@ -22,10 +22,15 @@ use std::{
 };
 use tracing::{Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, warn};
 
-// TODO: this module needs to be split up into several submodules
+// TODO: this module probably needs to be split up into several submodules
 
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an actor",
+    label = "this guy right here",
+    note = "implement `Actor`"
+)]
 pub trait Actor: Sized + 'static {
     const MAIL_BOX_SIZE: usize = 0;
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
@@ -163,7 +168,8 @@ impl<A: Actor> ActorBuilder<A> {
     }
 
     fn create_root_span(id: Id, parent: Span) -> Span {
-        // TODO: should i prefix all of these with actor. to namespace them?
+        // TODO: should i prefix all of these with actor. to namespace them? Try out with compact
+        // and default logging style, it's fine with pretty.
         span!(parent: parent, Level::DEBUG, "actor", id = id, {GROUP_KEY} = field::Empty, "type" = type_name::<A>())
     }
 
@@ -210,6 +216,8 @@ impl<A: Actor> ActorBuilder<A> {
         let id = self.idgen.generate();
         let (fut, adr) = self.raw(Self::create_channel(), id, None);
         debug!(id, "type" = type_name::<A>(), "Spawn new actor");
+        // TODO: make this a shared future and put in address, it can then have a way to wait for
+        // the actor to die.
         ex.spawn(fut).detach();
         adr
     }
@@ -372,6 +380,11 @@ pub struct AddressClosedError {
 }
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
+#[diagnostic::on_unimplemented(
+    message = "can't send messages of type `{T}` to actor `{Self}`",
+    label = "this one",
+    note = "implement `Receive<{T}>` on `{Self}` to make it be able to receive them"
+)]
 pub trait Receive<T>: Actor {
     // NOTE: I'm pretty sure the 'static bound on the Actor trait is implying that this also must be
     // 'static
@@ -507,7 +520,16 @@ impl<A: Actor> WeakAddress<A> {
     private_bounds,
     reason = "CanSendPriv and all types it is using should be private"
 )]
+#[diagnostic::on_unimplemented(
+    message = "can't send `{T}` to `{A}`",
+    label = "here",
+    note = "address scope is `{Self}`",
+    note = "`{T}` must implement `Send` if it is sent across threads",
+    note = "`{T}` must be `'static`, it can't borrow anything",
+    note = "`{A}` must be able to receive `{T}`"
+)]
 pub trait CanSend<A, T>: CanSendPriv<A, T> {}
+#[diagnostic::do_not_recommend]
 impl<A, T, X> CanSend<A, T> for X where X: CanSendPriv<A, T> {}
 
 trait CanSendPriv<A, T>: Scope {
@@ -592,14 +614,15 @@ trait Deliverable<A: Actor> {
 }
 
 mod unsafe_wrapper {
-    // TODO: it would be nice to add a ThreadId to this struct so it can double check in runtime
-    // that the contained value didn't get moved to another thread. The problem is that i cant use
-    // repr transparent if i do that, which is sad because that means i cant use pointer magic to
-    // convert it into its boxed inner type without allocating a new box. I could make a debug
-    // variant that takes that penalty, but that means i would have two different implementations
-    // for different build types, which sound risky.
-    #[repr(transparent)]
-    pub struct UnsafeSendWrapper<D>(D);
+    #[cfg(debug_assertions)]
+    use std::thread;
+
+    #[cfg_attr(not(debug_assertions), repr(transparent))]
+    pub struct UnsafeSendWrapper<D> {
+        inner: D,
+        #[cfg(debug_assertions)]
+        origin_thread: thread::ThreadId,
+    }
 
     // SAFETY: the new function is unsafe, so the caller is responsible for safety
     unsafe impl<D> Send for UnsafeSendWrapper<D> {}
@@ -608,19 +631,43 @@ mod unsafe_wrapper {
         // SAFETY: This makes !Send data appear as Send, so care should be taken to make sure this
         // value doesn't change threads.
         pub unsafe fn new(data: D) -> Self {
-            Self(data)
+            Self {
+                inner: data,
+                #[cfg(debug_assertions)]
+                origin_thread: thread::current().id(),
+            }
         }
 
+        #[cfg_attr(
+            debug_assertions,
+            expect(
+                clippy::boxed_local,
+                reason = "complains on the debug variant, but is needed on the release variant"
+            )
+        )]
         pub fn into_boxed_inner(self: Box<Self>) -> Box<D> {
-            let raw = Box::into_raw(self);
-            let inner_raw = raw as *mut D;
-            // SAFETY: the wrapper is repr(transparent), so its guaranteed to have the same size and
-            // alignment, making this cast safe.
-            unsafe { Box::from_raw(inner_raw) }
+            cfg_select! {
+                debug_assertions => {
+                    Box::new(self.inner)
+                }
+                _ => {
+                    let raw = Box::into_raw(self);
+                    let inner_raw = raw as *mut D;
+                    // SAFETY: the wrapper is repr(transparent), so its guaranteed to have the same size and
+                    // alignment, making this cast safe.
+                    unsafe { Box::from_raw(inner_raw) }
+                }
+            }
         }
 
         pub fn inner(&self) -> &D {
-            &self.0
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                thread::current().id(),
+                self.origin_thread,
+                "Value was sent to another thread"
+            );
+            &self.inner
         }
     }
 }
@@ -754,6 +801,8 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         Ok(Reply { recv: ret_rcv })
     }
 
+    // TODO: the return value is constrained too much here. No value is ever sent, but it's still
+    // constrained to be Send. This probably requires another trait to solve.
     pub async fn send<T>(&self, msg: T) -> Result<(), SendError>
     where
         T: 'static,
@@ -784,8 +833,6 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 }
 
-// TODO: it would be nice to have some kind of tests that makes sure some things CAN'T be done, i.e.
-// compilation failure.
 // TODO: merge these with the other impls for specific addresses?
 impl<A: Actor> GenericAddress<A, Remote> {
     pub fn secret<T>(&self) -> SecretAddress<T>
