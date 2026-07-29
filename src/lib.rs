@@ -6,6 +6,7 @@ pub mod utils;
 pub mod actor;
 pub mod actors;
 mod heart;
+mod kill_switch;
 pub mod signals;
 mod stream_utils;
 

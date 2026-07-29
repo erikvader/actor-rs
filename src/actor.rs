@@ -1,6 +1,7 @@
 use crate::{
     actor::unsafe_wrapper::UnsafeSendWrapper,
     heart::{self, Heart, PanicError, Rune},
+    kill_switch::{self, Bomb, Switch},
     signals::InactiveSignalStream,
     stream_utils::{StreamExt as _, YieldPolicy, yield_guard},
 };
@@ -92,8 +93,8 @@ pub struct Control<A: Actor> {
     // closed on accident by only having inactive receivers
     signals: InactiveSignalStream,
     new_tasks: Vec<FallibleTask<()>>,
-    task_heart: Heart,
-    task_rune: Rune,
+    task_bomb: Bomb,
+    task_switch: Switch,
     idgen: IdGenerator,
     thread_root_span: Span,
 }
@@ -121,6 +122,8 @@ impl IdGenerator {
 
     fn generate(&self) -> Id {
         self.counter
+            // NOTE: this is a standalone counter that doesn't synchronize other data, so relaxed is
+            // fine
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -216,9 +219,8 @@ impl<A: Actor> ActorBuilder<A> {
         let id = self.idgen.generate();
         let (fut, adr) = self.raw(Self::create_channel(), id, None);
         debug!(id, "type" = type_name::<A>(), "Spawn new actor");
-        // TODO: make this a shared future and put in address, it can then have a way to wait for
-        // the actor to die.
-        ex.spawn(fut).detach();
+        // TODO: put a bomb in each address, and a switch in actor runner
+        let task = ex.spawn(fut).fallible();
         adr
     }
 
@@ -277,7 +279,7 @@ impl<A: Actor> Control<A> {
         idgen: IdGenerator,
         thread_root_span: Span,
     ) -> Self {
-        let (task_heart, task_rune) = heart::create();
+        let (task_bomb, task_switch) = kill_switch::create();
         Self {
             ex,
             actor_rune: rune,
@@ -285,8 +287,8 @@ impl<A: Actor> Control<A> {
             home,
             signals,
             new_tasks: Vec::new(),
-            task_heart,
-            task_rune,
+            task_bomb,
+            task_switch,
             idgen,
             thread_root_span,
         }
@@ -303,7 +305,7 @@ impl<A: Actor> Control<A> {
         if let Some(adr) = self.home.upgrade() {
             adr.sender.close();
         }
-        self.task_rune.kill_heart();
+        self.task_switch.detonate();
     }
 
     #[instrument(skip_all)]
@@ -345,7 +347,7 @@ impl<A: Actor> Control<A> {
     // TODO: somehow get some kind of identifier for this job
     pub fn start_job<F>(&mut self, future: F)
     where
-        F: AsyncFnOnce(Heart) + 'static,
+        F: AsyncFnOnce(Bomb) + 'static,
     {
         debug!("type" = type_name::<F>(), "Starting a job");
         let task = self
@@ -353,7 +355,7 @@ impl<A: Actor> Control<A> {
             .upgrade()
             .expect("the executor is always alive here")
             // TODO: what span do I want these in? thread_root_span?
-            .spawn(future(self.task_heart.clone()))
+            .spawn(future(self.task_bomb.clone()))
             .fallible();
 
         self.new_tasks.push(task);
@@ -361,11 +363,11 @@ impl<A: Actor> Control<A> {
 
     pub fn start_blocking_job<F>(&mut self, thunk: F)
     where
-        F: FnOnce(Heart) + Send + 'static,
+        F: FnOnce(Bomb) + Send + 'static,
     {
         debug!("type" = type_name::<F>(), "Starting a blocking job");
         let task = blocking::unblock({
-            let heart = self.task_heart.clone();
+            let heart = self.task_bomb.clone();
             move || thunk(heart)
         })
         .fallible();

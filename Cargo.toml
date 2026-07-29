@@ -11,7 +11,6 @@ async-executor = "1.14.0"
 async-io = { version = "2.6.0", default-features = false }
 #NOTE: this has a tracing feature, which i assume just adds logs, which i don't want
 blocking = { version = "1.6.2", default-features = false }
-event-listener = "5.4.2"
 #NOTE: the primitives in futures-util are full of footguns and weird design, these are
 #better.
 futures-concurrency = "7.7.1"

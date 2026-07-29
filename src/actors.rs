@@ -1,1 +1,1 @@
-pub mod stdin;
+pub mod line_reader;

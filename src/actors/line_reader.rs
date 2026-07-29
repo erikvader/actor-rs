@@ -6,7 +6,7 @@ use tracing::Instrument;
 
 use crate::{
     actor::{Actor, Control, SecretAddress},
-    heart::{Heart, Watch},
+    kill_switch::{Bomb, Tick},
 };
 
 pub struct Line(pub String);
@@ -20,7 +20,7 @@ impl Actor for Stdin {
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let send_to = self.send_to.take().expect("will exist here");
         let myself = ctl.address();
-        let fut = move |mut heart: Heart| {
+        let fut = move |bomb: Bomb| {
             async move {
                 let _myself = myself; // NOTE: keep the actor alive
 
@@ -32,29 +32,22 @@ impl Actor for Stdin {
                     BufReader::new(Unblock::new(stdin))
                 };
 
-                let mut lines = pin!(heart.watch_stream(stdin.lines()));
+                let mut lines = pin!(bomb.attach_stream(stdin.lines()));
                 while let Some(watch) = lines.next().await {
                     match watch {
-                        Watch::Ready(Ok(line)) => {
+                        Tick::Tock(Ok(line)) => {
                             if send_to.send(Line(line)).await.is_err() {
                                 tracing::warn!("Receiver closed");
                             }
                         }
-                        Watch::Ready(Err(error)) => {
+                        Tick::Tock(Err(error)) => {
                             // TODO: possible to send lossy non-utf8 lines?
                             tracing::error!(
                                 error = &error as &dyn std::error::Error,
                                 "Line read errored"
                             );
                         }
-                        Watch::DeadPanic(error) => {
-                            tracing::error!(
-                                error = &error as &dyn std::error::Error,
-                                "Actor panicked"
-                            );
-                            break;
-                        }
-                        Watch::Dead => break,
+                        Tick::Boom => break,
                     }
                 }
 

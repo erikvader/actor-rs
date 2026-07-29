@@ -13,7 +13,6 @@ dependencies = [
  "async-io",
  "blocking",
  "ctor",
- "event-listener",
  "futures-concurrency",
  "futures-core",
  "futures-test",
