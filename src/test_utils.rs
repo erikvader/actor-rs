@@ -37,6 +37,14 @@ macro_rules! assert_future_pending {
 }
 
 macro_rules! assert_future_ready {
+    (unpin $fut:expr) => {{
+        let mut fut = $fut;
+        assert_future_ready!(fut)
+    }};
+    (unpin $fut:expr, $($args:tt)+) => {{
+        let mut fut = $fut;
+        assert_future_ready!(fut, $($args)+)
+    }};
     (pin $fut:expr) => {{
         let mut fut = core::pin::pin!($fut);
         assert_future_ready!(fut)
