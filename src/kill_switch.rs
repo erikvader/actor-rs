@@ -22,6 +22,7 @@ impl Switch {
     }
 }
 
+// TODO: why did i add this?
 #[derive(Clone)]
 /// Dropping this will surely activate it
 pub struct UnstableSwitch {

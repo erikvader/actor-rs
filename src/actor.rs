@@ -96,8 +96,13 @@ pub struct Control<A: Actor> {
     task_switch: Switch,
     idgen: IdGenerator,
     thread_root_span: Span,
-    // NOTE: these are last so they are dropped last
+    // NOTE: these are last so they are dropped last, right before the task terminates
     actor_rune: Rune,
+    // NOTE: I can't use a copy of the receiver here for the purpose of tracking when the actor has
+    // actually died, since a soft exit will close the channel, so it will appear dead long before
+    // the task is actually dropped.
+    #[expect(dead_code, reason = "this is only here as a guard")]
+    address_switch: Switch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -180,12 +185,13 @@ impl<A: Actor> ActorBuilder<A> {
     fn raw(
         self,
         (snd, rcv): (AdrSnd<A>, AdrRcv<A>),
+        (bomb, switch): (Bomb, Switch),
         id: Id,
         group_id: Option<Id>,
     ) -> (impl Future<Output = ()>, Address<A>) {
         // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
         // sender from another address.
-        let home = unsafe { Address::new(snd) };
+        let home = unsafe { Address::new(snd, bomb) };
 
         let span = {
             let span = Self::create_root_span(id, self.thread_root_span.clone());
@@ -202,6 +208,7 @@ impl<A: Actor> ActorBuilder<A> {
             self.signals,
             self.idgen,
             self.thread_root_span,
+            switch,
         );
 
         let fut = actor_main(ctl, self.actor, rcv, home.clone()).instrument(span);
@@ -212,16 +219,15 @@ impl<A: Actor> ActorBuilder<A> {
     fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
         let id = self.idgen.generate();
         debug!(id, "type" = type_name::<A>(), "Non-spawn new actor");
-        self.raw(Self::create_channel(), id, None)
+        self.raw(Self::create_channel(), kill_switch::create(), id, None)
     }
 
     fn spawn(self) -> Address<A> {
         let ex = Rc::clone(&self.ex);
         let id = self.idgen.generate();
-        let (fut, adr) = self.raw(Self::create_channel(), id, None);
+        let (fut, adr) = self.raw(Self::create_channel(), kill_switch::create(), id, None);
         debug!(id, "type" = type_name::<A>(), "Spawn new actor");
-        // TODO: put a bomb in each address, and a switch in actor runner
-        let task = ex.spawn(fut).fallible();
+        ex.spawn(fut).detach();
         adr
     }
 
@@ -231,6 +237,7 @@ impl<A: Actor> ActorBuilder<A> {
     {
         let ex = Rc::clone(&self.ex);
         let channel = Self::create_channel();
+        let bomb = kill_switch::create();
         let group_id = self.idgen.generate();
         debug!(
             group_id,
@@ -241,11 +248,13 @@ impl<A: Actor> ActorBuilder<A> {
 
         for _ in 0..additional {
             let id = self.idgen.generate();
-            let (fut, _) = self.clone().raw(channel.clone(), id, Some(group_id));
+            let (fut, _) = self
+                .clone()
+                .raw(channel.clone(), bomb.clone(), id, Some(group_id));
             ex.spawn(fut).detach();
         }
 
-        let (fut, adr) = self.raw(channel, group_id, Some(group_id));
+        let (fut, adr) = self.raw(channel, bomb, group_id, Some(group_id));
         ex.spawn(fut).detach();
         adr
     }
@@ -279,6 +288,7 @@ impl<A: Actor> Control<A> {
         signals: InactiveSignalStream,
         idgen: IdGenerator,
         thread_root_span: Span,
+        address_switch: Switch,
     ) -> Self {
         let (task_bomb, task_switch) = kill_switch::create();
         Self {
@@ -292,6 +302,7 @@ impl<A: Actor> Control<A> {
             task_switch,
             idgen,
             thread_root_span,
+            address_switch,
         }
     }
 
@@ -422,6 +433,7 @@ const_assert_eq!(std::mem::size_of::<Remote>(), 0);
 
 pub struct GenericAddress<A: Actor, S: Scope> {
     sender: channel::Sender<ErasedDeliverable<A>>,
+    bomb: Bomb,
     _scope: PhantomData<S>,
 }
 
@@ -433,6 +445,7 @@ assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
 
 pub struct GenericWeakAddress<A: Actor, S: Scope> {
     sender: channel::WeakSender<ErasedDeliverable<A>>,
+    bomb: Bomb,
     _scope: PhantomData<S>,
 }
 
@@ -445,50 +458,62 @@ assert_impl_all!(RemoteWeakAddress<DummyActor>: Send, Sync);
 impl<A: Actor, S: Scope> Clone for GenericAddress<A, S> {
     fn clone(&self) -> Self {
         let c = self.sender.clone();
+        let b = self.bomb.clone();
         // SAFETY: this gets the same scope as the original
-        unsafe { Self::new(c) }
+        unsafe { Self::new(c, b) }
     }
 }
 
 impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
     fn clone(&self) -> Self {
         let c = self.sender.clone();
+        let b = self.bomb.clone();
         // SAFETY: this gets the same scope as the original
-        unsafe { Self::new(c) }
+        unsafe { Self::new(c, b) }
     }
 }
 
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(sender: channel::Sender<ErasedDeliverable<A>>) -> Self {
+    unsafe fn new(sender: channel::Sender<ErasedDeliverable<A>>, bomb: Bomb) -> Self {
         Self {
             sender,
+            bomb,
             _scope: PhantomData,
         }
     }
 
     pub fn downgrade(&self) -> GenericWeakAddress<A, S> {
         let c = self.sender.downgrade();
+        let b = self.bomb.clone();
         // SAFETY: this gets the same scope as the original
-        unsafe { GenericWeakAddress::new(c) }
+        unsafe { GenericWeakAddress::new(c, b) }
     }
 
+    /// Can't send any more messages, but the actor might still be alive
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
 
-    pub async fn closed(&self) {
-        self.sender.closed().await
+    /// The actor is dead
+    pub fn is_dead(&self) -> bool {
+        self.bomb.has_exploded()
+    }
+
+    /// Wait for the actor to die. Remember that this non-weak address is keeping the actor alive
+    pub async fn wait(&self) {
+        self.bomb.wait().await
     }
 }
 
 impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(sender: channel::WeakSender<ErasedDeliverable<A>>) -> Self {
+    unsafe fn new(sender: channel::WeakSender<ErasedDeliverable<A>>, bomb: Bomb) -> Self {
         Self {
             sender,
+            bomb,
             _scope: PhantomData,
         }
     }
@@ -497,7 +522,20 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
         self.sender
             .upgrade()
             // SAFETY: this gets the same scope as the original
-            .map(|sender| unsafe { GenericAddress::new(sender) })
+            .map(|sender| {
+                let b = self.bomb.clone();
+                unsafe { GenericAddress::new(sender, b) }
+            })
+    }
+
+    /// The actor is dead
+    pub fn is_dead(&self) -> bool {
+        self.bomb.has_exploded()
+    }
+
+    /// Wait for the actor to die.
+    pub async fn wait(&self) {
+        self.bomb.wait().await
     }
 }
 
@@ -506,7 +544,8 @@ impl<A: Actor> Address<A> {
         // SAFETY: It's safe to go from a local address to a remote one, but not the other way
         // around, since a remote address can only send data that is Send.
         let c = self.sender.clone();
-        unsafe { RemoteAddress::new(c) }
+        let b = self.bomb.clone();
+        unsafe { RemoteAddress::new(c, b) }
     }
 }
 
@@ -515,7 +554,8 @@ impl<A: Actor> WeakAddress<A> {
         // SAFETY: It's safe to go from a local address to a remote one, but not the other way
         // around, since a remote address can only send data that is Send.
         let c = self.sender.clone();
-        unsafe { RemoteWeakAddress::new(c) }
+        let b = self.bomb.clone();
+        unsafe { RemoteWeakAddress::new(c, b) }
     }
 }
 
@@ -918,6 +958,7 @@ where
     }
 }
 
+// TODO: create a weak secret address?
 pub struct SecretAddress<T> {
     secret: Box<dyn SecretSend<T> + Send>,
     _scope: PhantomData<T>,
