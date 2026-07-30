@@ -86,7 +86,6 @@ pub struct Control<A: Actor> {
     // NOTE: weak so the executor can drop itself even if there are actors still alive
     ex: Weak<LocalExecutor<'static>>,
     state: State,
-    actor_rune: Rune,
     // NOTE: weak so the actor doesn't keep itself alive
     home: WeakAddress<A>,
     // NOTE: being inactive doesn't count towards this channel getting closed, so it won't get
@@ -97,6 +96,8 @@ pub struct Control<A: Actor> {
     task_switch: Switch,
     idgen: IdGenerator,
     thread_root_span: Span,
+    // NOTE: these are last so they are dropped last
+    actor_rune: Rune,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -203,7 +204,7 @@ impl<A: Actor> ActorBuilder<A> {
             self.thread_root_span,
         );
 
-        let fut = actor_runner(self.actor, rcv, ctl, home.clone()).instrument(span);
+        let fut = actor_main(ctl, self.actor, rcv, home.clone()).instrument(span);
         (fut, home)
     }
 
@@ -939,10 +940,11 @@ impl<T> SecretAddress<T> {
     }
 }
 
-async fn actor_runner<A: Actor>(
+async fn actor_main<A: Actor>(
+    // NOTE: control is the first argument so it is dropped last
+    mut ctl: Control<A>,
     mut actor: A,
     rcv: channel::Receiver<ErasedDeliverable<A>>,
-    mut ctl: Control<A>,
     home_adr: Address<A>,
 ) {
     debug!("Enter");
@@ -1007,31 +1009,40 @@ async fn actor_runner<A: Actor>(
             }
 
             for task in ctl.new_tasks.drain(..) {
-                events
-                    .as_mut()
-                    .mut_pin_main()
-                    .mut_pin_group()
-                    // NOTE: I never cancel tasks, so it being none must mean it panicked
-                    .insert(task.map(|res| Event::TaskDone(res.is_none())));
+                events.as_mut().mut_pin_main().mut_pin_group().push(
+                    crate::stream_utils::FutureExt::map(task, |res| {
+                        // NOTE: I never cancel tasks in this loop, so it being none must mean it
+                        // panicked
+                        Event::TaskDone(res.is_none())
+                    }),
+                );
             }
 
             if ctl.state == State::HardExiting {
-                // NOTE: it would be nice if cancel could be explicitly called on all background
-                // tasks here, but FutureGroup doesn't allow that. They will be cancelled when the
-                // group drops in any case.
                 debug!("Hard exit, breaking loop");
                 break;
             }
 
-            // TODO: test that this even works
             guard.yield_point().await;
         }
     })
     .await;
 
+    debug!("Cancelling all bg tasks");
+    {
+        let pinned_group_ref = events.mut_pin_main().mut_pin_group();
+        let group_ref = Pin::into_inner(pinned_group_ref);
+        let group = std::mem::take(group_ref);
+        futures_util::stream::iter(group.into_iter().map(|m| m.into_future().cancel()))
+            .for_each_concurrent(None, async |fut| {
+                let _: Option<()> = fut.await;
+            })
+            .await;
+    }
+
     debug!("Leave");
     actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
-    debug!("Died");
+    debug!("Died"); // NOTE: this is logged before all runes and stuff have dropped, but whatever
 }
 
 #[derive(Clone)]

@@ -18,25 +18,26 @@ impl Switch {
     }
 
     pub fn into_unstable(self) -> UnstableSwitch {
-        UnstableSwitch { inner: self.inner }
+        UnstableSwitch { inner: self }
     }
 }
 
 #[derive(Clone)]
 /// Dropping this will surely activate it
 pub struct UnstableSwitch {
-    inner: channel::Sender<()>,
+    inner: Switch,
 }
 
 impl Drop for UnstableSwitch {
     fn drop(&mut self) {
-        self.inner.close();
+        self.inner.detonate();
     }
 }
 
 #[derive(Clone)]
 // TODO: this could probably be an IntoFuture, but I need a concrete type for that
 pub struct Bomb {
+    // RANT: this channel is !Unpin even though it doesn't have to be
     inner: channel::Receiver<()>,
 }
 

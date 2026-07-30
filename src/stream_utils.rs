@@ -5,8 +5,8 @@ use std::{
     task::Poll,
 };
 
-use futures_concurrency::future::FutureGroup;
 use futures_core::{FusedStream, Stream};
+use futures_util::stream::FuturesUnordered;
 use pin_project::pin_project;
 
 // NOTE: this can't be a simple futures_util::stream::select since it will ignore the futuregroup if
@@ -19,7 +19,7 @@ pub struct WithFutures<S, F> {
     // NOTE: it's fine to poll this group over and over even though it has returned Ready(None).
     // It will start to return more results after more futures have been inserted into it.
     #[pin]
-    group: FutureGroup<F>,
+    group: FuturesUnordered<F>,
     group_first: bool,
 }
 
@@ -31,18 +31,18 @@ impl<S: Stream, F> WithFutures<S, F> {
     {
         Self {
             stream,
-            group: FutureGroup::new(),
+            group: FuturesUnordered::new(),
             group_first: false,
         }
     }
 }
 
 impl<S, F> WithFutures<S, F> {
-    pub fn mut_pin_group(self: Pin<&mut Self>) -> Pin<&mut FutureGroup<F>> {
+    pub fn mut_pin_group(self: Pin<&mut Self>) -> Pin<&mut FuturesUnordered<F>> {
         self.project().group
     }
 
-    pub fn group_ref(&self) -> &FutureGroup<F> {
+    pub fn group_ref(&self) -> &FuturesUnordered<F> {
         &self.group
     }
 
@@ -50,7 +50,7 @@ impl<S, F> WithFutures<S, F> {
         &self.stream
     }
 
-    pub fn mut_group(&mut self) -> &mut FutureGroup<F> {
+    pub fn mut_group(&mut self) -> &mut FuturesUnordered<F> {
         &mut self.group
     }
 }
@@ -260,6 +260,53 @@ where
     .await
 }
 
+pub trait FutureExt: Future {
+    fn map<F, U>(self, f: F) -> Map<Self, F>
+    where
+        F: FnOnce(Self::Output) -> U,
+        Self: Sized,
+    {
+        Map {
+            fut: self,
+            mapper: Some(f),
+        }
+    }
+}
+
+impl<F: Future> FutureExt for F {}
+
+#[pin_project]
+pub struct Map<Fut, F> {
+    #[pin]
+    fut: Fut,
+    mapper: Option<F>,
+}
+
+impl<Fut, F, U> Future for Map<Fut, F>
+where
+    Fut: Future,
+    F: FnOnce(Fut::Output) -> U,
+{
+    type Output = U;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let res = futures_core::ready!(this.fut.poll(cx));
+        Poll::Ready((this
+            .mapper
+            .take()
+            .expect("this will exist, on the first poll at least"))(
+            res
+        ))
+    }
+}
+
+impl<Fut, F> Map<Fut, F> {
+    pub fn into_future(self) -> Fut {
+        self.fut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,8 +451,8 @@ mod tests {
         fn fairness() {
             let s = fus::iter(vec![1, 2]).fuse();
             let mut s = s.with_future_group();
-            s.mut_group().insert(fuf::ready(3));
-            s.mut_group().insert(fuf::ready(4));
+            s.mut_group().push(fuf::ready(3));
+            s.mut_group().push(fuf::ready(4));
             assert_stream_next!(s, 3);
             assert_stream_next!(s, 1);
             assert_stream_next!(s, 4);
@@ -419,7 +466,7 @@ mod tests {
             let mut s = s.with_future_group();
             assert_stream_pending!(s); // NOTE: the group should have been polled here
             assert_stream_next!(s, 1);
-            s.mut_group().insert(fuf::ready(3));
+            s.mut_group().push(fuf::ready(3));
             assert_stream_next!(s, 3);
             assert_stream_pending!(s);
             assert_stream_next!(s, 2);
@@ -431,7 +478,7 @@ mod tests {
         fn empty_stream_non_empty_group() {
             let s = fus::empty();
             let mut s = s.with_future_group();
-            s.mut_group().insert(fuf::ready(1));
+            s.mut_group().push(fuf::ready(1));
             assert_stream_next!(s, 1);
             assert_stream_done!(s);
         }
