@@ -1,5 +1,8 @@
 use crate::{
-    actor::unsafe_wrapper::UnsafeSendWrapper,
+    actor::{
+        id_generator::{Id, IdGenerator},
+        unsafe_wrapper::UnsafeSendWrapper,
+    },
     heart::{self, Heart, PanicError, Rune},
     kill_switch::{self, Bomb, Switch},
     signals::InactiveSignalStream,
@@ -9,7 +12,7 @@ use async_channel as channel;
 use async_executor::{FallibleTask, LocalExecutor};
 use async_io::block_on;
 use futures_core::future::LocalBoxFuture;
-use futures_util::{FutureExt as _, StreamExt as _};
+use futures_util::{FutureExt as _, StreamExt as _, TryFutureExt};
 use pin_project::pin_project;
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
@@ -18,12 +21,12 @@ use std::{
     marker::PhantomData,
     pin::{Pin, pin},
     rc::{Rc, Weak},
-    sync::{Arc, atomic::AtomicU64},
     task::ready,
 };
 use tracing::{Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, warn};
 
-// TODO: this module probably needs to be split up into several submodules
+// TODO: this module probably needs to be split up into several submodules, but it's super tedious
+// and rust-analyzer isn't that big of a help.
 
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
@@ -112,25 +115,30 @@ enum State {
     HardExiting,
 }
 
-pub type Id = u64;
+mod id_generator {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
-#[derive(Clone)]
-struct IdGenerator {
-    counter: Arc<AtomicU64>,
-}
+    pub type Id = u64;
 
-impl IdGenerator {
-    fn new() -> Self {
-        Self {
-            counter: Arc::new(AtomicU64::new(0)),
-        }
+    #[derive(Clone)]
+    pub struct IdGenerator {
+        counter: Arc<AtomicU64>,
     }
 
-    fn generate(&self) -> Id {
-        self.counter
-            // NOTE: this is a standalone counter that doesn't synchronize other data, so relaxed is
-            // fine
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    impl IdGenerator {
+        pub fn new() -> Self {
+            Self {
+                counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        pub fn generate(&self) -> Id {
+            self.counter
+                // NOTE: this is a standalone counter that doesn't synchronize other data, so relaxed is
+                // fine
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }
     }
 }
 
@@ -147,7 +155,7 @@ struct ActorBuilder<A: Actor> {
     thread_root_span: Span,
 }
 
-const GROUP_KEY: &str = "group";
+const GROUP_KEY: &str = "actor.group";
 
 impl<A: Actor> ActorBuilder<A> {
     fn new(
@@ -177,9 +185,14 @@ impl<A: Actor> ActorBuilder<A> {
     }
 
     fn create_root_span(id: Id, parent: Span) -> Span {
-        // TODO: should i prefix all of these with actor. to namespace them? Try out with compact
-        // and default logging style, it's fine with pretty.
-        span!(parent: parent, Level::DEBUG, "actor", id = id, {GROUP_KEY} = field::Empty, "type" = type_name::<A>())
+        span!(
+            parent: parent,
+            Level::DEBUG,
+            "actor",
+            actor.id = id,
+            {GROUP_KEY} = field::Empty,
+            actor.type = type_name::<A>()
+        )
     }
 
     fn raw(
@@ -216,7 +229,7 @@ impl<A: Actor> ActorBuilder<A> {
     }
 
     #[cfg(test)]
-    fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
+    pub(crate) fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
         let id = self.idgen.generate();
         debug!(id, "type" = type_name::<A>(), "Non-spawn new actor");
         self.raw(Self::create_channel(), kill_switch::create(), id, None)
@@ -762,9 +775,13 @@ where
             // same effect by cloning the address and sending it alongside the message. It's not as
             // efficient, but it achieves the same thing, which is good enough for me.
             let _keep_alive = self.erased;
+            trace!("Received message");
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
         }
+        .instrument(
+            debug_span!("snd_rcv", msg.type = type_name::<Self>(), receiver.type = type_name::<A>()),
+        )
         .boxed_local()
     }
 }
@@ -786,8 +803,12 @@ where
     ) -> LocalBoxFuture<'a, ()> {
         async move {
             let _keep_alive = self.erased;
+            trace!("Received message");
             let _ret = actor.receive(self.msg, ctl).await;
         }
+        .instrument(
+            debug_span!("oneway", msg.type = type_name::<Self>(), receiver.type = type_name::<A>()),
+        )
         .boxed_local()
     }
 }
@@ -925,6 +946,7 @@ impl<T> Clone for Box<dyn SecretSend<T> + Send> {
 }
 
 trait SecretSend<T> {
+    // RANT: this can't be a simple async fn, cuz that is not object safe...
     fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>>;
     fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send>;
 }
@@ -936,7 +958,7 @@ where
     S: CanSend<A, T>,
 {
     fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
-        Box::new(self.send(msg)).boxed_local()
+        self.send(msg).boxed_local()
     }
 
     fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
@@ -958,6 +980,19 @@ where
     }
 }
 
+impl<T> SecretSend<T> for channel::Sender<T>
+where
+    T: Send + 'static,
+{
+    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+        self.send(msg).map_err(|_| SendError).boxed_local()
+    }
+
+    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
+        Box::new(self.clone())
+    }
+}
+
 // TODO: create a weak secret address?
 pub struct SecretAddress<T> {
     secret: Box<dyn SecretSend<T> + Send>,
@@ -965,6 +1000,21 @@ pub struct SecretAddress<T> {
 }
 assert_not_impl_any!(SecretAddress<Rc<()>>: Send);
 assert_impl_all!(SecretAddress<()>: Send);
+
+impl<T> SecretAddress<T> {
+    #[cfg(test)]
+    pub(crate) fn new_channel() -> (Self, channel::Receiver<T>)
+    where
+        T: Send + 'static,
+    {
+        let (snd, rcv) = channel::unbounded();
+        let adr = Self {
+            secret: Box::new(snd),
+            _scope: PhantomData,
+        };
+        (adr, rcv)
+    }
+}
 
 impl<T> Clone for SecretAddress<T> {
     fn clone(&self) -> Self {
@@ -1030,11 +1080,9 @@ async fn actor_main<A: Actor>(
                         .await
                 }
                 Some(Event::Delivery(delivery)) => {
-                    trace!("Delivery event");
-                    delivery
-                        .deliver(&mut actor, &mut ctl)
-                        .instrument(debug_span!("deliver")) // TODO: add the debug repr of delivery?
-                        .await
+                    // NOTE: the deliver method is responsible for logging and adding spans, since
+                    // it has the concrete types.
+                    delivery.deliver(&mut actor, &mut ctl).await
                 }
                 Some(Event::TaskDone(panicked)) => {
                     trace!("Task done event");
@@ -1094,8 +1142,6 @@ pub struct StageCore {
 assert_impl_all!(StageCore: Send, Sync);
 
 pub struct Stage {
-    // TODO: this could probably be a `Rc<dyn futures_task::LocalSpawn>`, then a stage could accept
-    // any spawner/executor
     ex: Rc<LocalExecutor<'static>>,
     heart: Heart,
     rune: Rune,
@@ -1156,15 +1202,45 @@ impl Stage {
     }
 
     pub fn play(self) -> Result<(), PanicError> {
+        self.play_internal(|heart, ex| block_on(ex.run(heart.wait())))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_plays_within(self, ticks: usize) {
+        self.play_internal(|heart, ex| {
+            for _ in 0..ticks {
+                if ex.is_empty() {
+                    break;
+                }
+                if !ex.try_tick() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            assert!(ex.is_empty(), "Did not finish within {ticks} ticks");
+
+            heart
+                .wait()
+                .now_or_never()
+                .expect("all actors should be dead")
+        })
+        .expect("Actor(s) panicked");
+    }
+
+    fn play_internal<F>(self, f: F) -> Result<(), PanicError>
+    where
+        F: FnOnce(Heart, &Rc<LocalExecutor<'static>>) -> Result<(), PanicError>,
+    {
         fn take_essentials_drop_the_rest(this: Stage) -> (Heart, Rc<LocalExecutor<'static>>) {
             (this.heart, this.ex)
         }
-        let (mut heart, ex) = take_essentials_drop_the_rest(self);
+        let (heart, ex) = take_essentials_drop_the_rest(self);
 
         debug!(num_actors = heart.rune_count(), "Action!");
-        let res = block_on(ex.run(heart.wait()));
-        assert_eq!(Rc::strong_count(&ex), 1);
+        let res = f(heart, &ex);
         debug!(?res, "Play exited");
+
+        assert!(ex.is_empty());
+        assert_eq!(Rc::strong_count(&ex), 1);
         res
     }
 }
@@ -1175,6 +1251,12 @@ mod tests {
 
     mod simple {
         use super::*;
+
+        #[test]
+        fn no_actors_added() {
+            let stage = Stage::new_no_signals();
+            assert!(stage.play().is_ok());
+        }
 
         #[test]
         fn terminate_when_all_addresses_gone() {
@@ -1237,12 +1319,12 @@ mod tests {
                     let _span = thread_info_span().entered();
                     let stage = Stage::new_from_core(core);
                     stage.summon(Bob { alice: alice_adr });
-                    stage.play().unwrap();
+                    stage.assert_plays_within(100);
                 }
             });
 
             drop(alice_adr);
-            main_stage.play().unwrap();
+            main_stage.assert_plays_within(100);
             t1.join().unwrap();
         }
     }

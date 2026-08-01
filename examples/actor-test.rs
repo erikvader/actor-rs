@@ -16,9 +16,11 @@ fn setup_tracing() {
         anstream::AutoStream::choice(&std::io::stdout()),
         ColorChoice::AlwaysAnsi | ColorChoice::Always
     );
+    // TODO: setup with systemd if started from a service
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
         .with_ansi(use_ansi)
+        // TODO: don't use pretty, use the default non-compact one
         .pretty();
 
     let filter = Targets::new().with_default(LevelFilter::TRACE);
