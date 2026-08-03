@@ -45,6 +45,7 @@ fn setup_tracing() {
 #[snafu::report]
 fn main() -> Result<(), Whatever> {
     setup_tracing();
+    let _span = actor_rs::utils::thread_info_span().entered();
     let grace = Signals::new().whatever_context("Couldn't create signal handler")?;
     let stage = Stage::with_signals(&grace);
 

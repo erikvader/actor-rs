@@ -106,6 +106,7 @@ pub struct Control<A: Actor> {
     task_switch: Switch,
     idgen: IdGenerator,
     thread_root_span: Span,
+    actor_span: Span,
     // NOTE: these are last so they are dropped last, right before the task terminates
     actor_rune: Rune,
     // NOTE: I can't use a copy of the receiver here for the purpose of tracking when the actor has
@@ -191,12 +192,12 @@ impl<A: Actor> ActorBuilder<A> {
         }
     }
 
-    fn create_root_span(id: Id, parent: Span) -> Span {
+    fn create_root_span(id: Id, parent: &Span) -> Span {
         span!(
             parent: parent,
             Level::DEBUG,
             "actor",
-            id = id,
+            id,
             {GROUP_KEY} = field::Empty,
         )
     }
@@ -213,7 +214,7 @@ impl<A: Actor> ActorBuilder<A> {
         let home = unsafe { Address::new(snd, bomb) };
 
         let span = {
-            let span = Self::create_root_span(id, self.thread_root_span.clone());
+            let span = Self::create_root_span(id, &self.thread_root_span);
             if let Some(group_id) = group_id {
                 span.record(GROUP_KEY, group_id);
             }
@@ -227,6 +228,7 @@ impl<A: Actor> ActorBuilder<A> {
             self.signals,
             self.idgen,
             self.thread_root_span,
+            span.clone(),
             switch,
         );
 
@@ -307,6 +309,7 @@ impl<A: Actor> Control<A> {
         signals: InactiveSignalStream,
         idgen: IdGenerator,
         thread_root_span: Span,
+        actor_span: Span,
         address_switch: Switch,
     ) -> Self {
         let (task_bomb, task_switch) = kill_switch::create();
@@ -321,6 +324,7 @@ impl<A: Actor> Control<A> {
             task_switch,
             idgen,
             thread_root_span,
+            actor_span,
             address_switch,
         }
     }
@@ -376,30 +380,34 @@ impl<A: Actor> Control<A> {
     }
 
     // TODO: somehow get some kind of identifier for this job
-    pub fn start_job<F>(&mut self, future: F)
+    pub fn start_job<F, S>(&mut self, future: F, spanner: S)
     where
         F: AsyncFnOnce(Bomb) + 'static,
+        S: FnOnce(&Span) -> Span,
     {
         debug!("type" = type_name::<F>(), "Starting a job");
+        let span = spanner(&self.actor_span);
+
         let task = self
             .ex
             .upgrade()
             .expect("the executor is always alive here")
-            // TODO: what span do I want these in? thread_root_span?
-            .spawn(future(self.task_bomb.clone()))
+            .spawn(future(self.task_bomb.clone()).instrument(span))
             .fallible();
 
         self.new_tasks.push(task);
     }
 
-    pub fn start_blocking_job<F>(&mut self, thunk: F)
+    pub fn start_blocking_job<F, S>(&mut self, thunk: F, spanner: S)
     where
         F: FnOnce(Bomb) + Send + 'static,
+        S: FnOnce(&Span) -> Span,
     {
         debug!("type" = type_name::<F>(), "Starting a blocking job");
         let task = blocking::unblock({
             let heart = self.task_bomb.clone();
-            move || thunk(heart)
+            let span = spanner(&self.actor_span);
+            move || span.in_scope(|| thunk(heart))
         })
         .fallible();
         self.new_tasks.push(task);

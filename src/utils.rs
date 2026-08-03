@@ -5,6 +5,7 @@ unsafe extern "C" {
     fn gettid() -> i32;
 }
 
+#[must_use = "This span must be used to do anything, consider entering it"]
 pub fn thread_info_span() -> Span {
     let os_id = unsafe { gettid() };
     let rust_id = std::thread::current().id();

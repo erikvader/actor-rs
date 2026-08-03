@@ -99,8 +99,7 @@ where
         let cleanup = self.cleaner.take().expect("will exist here");
         let myself: Address<Self> = ctl.address().expect("Is guaranteed to be alive in enter");
 
-        let fut = move |bomb: Bomb| {
-            async move {
+        let fut = async move |bomb: Bomb| {
                 let _myself = myself; // NOTE: keep the actor alive
 
                 let mut lines = pin!(bomb.attach_stream(read_from.lines()));
@@ -132,10 +131,12 @@ where
                 cleanup.cleanup().await;
 
                 tracing::debug!("Exited");
-            }
-            .instrument(tracing::info_span!("bg_job"))
         };
-        ctl.start_job(fut);
+
+        ctl.start_job(
+            fut,
+            |parent| tracing::info_span!(parent: parent, "read_job"),
+        );
     }
 
     async fn interrupted(&mut self, ctl: &mut Control<Self>) {
