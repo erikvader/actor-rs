@@ -55,7 +55,7 @@ impl Bomb {
     }
 
     pub async fn attach_future<T>(&self, fut: impl Future<Output = T>) -> Tick<T> {
-        // NOTE: this select will always prioritize the left future
+        // HACK: this select will always prioritize the left future
         match futures_util::future::select(pin!(self.wait()), pin!(fut)).await {
             futures_util::future::Either::Left(((), _)) => Tick::Boom,
             futures_util::future::Either::Right((val, _)) => Tick::Tock(val),

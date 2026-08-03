@@ -3,12 +3,33 @@ use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Handle,
 };
-use tracing::{debug, error, info_span};
+use tracing::{debug, error, info_span, warn};
 
 #[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Signal {
     Int,
     Term,
+}
+
+impl TryFrom<i32> for Signal {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            SIGINT => Ok(Signal::Int),
+            SIGTERM => Ok(Signal::Term),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<Signal> for i32 {
+    fn from(value: Signal) -> Self {
+        match value {
+            Signal::Int => SIGINT,
+            Signal::Term => SIGTERM,
+        }
+    }
 }
 
 pub struct Signals {
@@ -25,46 +46,59 @@ impl Signals {
         let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
         let signals_handle = signals.handle();
         let (snd, rcv) = async_broadcast::broadcast(16);
-        const MAXIMUM: i32 = 2;
+        const MAXIMUM: i32 = 3;
 
         let thread_handle = std::thread::spawn(move || {
-            let _span = info_span!("Signals thread").entered();
+            let _span = info_span!("signals").entered();
             debug!("Started");
 
             let mut sigint_count = 0;
             let mut sigterm_count = 0;
-            let mut latest: Option<i32> = None;
+            let mut largest: Option<Signal> = None;
 
             for raw_signal in signals.forever() {
-                debug!(raw_signal, sigint_count, sigterm_count, "Received signal");
+                let signal = Signal::try_from(raw_signal)
+                    .expect("can't receive signals i'm not listening for");
 
-                latest = Some(raw_signal);
-                let signal = match raw_signal {
-                    SIGINT => {
+                largest = std::cmp::max(largest, Some(signal));
+
+                match signal {
+                    Signal::Int => {
                         sigint_count += 1;
+                        warn!(
+                            count = sigint_count,
+                            force_quit = MAXIMUM,
+                            "Received SIGINT"
+                        );
                         if sigint_count >= MAXIMUM {
                             break;
                         }
-                        Signal::Int
                     }
-                    SIGTERM => {
+                    Signal::Term => {
                         sigterm_count += 1;
+                        warn!(
+                            count = sigterm_count,
+                            force_quit = MAXIMUM,
+                            "Received SIGTERM"
+                        );
                         if sigterm_count >= MAXIMUM {
                             break;
                         }
-                        Signal::Term
                     }
-                    _ => unreachable!(),
                 };
 
                 if let Err(e) = snd.try_broadcast(signal) {
-                    error!(error = %e, "Failed to broadcast signal");
+                    error!(
+                        error = &e as &dyn std::error::Error,
+                        "Failed to broadcast signal"
+                    );
                 }
             }
 
-            if let Some(signal) = latest {
-                debug!(signal, "Executing default signal handler");
-                signal_hook::low_level::emulate_default_handler(signal).expect("The signal exists");
+            if let Some(signal) = largest {
+                debug!(?signal, "Executing default signal handler");
+                signal_hook::low_level::emulate_default_handler(signal.into())
+                    .expect("The signal exists");
             }
 
             debug!("Exited");
@@ -88,7 +122,7 @@ impl Signals {
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        let _span = info_span!("drop").entered();
+        let _span = info_span!("signals_drop").entered();
         self.signals_handle.close();
         if let Some(thread_handle) = self.thread_handle.take() {
             debug!("Waiting for thread to die");

@@ -6,10 +6,10 @@ unsafe extern "C" {
 }
 
 pub fn thread_info_span() -> Span {
-    let os_thread_id = unsafe { gettid() };
-    let rust_thread_id = std::thread::current().id();
-    let thread_name = std::thread::current()
+    let os_id = unsafe { gettid() };
+    let rust_id = std::thread::current().id();
+    let name = std::thread::current()
         .name()
         .map_or_else(|| "unnamed".to_string(), |s| s.to_string());
-    debug_span!("thread", os_thread_id, ?rust_thread_id, thread_name)
+    debug_span!("thread", os_id, ?rust_id, name)
 }

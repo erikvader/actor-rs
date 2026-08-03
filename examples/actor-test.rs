@@ -1,5 +1,6 @@
 use actor_rs::{
     actor::{Actor, Control, Receive, Stage},
+    actors,
     signals::Signals,
     whatever::*,
 };
@@ -19,9 +20,7 @@ fn setup_tracing() {
     // TODO: setup with systemd if started from a service
     let fmt = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stdout)
-        .with_ansi(use_ansi)
-        // TODO: don't use pretty, use the default non-compact one
-        .pretty();
+        .with_ansi(use_ansi);
 
     let filter = Targets::new().with_default(LevelFilter::TRACE);
 
@@ -43,35 +42,16 @@ fn setup_tracing() {
     }));
 }
 
-struct Alice;
-impl Actor for Alice {
-    async fn enter(&mut self, ctl: &mut Control<Self>) {
-        let bob = ctl.summon(Bob);
-        let reply = bob.send_receive(Hej(5)).await.unwrap();
-        let reply = reply.await.unwrap();
-        info!("I got {reply}");
-    }
-}
-
-struct Bob;
-impl Actor for Bob {}
-
-struct Hej(i32);
-
-impl Receive<Hej> for Bob {
-    type Retval = i32;
-
-    async fn receive(&mut self, msg: Hej, _ctl: &mut Control<Self>) -> Self::Retval {
-        msg.0 * msg.0
-    }
-}
-
 #[snafu::report]
 fn main() -> Result<(), Whatever> {
     setup_tracing();
-    let grace = Signals::new().expect("this should just work");
-    let stage = Stage::new(grace.inactive_signal_stream());
-    stage.summon(Alice);
-    let _ = stage.play();
-    Ok(())
+    let grace = Signals::new().whatever_context("Couldn't create signal handler")?;
+    let stage = Stage::with_signals(&grace);
+
+    {
+        let printer_adr = stage.summon(actors::logger::Logger);
+        stage.summon(actors::line_reader::stdin(printer_adr.secret()));
+    }
+
+    stage.play().whatever_context("Stage failed")
 }

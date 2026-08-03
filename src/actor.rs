@@ -23,10 +23,15 @@ use std::{
     rc::{Rc, Weak},
     task::ready,
 };
-use tracing::{Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, warn};
+use tracing::{
+    Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, trace_span, warn,
+};
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
+
+// NOTE: Since the output of `type_name` usually is long, i only use it on spans of level trace and
+// events of levels debug or higher (verbosity).
 
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
@@ -39,9 +44,7 @@ pub trait Actor: Sized + 'static {
     const MAIL_BOX_SIZE: usize = 0;
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
 
-    fn span(&self, parent: Span) -> Span {
-        parent
-    }
+    fn span(&self, parent: &Span) -> Span;
 
     #[expect(
         async_fn_in_trait,
@@ -81,7 +84,11 @@ pub trait Actor: Sized + 'static {
 
 // NOTE: for static assertions
 struct DummyActor;
-impl Actor for DummyActor {}
+impl Actor for DummyActor {
+    fn span(&self, parent: &Span) -> Span {
+        tracing::info_span!(parent: parent, "dummy")
+    }
+}
 
 pub struct Control<A: Actor> {
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
@@ -155,7 +162,7 @@ struct ActorBuilder<A: Actor> {
     thread_root_span: Span,
 }
 
-const GROUP_KEY: &str = "actor.group";
+const GROUP_KEY: &str = "group";
 
 impl<A: Actor> ActorBuilder<A> {
     fn new(
@@ -189,9 +196,8 @@ impl<A: Actor> ActorBuilder<A> {
             parent: parent,
             Level::DEBUG,
             "actor",
-            actor.id = id,
+            id = id,
             {GROUP_KEY} = field::Empty,
-            actor.type = type_name::<A>()
         )
     }
 
@@ -211,7 +217,7 @@ impl<A: Actor> ActorBuilder<A> {
             if let Some(group_id) = group_id {
                 span.record(GROUP_KEY, group_id);
             }
-            self.actor.span(span)
+            self.actor.span(&span)
         };
 
         let ctl = Control::new(
@@ -779,9 +785,12 @@ where
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
         }
-        .instrument(
-            debug_span!("snd_rcv", msg.type = type_name::<Self>(), receiver.type = type_name::<A>()),
-        )
+        .instrument(trace_span!(
+            "snd_rcv",
+            msg = type_name::<Self>(),
+            return = type_name::<A::Retval>(),
+            actor = type_name::<A>()
+        ))
         .boxed_local()
     }
 }
@@ -806,9 +815,11 @@ where
             trace!("Received message");
             let _ret = actor.receive(self.msg, ctl).await;
         }
-        .instrument(
-            debug_span!("oneway", msg.type = type_name::<Self>(), receiver.type = type_name::<A>()),
-        )
+        .instrument(trace_span!(
+            "oneway",
+            msg = type_name::<Self>(),
+            actor = type_name::<A>()
+        ))
         .boxed_local()
     }
 }
@@ -849,9 +860,9 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         S: CanSend<A, T>,
     {
         trace!(
-            "actor.rcv.type" = type_name::<A>(),
-            "msg.type" = type_name::<T>(),
-            "msg.return.type" = type_name::<A::Retval>(),
+            "to" = type_name::<A>(),
+            "msg" = type_name::<T>(),
+            "return" = type_name::<A::Retval>(),
             "Send and receive"
         );
         let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
@@ -874,9 +885,9 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         S: CanSend<A, T>,
     {
         trace!(
-            "actor.rcv.type" = type_name::<A>(),
-            "msg.type" = type_name::<T>(),
-            "Send"
+            "to" = type_name::<A>(),
+            "msg" = type_name::<T>(),
+            "Send message"
         );
         let ticket = OneWayTicket {
             msg,
@@ -1092,7 +1103,7 @@ async fn actor_main<A: Actor>(
                         .await
                 }
                 None => {
-                    trace!("No more events, breaking loop");
+                    trace!("No more events");
                     break;
                 }
             }
@@ -1117,7 +1128,7 @@ async fn actor_main<A: Actor>(
     })
     .await;
 
-    debug!("Cancelling all bg tasks");
+    trace!("Cancelling all bg tasks");
     {
         let pinned_group_ref = events.mut_pin_main().mut_pin_group();
         let group_ref = Pin::into_inner(pinned_group_ref);
@@ -1129,7 +1140,7 @@ async fn actor_main<A: Actor>(
             .await;
     }
 
-    debug!("Leave");
+    trace!("Before leave");
     actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
     debug!("Died"); // NOTE: this is logged before all runes and stuff have dropped, but whatever
 }
@@ -1152,7 +1163,7 @@ pub struct Stage {
 assert_not_impl_any!(Stage: Send, Sync);
 
 impl Stage {
-    pub fn new_from_core(core: StageCore) -> Self {
+    pub fn from_core(core: StageCore) -> Self {
         let (heart, rune) = heart::create();
         Self {
             ex: Rc::new(LocalExecutor::new()),
@@ -1164,15 +1175,19 @@ impl Stage {
         }
     }
 
-    pub fn new(signal_stream: InactiveSignalStream) -> Self {
-        Self::new_from_core(StageCore {
+    fn new(signal_stream: InactiveSignalStream) -> Self {
+        Self::from_core(StageCore {
             signal_stream,
             idgen: IdGenerator::new(),
         })
     }
 
-    pub fn new_no_signals() -> Self {
+    pub fn without_signals() -> Self {
         Self::new(crate::signals::dummy_signal_stream())
+    }
+
+    pub fn with_signals(signals: &crate::signals::Signals) -> Self {
+        Self::new(signals.inactive_signal_stream())
     }
 
     pub fn core(&self) -> StageCore {
@@ -1234,10 +1249,11 @@ impl Stage {
             (this.heart, this.ex)
         }
         let (heart, ex) = take_essentials_drop_the_rest(self);
+        let _span = debug_span!("stage").entered();
 
         debug!(num_actors = heart.rune_count(), "Action!");
         let res = f(heart, &ex);
-        debug!(?res, "Play exited");
+        debug!(?res, "Exited");
 
         assert!(ex.is_empty());
         assert_eq!(Rc::strong_count(&ex), 1);
@@ -1254,13 +1270,13 @@ mod tests {
 
         #[test]
         fn no_actors_added() {
-            let stage = Stage::new_no_signals();
+            let stage = Stage::without_signals();
             assert!(stage.play().is_ok());
         }
 
         #[test]
         fn terminate_when_all_addresses_gone() {
-            let stage = Stage::new_no_signals();
+            let stage = Stage::without_signals();
             let (fut, _) = stage.actor_builder(DummyActor).no_spawn();
             let mut fut = pin!(fut);
             assert_future_ready!(fut);
@@ -1268,7 +1284,7 @@ mod tests {
 
         #[test]
         fn terminate_when_all_addresses_gone_after_one_poll_ready() {
-            let stage = Stage::new_no_signals();
+            let stage = Stage::without_signals();
             let (fut, adr) = stage.actor_builder(DummyActor).no_spawn();
             let mut fut = pin!(fut);
             assert_future_pending!(fut);
@@ -1285,7 +1301,11 @@ mod tests {
         use crate::utils::thread_info_span;
 
         struct Alice;
-        impl Actor for Alice {}
+        impl Actor for Alice {
+            fn span(&self, parent: &Span) -> Span {
+                tracing::info_span!(parent: parent, "alice")
+            }
+        }
         impl Receive<i32> for Alice {
             type Retval = i32;
 
@@ -1304,12 +1324,16 @@ mod tests {
                 let reply = reply.await.unwrap();
                 assert_eq!(reply, 25);
             }
+
+            fn span(&self, parent: &Span) -> Span {
+                tracing::info_span!(parent: parent, "bob")
+            }
         }
 
         #[test]
         fn remote() {
             let _span = thread_info_span().entered();
-            let main_stage = Stage::new_no_signals();
+            let main_stage = Stage::without_signals();
             let alice_adr = main_stage.summon(Alice);
 
             let t1 = std::thread::spawn({
@@ -1317,7 +1341,7 @@ mod tests {
                 let core = main_stage.core();
                 || {
                     let _span = thread_info_span().entered();
-                    let stage = Stage::new_from_core(core);
+                    let stage = Stage::from_core(core);
                     stage.summon(Bob { alice: alice_adr });
                     stage.assert_plays_within(100);
                 }
