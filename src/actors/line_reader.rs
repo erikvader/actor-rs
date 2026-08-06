@@ -1,4 +1,4 @@
-use std::pin::pin;
+use std::{convert::Infallible, pin::pin};
 
 use blocking::Unblock;
 use futures_util::{AsyncBufRead, AsyncBufReadExt, AsyncRead, StreamExt, io::BufReader};
@@ -93,6 +93,9 @@ where
     R: AsyncBufRead + 'static,
     C: AsyncCleanup + 'static,
 {
+    type Error = Infallible;
+    type Job = ();
+
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let send_to = self.send_to.take().expect("will exist here");
         let read_from = self.read_from.take().expect("will exist here");
@@ -133,10 +136,7 @@ where
                 tracing::debug!("Exited");
         };
 
-        ctl.start_job(
-            fut,
-            |parent| tracing::info_span!(parent: parent, "read_job"),
-        );
+        ctl.start_job(fut, |parent| tracing::info_span!(parent: parent, "bg_job"));
     }
 
     async fn interrupted(&mut self, ctl: &mut Control<Self>) {

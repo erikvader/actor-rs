@@ -1,4 +1,4 @@
-use async_broadcast::{InactiveReceiver, Receiver};
+use async_broadcast::{InactiveReceiver, Receiver, TrySendError};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Handle,
@@ -38,6 +38,8 @@ pub struct Signals {
     recv: InactiveSignalStream,
 }
 
+// NOTE: Stream for async_broadcast::receiver ignores overflow errors, so no custom logic on the
+// user side is needed cuz of the overflow flag being set
 pub type SignalStream = Receiver<Signal>;
 pub type InactiveSignalStream = InactiveReceiver<Signal>;
 
@@ -45,7 +47,9 @@ impl Signals {
     pub fn new() -> std::io::Result<Self> {
         let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
         let signals_handle = signals.handle();
-        let (snd, rcv) = async_broadcast::broadcast(16);
+        let (snd, mut rcv) = async_broadcast::broadcast(16);
+        rcv.set_overflow(true);
+        rcv.set_await_active(false);
         const MAXIMUM: i32 = 3;
 
         let thread_handle = std::thread::spawn(move || {
@@ -59,6 +63,8 @@ impl Signals {
             for raw_signal in signals.forever() {
                 let signal = Signal::try_from(raw_signal)
                     .expect("can't receive signals i'm not listening for");
+
+                let _inner_span = info_span!("handling", ?signal).entered();
 
                 largest = std::cmp::max(largest, Some(signal));
 
@@ -87,11 +93,16 @@ impl Signals {
                     }
                 };
 
-                if let Err(e) = snd.try_broadcast(signal) {
-                    error!(
-                        error = &e as &dyn std::error::Error,
-                        "Failed to broadcast signal"
-                    );
+                match snd.try_broadcast(signal) {
+                    Ok(None) => (),
+                    Ok(Some(_)) => debug!("Channel overflowed"),
+                    Err(TrySendError::Closed(_)) => {
+                        warn!("No receivers to broadcast the signal to")
+                    }
+                    Err(TrySendError::Inactive(_)) => {
+                        warn!("Only inactive receivers, not broadcasting signal")
+                    }
+                    Err(TrySendError::Full(_)) => panic!("should not happen"),
                 }
             }
 

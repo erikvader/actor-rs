@@ -11,6 +11,8 @@ use pin_project::pin_project;
 
 // NOTE: this can't be a simple futures_util::stream::select since it will ignore the futuregroup if
 // it has been empty even once.
+// NOTE: this is very similar to for_each_concurrent, except that this adds futures from the outside
+// instead of from the stream itself.
 #[must_use = "this does nothing without being polled"]
 #[pin_project]
 pub struct WithFutures<S, F> {
@@ -18,6 +20,8 @@ pub struct WithFutures<S, F> {
     stream: S,
     // NOTE: it's fine to poll this group over and over even though it has returned Ready(None).
     // It will start to return more results after more futures have been inserted into it.
+    // TODO: futuresunordered is always unpin i think, so use poll_next_unpin instead and remove pin
+    // here?
     #[pin]
     group: FuturesUnordered<F>,
     group_first: bool,
@@ -50,6 +54,7 @@ impl<S, F> WithFutures<S, F> {
         &self.stream
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "only used in tests atm"))]
     pub fn mut_group(&mut self) -> &mut FuturesUnordered<F> {
         &mut self.group
     }
@@ -203,7 +208,7 @@ pub enum YieldPolicy {
 
 impl YieldPolicy {
     pub const fn default() -> Self {
-        Self::Every(const { NonZeroU32::new(16).unwrap() })
+        Self::Every(const { NonZeroU32::new(8).unwrap() })
     }
 
     pub const fn always() -> Self {

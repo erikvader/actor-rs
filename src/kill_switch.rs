@@ -16,23 +16,6 @@ impl Switch {
     pub fn detonate(&self) {
         self.inner.close();
     }
-
-    pub fn into_unstable(self) -> UnstableSwitch {
-        UnstableSwitch { inner: self }
-    }
-}
-
-// TODO: why did i add this?
-#[derive(Clone)]
-/// Dropping this will surely activate it
-pub struct UnstableSwitch {
-    inner: Switch,
-}
-
-impl Drop for UnstableSwitch {
-    fn drop(&mut self) {
-        self.inner.detonate();
-    }
 }
 
 #[derive(Clone)]
@@ -80,6 +63,8 @@ pub fn create() -> (Bomb, Switch) {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Tick<T> {
     Tock(T),
+    // TODO: mimic futures_util::select and return the future/stream here? The future would need to
+    // be Unpin so it can move out of Pin safely and be returned.
     Boom,
 }
 
