@@ -1,15 +1,18 @@
 use std::convert::Infallible;
 
-use crate::actor::{Actor, Receive};
+use crate::{
+    actor::{Actor, Receive},
+    deferred_info_span,
+    utils::DeferredSpan,
+};
 
 pub struct Logger;
 
 impl Actor for Logger {
-    type Job = Infallible;
     type Error = Infallible;
 
-    fn span(&self, parent: &tracing::Span) -> tracing::Span {
-        tracing::info_span!(parent: parent, "logger")
+    fn span(&self) -> DeferredSpan<'_> {
+        deferred_info_span!("logger")
     }
 }
 

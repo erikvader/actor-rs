@@ -5,8 +5,10 @@ use futures_util::{AsyncBufRead, AsyncBufReadExt, AsyncRead, StreamExt, io::BufR
 use tracing::Instrument;
 
 use crate::{
-    actor::{Actor, Address, Control, Receive, SecretAddress},
-    kill_switch::{Bomb, Tick},
+    actor::{Actor, Address, Control, Receive, SecretAddress, bg_job::Job},
+    deferred_info_span,
+    kill_switch::{self, Bomb, Tick},
+    utils::DeferredSpan,
 };
 
 #[derive(Debug)]
@@ -94,49 +96,50 @@ where
     C: AsyncCleanup + 'static,
 {
     type Error = Infallible;
-    type Job = ();
 
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let send_to = self.send_to.take().expect("will exist here");
         let read_from = self.read_from.take().expect("will exist here");
         let cleanup = self.cleaner.take().expect("will exist here");
-        let myself: Address<Self> = ctl.address().expect("Is guaranteed to be alive in enter");
 
-        let fut = async move |bomb: Bomb| {
-                let _myself = myself; // NOTE: keep the actor alive
-
-                let mut lines = pin!(bomb.attach_stream(read_from.lines()));
-                while let Some(watch) = lines.next().await {
-                    match watch {
-                        Tick::Tock(Ok(line)) => {
-                            if send_to.send(Line(line)).await.is_err() {
-                                tracing::warn!("Receiver closed");
-                            }
-                        }
-                        Tick::Tock(Err(error)) => {
-                            // TODO: the lines stream will return this error if a line cannot be
-                            // converted into an UTF-8 string, it will continue as normal with the
-                            // next one though. Should I care about invalid lines? How to handle
-                            // them?
-                            tracing::error!(
-                                error = &error as &dyn std::error::Error,
-                                "Line read errored"
-                            );
-                        }
-                        Tick::Boom => {
-                            tracing::debug!("Interrupted early");
-                            break;
+        // TODO: activate the switch on shutdown
+        let (bomb, switch) = kill_switch::create();
+        Job::new(async move {
+            let mut lines = pin!(bomb.attach_stream(read_from.lines()));
+            while let Some(watch) = lines.next().await {
+                match watch {
+                    Tick::Tock(Ok(line)) => {
+                        if send_to.send(Line(line)).await.is_err() {
+                            tracing::warn!("Receiver closed");
                         }
                     }
+                    Tick::Tock(Err(error)) => {
+                        // TODO: the lines stream will return this error if a line cannot be
+                        // converted into an UTF-8 string, it will continue as normal with the
+                        // next one though. Should I care about invalid lines? How to handle
+                        // them?
+                        tracing::error!(
+                            error = &error as &dyn std::error::Error,
+                            "Line read errored"
+                        );
+                    }
+                    Tick::Boom => {
+                        tracing::debug!("Interrupted early");
+                        break;
+                    }
                 }
+            }
 
-                tracing::trace!("Cleaning up");
-                cleanup.cleanup().await;
+            tracing::trace!("Cleaning up");
+            cleanup.cleanup().await;
 
-                tracing::debug!("Exited");
-        };
+            tracing::debug!("Exited");
+        });
+        // TODO:
+        // .start(ctl);
 
-        ctl.start_job(fut, |parent| tracing::info_span!(parent: parent, "bg_job"));
+        // TODO: re-add the span to the job
+        // ctl.start_job(fut, |parent| tracing::info_span!(parent: parent, "bg_job"));
     }
 
     async fn interrupted(&mut self, ctl: &mut Control<Self>) {
@@ -144,9 +147,9 @@ where
         ctl.escalating_exit();
     }
 
-    fn span(&self, parent: &tracing::Span) -> tracing::Span {
+    fn span(&self) -> DeferredSpan<'_> {
         // TODO: add what is being read from somehow?
-        tracing::info_span!(parent: parent, "line_reader")
+        deferred_info_span!("line_reader")
     }
 }
 
@@ -166,9 +169,9 @@ where
 pub type Stdin = LineReader<BufReader<Unblock<std::io::Stdin>>>;
 
 pub fn stdin(to: SecretAddress<Line>) -> Stdin {
-        // NOTE: this can't be sent to another thread, it's unblock that will send it to
-        // a worker thread. It would be really nice if this could lock stdin for performance
-        // reasons.
+    // NOTE: this can't be sent to another thread, it's unblock that will send it to
+    // a worker thread. It would be really nice if this could lock stdin for performance
+    // reasons.
     // TODO: The way to read from a locked stdin is to create a custom Unblock that creates a
     // thread and locks it there.
     // NOTE: Sending stdin to another thread to block read it is the easiest solution, it is
@@ -177,11 +180,11 @@ pub fn stdin(to: SecretAddress<Line>) -> Stdin {
     // itself gets affected. I guess it could also be possible to use the fd directly and adding
     // support to Heart to interrupt a blocking fd using eventfd and select, but that is a lot
     // more work to implement.
-        // let locked = stdin.lock();
-        // NOTE: Unblock is moving the stdin to another thread and reads up to and buffers 8 MB of
-        // data at a time, so this actor should not be killed and respawned without expecting data
-        // loss.
-        LineReader::from_blocking_readable(std::io::stdin(), to)
+    // let locked = stdin.lock();
+    // NOTE: Unblock is moving the stdin to another thread and reads up to and buffers 8 MB of
+    // data at a time, so this actor should not be killed and respawned without expecting data
+    // loss.
+    LineReader::from_blocking_readable(std::io::stdin(), to)
 }
 
 #[cfg(test)]

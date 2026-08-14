@@ -3,7 +3,11 @@ use std::{io, marker::PhantomData, pin::pin, process::Stdio};
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader};
 
-use crate::actor::{Actor, Control, Receive, SecretAddress};
+use crate::{
+    actor::{Actor, Control, Receive, SecretAddress},
+    deferred_info_span,
+    utils::DeferredSpan,
+};
 
 // TODO: add ways to modify the environment?
 // TODO: i should probably take another type argument for stderr
@@ -179,11 +183,10 @@ where
     O: Output + 'static,
 {
     // TODO: set to something sensible
-    type Job = ();
     type Error = std::convert::Infallible;
 
-    fn span(&self, parent: &tracing::Span) -> tracing::Span {
-        tracing::info_span!(parent: parent, "process", exe = self.exe)
+    fn span(&self) -> DeferredSpan<'_> {
+        deferred_info_span!("process", exe = self.exe)
     }
 
     // TODO: should this actor run the async_process::driver? The stage?
@@ -210,32 +213,32 @@ where
 
         self.input.register(&mut child.stdin);
 
-        ctl.start_job(
-            {
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
-                async move |bomb| {
-                    let out = output.process_stdout(stdout);
-                    let err = output.process_stderr(stderr);
-                    let res = bomb
-                        .attach_future(futures_util::future::join(out, err))
-                        .await;
-                    tracing::debug!(?res);
-                }
-            },
-            |parent| tracing::info_span!(parent: parent, "output_job"),
-        );
+        // ctl.start_job(
+        //     {
+        //         let stdout = child.stdout.take();
+        //         let stderr = child.stderr.take();
+        //         async move |bomb| {
+        //             let out = output.process_stdout(stdout);
+        //             let err = output.process_stderr(stderr);
+        //             let res = bomb
+        //                 .attach_future(futures_util::future::join(out, err))
+        //                 .await;
+        //             tracing::debug!(?res);
+        //         }
+        //     },
+        //     |parent| tracing::info_span!(parent: parent, "output_job"),
+        // );
 
-        ctl.start_job(
-            async move |bomb| {
-                let mut status = pin!(child.status());
-                // TODO: kill if heart is activated?
-                let res = bomb.attach_future(&mut status).await;
-                status.await;
-                tracing::debug!(?res, "Process died"); // TODO: log with error on error?
-            },
-            |parent| tracing::info_span!(parent: parent, "wait_job"),
-        );
+        // ctl.start_job(
+        //     async move |bomb| {
+        //         let mut status = pin!(child.status());
+        //         // TODO: kill if heart is activated?
+        //         let res = bomb.attach_future(&mut status).await;
+        //         status.await;
+        //         tracing::debug!(?res, "Process died"); // TODO: log with error on error?
+        //     },
+        //     |parent| tracing::info_span!(parent: parent, "wait_job"),
+        // );
     }
 }
 

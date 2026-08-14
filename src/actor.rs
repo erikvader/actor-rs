@@ -3,17 +3,22 @@ use crate::{
         id_generator::{Id, IdGenerator},
         unsafe_wrapper::UnsafeSendWrapper,
     },
+    deferred_span,
     heart::{self, Heart, PanicError, Rune},
     kill_switch::{self, Bomb, Switch},
     signals::InactiveSignalStream,
-    stream_utils::{StreamExt as _, YieldPolicy, yield_guard},
+    stream_utils::{YieldPolicy, yield_guard},
+    utils::DeferredSpan,
 };
 use async_broadcast as bhannel;
 use async_channel as channel;
-use async_executor::{FallibleTask, LocalExecutor};
+use async_executor::LocalExecutor;
 use async_io::block_on;
 use futures_core::future::LocalBoxFuture;
-use futures_util::{FutureExt as _, StreamExt as _, TryFutureExt};
+use futures_util::{
+    FutureExt as _, StreamExt as _, TryFutureExt,
+    stream::{self, FuturesUnordered},
+};
 use pin_project::pin_project;
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
@@ -60,10 +65,9 @@ pub trait Actor: Sized + 'static {
     const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
 
     // RANT: these, annoyingly, can't have default values
-    type Job; // = Infallible; no background tasks are spawned
     type Error: std::error::Error + Clone; // = Infallible; will never error
 
-    fn span(&self, parent: &Span) -> Span;
+    fn span(&self) -> DeferredSpan<'_>;
 
     #[expect(
         async_fn_in_trait,
@@ -89,27 +93,15 @@ pub trait Actor: Sized + 'static {
     async fn interrupted(&mut self, ctl: &mut Control<Self>) {
         debug!("Ignoring an interrupt");
     }
-
-    #[expect(
-        async_fn_in_trait,
-        reason = "i don't really understand what this is complaining about"
-    )]
-    #[expect(unused_variables, reason = "the default is a noop")]
-    async fn job_done(&mut self, ctl: &mut Control<Self>, retval: Option<Self::Job>) {
-        if retval.is_none() {
-            panic!("A background job panicked");
-        }
-    }
 }
 
 // NOTE: for static assertions
 struct DummyActor;
 impl Actor for DummyActor {
-    type Job = Infallible;
     type Error = Infallible;
 
-    fn span(&self, parent: &Span) -> Span {
-        tracing::info_span!(parent: parent, "dummy")
+    fn span(&self) -> DeferredSpan<'_> {
+        DeferredSpan::none()
     }
 }
 
@@ -124,9 +116,13 @@ pub struct Control<A: Actor> {
     // NOTE: being inactive doesn't count towards this channel getting closed, so it won't get
     // closed on accident by only having inactive receivers
     signals: InactiveSignalStream,
-    new_tasks: Vec<FallibleTask<A::Job>>,
-    task_bomb: Bomb,
-    task_switch: Switch,
+    // NOTE: this is unfortunately returng three boxed dyn traits in a row, which is not ideal.
+    // It helps though, a little, that Box<()> doesn't actually allocate anything. It's possible
+    // to reduce the number of boxes by implementing the async fn in the dyn trait as a poll
+    // function instead of returning a boxed future, but that is a lot more complicated since
+    // the state machine has to be written from scratch. It also doesn't help in this case
+    // unfortunately, because async fns it awaits has to be boxed anyways...
+    bg_jobs: FuturesUnordered<LocalBoxFuture<'static, ErasedLocalDeliverable<A>>>,
     idgen: IdGenerator,
     thread_root_span: Span,
     actor_span: Span,
@@ -245,7 +241,13 @@ impl<A: Actor> ActorBuilder<A> {
             if let Some(group_id) = group_id {
                 span.record(GROUP_KEY, group_id);
             }
-            self.actor.span(&span)
+
+            let span = if span.is_disabled() {
+                self.thread_root_span.clone()
+            } else {
+                span
+            };
+            self.actor.span().create_or_parent(span)
         };
 
         let ctl = Control::new(
@@ -259,6 +261,10 @@ impl<A: Actor> ActorBuilder<A> {
             exit_snd,
         );
 
+        // NOTE: I am pretty certain that if span is thread_root_span here it's actually redundant
+        // cuz it gets entered twice, but i don't feel like that special case is worth worrying
+        // about. This is of course only the case if the future is spawned as a task on an executor
+        // that is blocked on its event loop where thread_root_span is active.
         let fut = actor_main(ctl, self.actor, rcv, home.clone()).instrument(span);
         (fut, home)
     }
@@ -349,16 +355,13 @@ impl<A: Actor> Control<A> {
         actor_span: Span,
         exit_send: ExitSend<A::Error>,
     ) -> Self {
-        let (task_bomb, task_switch) = kill_switch::create();
         Self {
             ex,
             actor_rune: rune,
             state: State::Running,
             home,
             signals,
-            new_tasks: Vec::new(),
-            task_bomb,
-            task_switch,
+            bg_jobs: FuturesUnordered::new(),
             idgen,
             thread_root_span,
             actor_span,
@@ -382,7 +385,8 @@ impl<A: Actor> Control<A> {
         if let Some(adr) = self.home.upgrade() {
             adr.sender.close();
         }
-        self.task_switch.detonate();
+        // TODO:
+        // self.task_switch.detonate();
     }
 
     #[instrument(skip_all)]
@@ -421,38 +425,8 @@ impl<A: Actor> Control<A> {
         self.state >= State::SoftExiting
     }
 
-    pub fn start_job<F, S>(&mut self, future: F, spanner: S)
-    where
-        F: AsyncFnOnce(Bomb) -> A::Job + 'static,
-        S: FnOnce(&Span) -> Span,
-    {
-        debug!("type" = type_name::<F>(), "Starting a job");
-        let span = spanner(&self.actor_span);
-
-        let task = self
-            .ex
-            .upgrade()
-            .expect("the executor is always alive here")
-            .spawn(future(self.task_bomb.clone()).instrument(span))
-            .fallible();
-
-        self.new_tasks.push(task);
-    }
-
-    pub fn start_blocking_job<F, S>(&mut self, thunk: F, spanner: S)
-    where
-        F: FnOnce(Bomb) -> A::Job + Send + 'static,
-        A::Job: Send,
-        S: FnOnce(&Span) -> Span,
-    {
-        debug!("type" = type_name::<F>(), "Starting a blocking job");
-        let task = blocking::unblock({
-            let heart = self.task_bomb.clone();
-            let span = spanner(&self.actor_span);
-            move || span.in_scope(|| thunk(heart))
-        })
-        .fallible();
-        self.new_tasks.push(task);
+    fn add_bg_job(&mut self, job: LocalBoxFuture<'static, ErasedLocalDeliverable<A>>) {
+        self.bg_jobs.push(job);
     }
 }
 
@@ -492,6 +466,7 @@ pub trait Receive<T>: Actor {
 }
 
 type ErasedDeliverable<A> = Box<dyn Deliverable<A> + Send>;
+type ErasedLocalDeliverable<A> = Box<dyn Deliverable<A>>;
 
 mod private {
     pub trait Sealed {}
@@ -499,13 +474,17 @@ mod private {
 
 pub trait Scope: private::Sealed + 'static {}
 
-pub struct Local(PhantomData<Rc<()>>);
+pub struct Local {
+    _priv: PhantomData<Rc<()>>,
+}
 impl private::Sealed for Local {}
 impl Scope for Local {}
 assert_not_impl_any!(Local: Send, Sync);
 const_assert_eq!(std::mem::size_of::<Local>(), 0);
 
-pub struct Remote;
+pub struct Remote {
+    _priv: (),
+}
 impl private::Sealed for Remote {}
 impl Scope for Remote {}
 assert_impl_all!(Remote: Send, Sync);
@@ -667,7 +646,7 @@ impl<A: Actor> WeakAddress<A> {
     }
 }
 
-#[allow(
+#[expect(
     private_bounds,
     reason = "CanSendPriv and all types it is using should be private"
 )]
@@ -843,13 +822,13 @@ where
         ctl: &'a mut Control<A>,
     ) -> LocalBoxFuture<'a, ()> {
         async move {
-            // NOTE: There was a problem where the channel would get closed before all messages in
-            // it had been processed, which is bad since a message handler should be able to get an
-            // address unless the actor is exiting. I could only think of two different ways to keep
-            // the channel open if it had messages in its queue when all addresses were dropped:
-            // wrapping the channel's control block in a mutex or by adding the number of messages
-            // in the queue to the strong sender count. I guess i also could rewrite/mod the
-            // concurrent queue that async-channels relies on, but that felt too far. The mutex
+            // NOTE: To prevent the problam where the channel would get closed before all messages
+            // in it had been processed, which is bad since a message handler should be able to get
+            // an address unless the actor is exiting. I could only think of two different ways to
+            // keep the channel open if it had messages in its queue when all addresses were
+            // dropped: wrapping the channel's control block in a mutex or by adding the number of
+            // messages in the queue to the strong sender count. I guess i also could rewrite/mod
+            // the concurrent queue that async-channels relies on, but that felt too far. The mutex
             // solution is not good since it ruins the lock-free nature of the channel, so the
             // modifying the sender count was the way to go. I could think of more solutions to this
             // problem, but they all had some race condition where a weak sender could get upgraded
@@ -898,6 +877,234 @@ where
             actor = type_name::<A>()
         ))
         .boxed_local()
+    }
+}
+
+impl<A: Actor> Deliverable<A> for () {
+    fn deliver<'a>(
+        self: Box<Self>,
+        _actor: &'a mut A,
+        _ctl: &'a mut Control<A>,
+    ) -> LocalBoxFuture<'a, ()> {
+        // NOTE: I don't like that this is allocating something that doesn't do anything
+        async {}.boxed_local()
+    }
+}
+
+pub mod bg_job {
+    use super::*;
+
+    pub struct Skip {
+        _priv: (),
+    }
+
+    pub struct NonSkip<S> {
+        inner: S,
+    }
+
+    impl Skip {
+        fn new() -> Self {
+            Self { _priv: () }
+        }
+    }
+
+    pub struct Job<'a, F, S = Skip> {
+        future: F,
+        sync: S,
+        span: DeferredSpan<'a>,
+    }
+
+    impl<'a, F> Job<'a, F, Skip> {
+        pub fn new(future: F) -> Self {
+            Self {
+                future,
+                sync: Skip::new(),
+                span: DeferredSpan::none(),
+            }
+        }
+
+        pub fn then<S, A, O>(self, sync: S) -> Job<'a, F, NonSkip<S>>
+        where
+            // HACK: this is needed to workaround passing async |...| {} to the then function. I
+            // honestly don't really understand why this is needed, something about closure being
+            // early-binding and functions being late-binding.
+            // https://github.com/rust-lang/rust/issues/70263 .This shouldn't actually be necessary,
+            // but adding this here solves an annoying HRTB early-bind vs late-bind of lifetimes
+            // when actually calling start on this job. I don't understand how this actually helps
+            // the compiler, but it removes the error message about the closure not being general
+            // enough.
+            S: AsyncFnOnce(&mut A, &mut Control<A>, O),
+        {
+            Job {
+                future: self.future,
+                sync: NonSkip { inner: sync },
+                span: self.span,
+            }
+        }
+    }
+
+    impl<'a, F, S> Job<'a, F, S> {
+        pub fn instrument(mut self, span: DeferredSpan<'a>) -> Self {
+            self.span = span;
+            self
+        }
+    }
+
+    impl<'a, F, S> Job<'a, F, NonSkip<S>> {
+        fn start<A, O>(self, ctl: &mut Control<A>)
+        where
+            F: Future<Output = O> + 'static,
+            S: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
+            A: Actor,
+            O: 'static,
+        {
+            let span = self.span.create_or_parent(ctl.actor_span.clone());
+            let fut = {
+                let span = span.clone();
+                async move {
+                    let output = self.future.await;
+                    let deliv = SyncPointDeliv {
+                        span,
+                        output,
+                        sync: self.sync.inner,
+                    };
+                    let erased: ErasedLocalDeliverable<A> = Box::new(deliv);
+                    erased
+                }
+            }
+            // HACK: if the deferred span is disabled, then this future will be instrumentet with
+            // the actor_span, which is technically redundant since this future will be polled in a
+            // context where the actor_span is the current span, or at least it should be. I will
+            // leave this as is, fewer special cases to think about.
+            .instrument(span)
+            .boxed_local();
+
+            ctl.add_bg_job(fut);
+        }
+    }
+
+    impl<'a, F> Job<'a, F, Skip> {
+        fn start<A>(self, ctl: &mut Control<A>)
+        where
+            F: Future<Output = ()> + 'static,
+            A: Actor,
+        {
+            let span = self.span.create_or_parent(ctl.actor_span.clone());
+            let fut = async {
+                let output: () = self.future.await;
+                // NOTE: () is a zero-sized type, so the box is not actually allocating anything
+                let erased: ErasedLocalDeliverable<A> = Box::new(output);
+                erased
+            }
+            // HACK: if the deferred span is disabled, then this future will be instrumentet with
+            // the actor_span, which is technically redundant since this future will be polled in a
+            // context where the actor_span is the current span, or at least it should be. I will
+            // leave this as is, fewer special cases to think about.
+            .instrument(span)
+            .boxed_local();
+
+            ctl.add_bg_job(fut);
+        }
+    }
+
+    struct SyncPointDeliv<O, F> {
+        span: Span,
+        output: O,
+        sync: F,
+    }
+
+    impl<O, F, A> Deliverable<A> for SyncPointDeliv<O, F>
+    where
+        A: Actor,
+        F: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
+        O: 'static,
+    {
+        fn deliver<'a>(
+            self: Box<Self>,
+            actor: &'a mut A,
+            ctl: &'a mut Control<A>,
+        ) -> LocalBoxFuture<'a, ()> {
+            let Self { span, output, sync } = *self;
+            async {
+                sync(actor, ctl, output).await;
+            }
+            .instrument(span)
+            .boxed_local()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::test_utils::{assert_parent_span, assert_span};
+
+        use super::*;
+
+        #[test]
+        fn the_jobs_actually_run() {
+            struct Alice {
+                snd: SecretAddress<i32>,
+            }
+            impl Actor for Alice {
+                type Error = Infallible;
+                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
+
+                fn span(&self) -> DeferredSpan<'_> {
+                    deferred_span!(Level::INFO, "alice")
+                }
+
+                async fn enter(&mut self, ctl: &mut Control<Self>) {
+                    Job::new(async {
+                        assert_span("double");
+                        assert_parent_span("alice");
+                        tracing::info!("Producing the value");
+                        5
+                    })
+                    .then(async |act: &mut Self, _ctl, out| {
+                        assert_span("double");
+                        assert_parent_span("alice");
+                        tracing::info!("Sending from the actor");
+                        act.snd.send(out).await.unwrap()
+                    })
+                    .instrument(crate::deferred_info_span!("double"))
+                    .start(ctl);
+
+                    Job::new({
+                        let snd = self.snd.clone();
+                        async move {
+                            assert_span("single");
+                            assert_parent_span("alice");
+                            tracing::info!("Sending from the job");
+                            snd.send(5).await.unwrap()
+                        }
+                    })
+                    .instrument(crate::deferred_info_span!("single"))
+                    .start(ctl);
+
+                    Job::new({
+                        let snd = self.snd.clone();
+                        async move {
+                            assert_span("alice");
+                            tracing::info!("Sending from the non-instrumented job");
+                            snd.send(5).await.unwrap()
+                        }
+                    })
+                    .start(ctl);
+                }
+            }
+
+            let main_stage = Stage::without_signals();
+            let (snd, rcv) = SecretAddress::new_channel();
+            main_stage.summon(Alice { snd });
+
+            main_stage.assert_plays_within(100);
+
+            let messages = rcv
+                .collect::<Vec<_>>()
+                .now_or_never()
+                .expect("this should be ready");
+
+            assert_eq!(messages, vec![5, 5, 5]);
+        }
     }
 }
 
@@ -1135,34 +1342,35 @@ async fn actor_main<A: Actor>(
 
     enum Event<A: Actor> {
         Delivery(ErasedDeliverable<A>),
-        TaskDone(Option<A::Job>),
+        LocalDelivery(ErasedLocalDeliverable<A>),
         Signal,
     }
     let mut events = {
-        let signal_stream = ctl.signals.activate_cloned().map(|_| Event::<A>::Signal);
         let delivery_stream = rcv.map(Event::Delivery);
-        let events = delivery_stream.with_future_group().addon(signal_stream);
-        pin!(events)
+        pin!(delivery_stream)
     };
+    let mut poll_next = stream::PollNext::default();
 
     yield_guard(A::YIELD_POLICY, async |guard| {
         loop {
             {
-                let signal_stream = events.addon_ref().get_ref();
-                let task_group = events.main_ref().group_ref();
-                let delivery_stream = events.main_ref().stream_ref().get_ref();
+                let delivery_stream = events.get_ref();
                 let delivery_len = delivery_stream.len();
                 trace!(
-                    tasks.len = task_group.len(),
+                    bg_jobs.len = ctl.bg_jobs.len(),
                     events.len = delivery_len,
-                    signals.len = signal_stream.len(),
                     addresses.count.estimation = delivery_stream.sender_count() - delivery_len,
                     mailbox.size = ?A::MAIL_BOX_SIZE, // TODO: make the string prettier
                     "Awaiting next event"
                 );
             }
 
-            match events.as_mut().next().await {
+            let mut events = stream::select_with_strategy(
+                events.as_mut(),
+                (&mut ctl.bg_jobs).map(Event::LocalDelivery),
+                |()| poll_next.toggle(),
+            );
+            match events.next().await {
                 // TODO: this event can't be processed if some other event is stuck. The only way i
                 // can think of to solve this is to add an async fn to Control that listens for
                 // interrupts. It can't be safe in general to just cancel a message handler, so let
@@ -1179,27 +1387,15 @@ async fn actor_main<A: Actor>(
                     // it has the concrete types.
                     delivery.deliver(&mut actor, &mut ctl).await
                 }
-                Some(Event::TaskDone(retval)) => {
-                    trace!("Task done event");
-                    actor
-                        .job_done(&mut ctl, retval)
-                        // NOTE: I never cancel tasks in this loop, so it being none must mean it
-                        // panicked
-                        .instrument(debug_span!("task_done"))
-                        .await
+                Some(Event::LocalDelivery(delivery)) => {
+                    // NOTE: the deliver method is responsible for logging and adding spans, since
+                    // it has the concrete types.
+                    delivery.deliver(&mut actor, &mut ctl).await
                 }
                 None => {
                     trace!("No more events");
                     break;
                 }
-            }
-
-            for task in ctl.new_tasks.drain(..) {
-                events
-                    .as_mut()
-                    .mut_pin_main()
-                    .mut_pin_group()
-                    .push(crate::stream_utils::FutureExt::map(task, Event::TaskDone));
             }
 
             if ctl.state == State::HardExiting {
@@ -1211,20 +1407,6 @@ async fn actor_main<A: Actor>(
         }
     })
     .await;
-
-    trace!("Cancelling all bg tasks");
-    {
-        let pinned_group_ref = events.mut_pin_main().mut_pin_group();
-        let group_ref = Pin::into_inner(pinned_group_ref);
-        let group = std::mem::take(group_ref);
-        futures_util::stream::iter(group.into_iter().map(|m| m.into_future().cancel()))
-            .for_each_concurrent(None, async |fut| {
-                // NOTE: not running job_done here since if there a tasks here it means we are
-                // hard_exiting, so we want to exit asap
-                let _: Option<_> = fut.await;
-            })
-            .await;
-    }
 
     trace!("Before leave");
     let exit_reason = actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
@@ -1266,6 +1448,7 @@ impl Stage {
             rune,
             signal_stream: core.signal_stream,
             idgen: core.idgen,
+            // NOTE: this span is allowed to be anything
             thread_root_span: Span::current(),
         }
     }
@@ -1390,51 +1573,48 @@ mod tests {
     }
 
     mod multi_thread {
-        use tracing::info;
-
         use super::*;
         use crate::utils::thread_info_span;
-
-        struct Alice;
-        impl Actor for Alice {
-            type Job = Infallible;
-            type Error = Infallible;
-            const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
-
-            fn span(&self, parent: &Span) -> Span {
-                tracing::info_span!(parent: parent, "alice")
-            }
-        }
-        impl Receive<i32> for Alice {
-            type Retval = i32;
-
-            async fn receive(&mut self, msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
-                msg * msg
-            }
-        }
-
-        struct Bob {
-            alice: RemoteAddress<Alice>,
-        }
-        impl Actor for Bob {
-            type Job = Infallible;
-            type Error = Infallible;
-            const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
-
-            async fn enter(&mut self, _ctl: &mut Control<Self>) {
-                info!("sending to alice");
-                let reply = self.alice.send_receive(5).await.unwrap();
-                let reply = reply.await.unwrap();
-                assert_eq!(reply, 25);
-            }
-
-            fn span(&self, parent: &Span) -> Span {
-                tracing::info_span!(parent: parent, "bob")
-            }
-        }
+        use tracing::info;
 
         #[test]
         fn remote() {
+            struct Alice;
+            impl Actor for Alice {
+                type Error = Infallible;
+                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
+
+                fn span(&self) -> DeferredSpan<'_> {
+                    deferred_span!(Level::INFO, "alice")
+                }
+            }
+            impl Receive<i32> for Alice {
+                type Retval = i32;
+
+                async fn receive(&mut self, msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
+                    msg * msg
+                }
+            }
+
+            struct Bob {
+                alice: RemoteAddress<Alice>,
+            }
+            impl Actor for Bob {
+                type Error = Infallible;
+                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
+
+                async fn enter(&mut self, _ctl: &mut Control<Self>) {
+                    info!("sending to alice");
+                    let reply = self.alice.send_receive(5).await.unwrap();
+                    let reply = reply.await.unwrap();
+                    assert_eq!(reply, 25);
+                }
+
+                fn span(&self) -> DeferredSpan<'_> {
+                    deferred_span!(Level::INFO, "bob")
+                }
+            }
+
             let _span = thread_info_span().entered();
             let main_stage = Stage::without_signals();
             let alice_adr = main_stage.summon(Alice);
