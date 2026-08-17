@@ -142,10 +142,10 @@ where
         // ctl.start_job(fut, |parent| tracing::info_span!(parent: parent, "bg_job"));
     }
 
-    async fn interrupted(&mut self, ctl: &mut Control<Self>) {
-        tracing::debug!("Interrupt received");
-        ctl.escalating_exit();
-    }
+    // async fn interrupted(&mut self, ctl: &mut Control<Self>) {
+    //     tracing::debug!("Interrupt received");
+    //     ctl.escalating_exit();
+    // }
 
     fn span(&self) -> DeferredSpan<'_> {
         // TODO: add what is being read from somehow?
@@ -162,7 +162,8 @@ where
 
     async fn receive(&mut self, _msg: Exit, ctl: &mut Control<Self>) -> Self::Retval {
         tracing::debug!("Exit message received");
-        ctl.escalating_exit();
+        // TODO:
+        // ctl.escalating_exit();
     }
 }
 
@@ -197,7 +198,7 @@ mod tests {
     fn test_template(input: &'static str) -> Vec<String> {
         let input = input.as_bytes();
         let (adr, output) = SecretAddress::new_channel();
-        let stage = Stage::without_signals();
+        let stage = Stage::new();
         stage.summon(LineReader::new(input, adr));
         stage.assert_plays_within(10);
         let lines: Vec<String> = output

@@ -206,7 +206,7 @@ where
             }
             Err(err) => {
                 tracing::error!("Failed to spawn process"); // TODO: add context?
-                ctl.hard_exit();
+                // ctl.hard_exit();
                 return;
             }
         };

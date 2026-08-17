@@ -3,10 +3,9 @@ use crate::{
         id_generator::{Id, IdGenerator},
         unsafe_wrapper::UnsafeSendWrapper,
     },
-    deferred_span,
     heart::{self, Heart, PanicError, Rune},
     kill_switch::{self, Bomb, Switch},
-    signals::InactiveSignalStream,
+    signals::{SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
     utils::DeferredSpan,
 };
@@ -31,9 +30,7 @@ use std::{
     rc::{Rc, Weak},
     task::ready,
 };
-use tracing::{
-    Instrument, Level, Span, debug, debug_span, field, instrument, span, trace, trace_span, warn,
-};
+use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, trace_span};
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
@@ -90,8 +87,8 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn interrupted(&mut self, ctl: &mut Control<Self>) {
-        debug!("Ignoring an interrupt");
+    async fn mailbox_eof(&mut self, ctl: &mut Control<Self>) {
+        debug!("The mailbox is closed and empty");
     }
 }
 
@@ -110,12 +107,9 @@ pub struct Control<A: Actor> {
     // pretty much mean all actors can borrow stack data from the main function.
     // NOTE: weak so the executor can drop itself even if there are actors still alive
     ex: Weak<LocalExecutor<'static>>,
-    state: State,
     // NOTE: weak so the actor doesn't keep itself alive
     home: WeakAddress<A>,
-    // NOTE: being inactive doesn't count towards this channel getting closed, so it won't get
-    // closed on accident by only having inactive receivers
-    signals: InactiveSignalStream,
+    drain_mailbox: bool,
     // NOTE: this is unfortunately returng three boxed dyn traits in a row, which is not ideal.
     // It helps though, a little, that Box<()> doesn't actually allocate anything. It's possible
     // to reduce the number of boxes by implementing the async fn in the dyn trait as a poll
@@ -126,19 +120,11 @@ pub struct Control<A: Actor> {
     idgen: IdGenerator,
     thread_root_span: Span,
     actor_span: Span,
-    // NOTE: these are last so they are dropped last, right before the task terminates
+    // HACK: these are last so they are dropped last, right before the task terminates. The actor is
+    // as dead as possible as this point. The absolute best thing would be to track the task handle
+    // itself, but that wasn't as easy.
     actor_rune: Rune,
-    // NOTE: I can't use a copy of the receiver here for the purpose of tracking when the actor has
-    // actually died, since a soft exit will close the channel, so it will appear dead long before
-    // the task is actually dropped.
     exit_send: ExitSend<A::Error>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
-enum State {
-    Running,
-    SoftExiting,
-    HardExiting,
 }
 
 mod id_generator {
@@ -176,7 +162,6 @@ struct ActorBuilder<A: Actor> {
     actor: A,
     ex: Rc<LocalExecutor<'static>>,
     rune: Rune,
-    signals: InactiveSignalStream,
     idgen: IdGenerator,
     thread_root_span: Span,
 }
@@ -188,7 +173,6 @@ impl<A: Actor> ActorBuilder<A> {
         actor: A,
         ex: Rc<LocalExecutor<'static>>,
         rune: Rune,
-        signals: InactiveSignalStream,
         idgen: IdGenerator,
         thread_root_span: Span,
     ) -> Self {
@@ -196,7 +180,6 @@ impl<A: Actor> ActorBuilder<A> {
             actor,
             ex,
             rune,
-            signals,
             idgen,
             thread_root_span,
         }
@@ -254,7 +237,6 @@ impl<A: Actor> ActorBuilder<A> {
             Rc::downgrade(&self.ex),
             self.rune,
             home.downgrade(),
-            self.signals,
             self.idgen,
             self.thread_root_span,
             span.clone(),
@@ -338,7 +320,6 @@ impl<A: Actor> Control<A> {
             actor,
             ex,
             self.actor_rune.clone(),
-            self.signals.clone(),
             self.idgen.clone(),
             self.thread_root_span.clone(),
         )
@@ -349,7 +330,6 @@ impl<A: Actor> Control<A> {
         ex: Weak<LocalExecutor<'static>>,
         rune: Rune,
         home: WeakAddress<A>,
-        signals: InactiveSignalStream,
         idgen: IdGenerator,
         thread_root_span: Span,
         actor_span: Span,
@@ -358,10 +338,9 @@ impl<A: Actor> Control<A> {
         Self {
             ex,
             actor_rune: rune,
-            state: State::Running,
             home,
-            signals,
             bg_jobs: FuturesUnordered::new(),
+            drain_mailbox: false,
             idgen,
             thread_root_span,
             actor_span,
@@ -369,44 +348,19 @@ impl<A: Actor> Control<A> {
         }
     }
 
-    #[instrument(skip_all)]
-    pub fn soft_exit(&mut self) {
-        if self.state >= State::SoftExiting {
-            return;
-        }
-        debug!("Soft exit commanded");
-        self.state = State::SoftExiting;
-        // TODO: i think it would be nice to be able to close the channel only if an actor knows it
-        // can't do anything with more messages and wants to inhibit others from sending them at
-        // all. Not sure if another state is necessary for this, but i guess it would make sense to
-        // have one. Add the option do discard everything in the queue as well.
-        // TODO: add a close_mail_box and close_and_clear_mail_box
+    // TODO: and create a close_and_clear_mail_box
+    pub fn close_mailbox(&mut self) {
+        trace!("Closing the mailbox");
         // NOTE: this will only fail if already closed
         if let Some(adr) = self.home.upgrade() {
             adr.sender.close();
         }
-        // TODO:
-        // self.task_switch.detonate();
     }
 
-    #[instrument(skip_all)]
-    pub fn hard_exit(&mut self) {
-        if self.state >= State::HardExiting {
-            return;
-        }
-        debug!("Hard exit commanded");
-        self.soft_exit();
-        self.state = State::HardExiting;
-    }
-
-    #[instrument(skip_all)]
-    pub fn escalating_exit(&mut self) {
-        match self.state {
-            State::Running => self.soft_exit(),
-            State::SoftExiting => self.hard_exit(),
-            State::HardExiting => debug!("Already hard exiting"),
-        }
-        debug_assert!(self.is_exiting());
+    pub fn close_and_clear_mail_box(&mut self) {
+        self.close_mailbox();
+        trace!("Draining the mailbox");
+        self.drain_mailbox = true;
     }
 
     pub fn weak_address(&self) -> WeakAddress<A> {
@@ -416,13 +370,7 @@ impl<A: Actor> Control<A> {
     pub fn address(&self) -> Result<Address<A>, AddressClosedError> {
         // NOTE: This can fail if all addresses got dropped and/or a soft exit has been issued. It's
         // guaranteed to not fail in enter and message handlers, unless soft exiting.
-        self.home.upgrade().context(AddressClosedSnafu {
-            exiting: self.is_exiting(),
-        })
-    }
-
-    pub fn is_exiting(&self) -> bool {
-        self.state >= State::SoftExiting
+        self.home.upgrade().context(AddressClosedSnafu)
     }
 
     fn add_bg_job(&mut self, job: LocalBoxFuture<'static, ErasedLocalDeliverable<A>>) {
@@ -431,10 +379,8 @@ impl<A: Actor> Control<A> {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(display("The address is closed, exiting={exiting}"))]
-pub struct AddressClosedError {
-    exiting: bool,
-}
+#[snafu(display("The address is closed"))]
+pub struct AddressClosedError;
 
 #[derive(Debug, Snafu)]
 pub enum WaitError<T: std::error::Error + 'static> {
@@ -456,7 +402,8 @@ type ExitSend<E> = bhannel::Sender<Result<(), E>>;
 pub trait Receive<T>: Actor {
     // NOTE: I'm pretty sure the 'static bound on the Actor trait is implying that this also must be
     // 'static
-    type Retval;
+    // RANT: these, annoyingly, can't have default values
+    type Retval; // = ()
 
     #[expect(
         async_fn_in_trait,
@@ -587,6 +534,8 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     /// This will return some arbitrary error if used after the exit reason has been awaited once
     /// already.
     pub async fn wait(&mut self) -> Result<(), WaitError<A::Error>> {
+        // TODO: shouldn't this require A::Error to be Send if the scope is remote? Or is this
+        // required to always be send or something? A local address shouldn't care.
         wait_on_exit_recv::<A>(&mut self.status).await
     }
 }
@@ -681,7 +630,9 @@ where
     T: Send + 'static,
     A: Receive<T>,
     A::Retval: Send,
-    A::Error: Send,
+    A::Error: Send, // TODO: this shouldn't need to be here, this has nothing to do with the message
+                    // being sent. This maybe fixes itself together with the TODO in the
+                    // erase_address function, which is the one requiring this.
 {
     fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A> {
         Box::new(p)
@@ -892,6 +843,8 @@ impl<A: Actor> Deliverable<A> for () {
 }
 
 pub mod bg_job {
+    use blocking::Unblock;
+
     use super::*;
 
     pub struct Skip {
@@ -908,6 +861,7 @@ pub mod bg_job {
         }
     }
 
+    #[must_use = "the job must be started to do anything"]
     pub struct Job<'a, F, S = Skip> {
         future: F,
         sync: S,
@@ -940,6 +894,12 @@ pub mod bg_job {
                 sync: NonSkip { inner: sync },
                 span: self.span,
             }
+        }
+    }
+
+    impl<'a, F> Job<'a, Unblock<F>, Skip> {
+        pub fn new_blocking(func: F) -> Self {
+            Self::new(Unblock::new(func))
         }
     }
 
@@ -1035,7 +995,10 @@ pub mod bg_job {
 
     #[cfg(test)]
     mod tests {
-        use crate::test_utils::{assert_parent_span, assert_span};
+        use crate::{
+            deferred_span,
+            test_utils::{assert_parent_span, assert_span},
+        };
 
         use super::*;
 
@@ -1092,7 +1055,7 @@ pub mod bg_job {
                 }
             }
 
-            let main_stage = Stage::without_signals();
+            let main_stage = Stage::new();
             let (snd, rcv) = SecretAddress::new_channel();
             main_stage.summon(Alice { snd });
 
@@ -1110,7 +1073,19 @@ pub mod bg_job {
 
 #[derive(Debug, Snafu)]
 #[snafu(display("Could not send message, actor dead :("))]
+// TODO: make these send errors return the value that was attempted to be sent? It's difficult to
+// get them back since they are erased in a Box, but it should be possible to downcast them back i
+// think.
 pub struct SendError;
+
+#[derive(Debug, Snafu)]
+#[snafu(module, context(suffix(false)))]
+pub enum TrySendError {
+    #[snafu(display("Could not send message, mailbox full"))]
+    Full,
+    #[snafu(display("Could not send message, actor dead :("))]
+    Closed,
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(display("Could not receive reply, actor dead :("))]
@@ -1139,7 +1114,6 @@ impl<R> Future for Reply<R> {
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
     where
-        T: 'static,
         A: Receive<T>,
         S: CanSend<A, T>,
     {
@@ -1161,10 +1135,12 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 
     // TODO: the return value is constrained too much here. No value is ever sent, but it's still
-    // constrained to be Send. This probably requires another trait to solve.
+    // constrained to be Send. This probably requires another trait to solve. Not sure how big of a
+    // problem this is though, I imagine that most messages sent with this will have retval = (), so
+    // it doesn't matter. This should maybe even require the retval on receive to be ()? Isn't it
+    // weird to define a return value and then ignore it?
     pub async fn send<T>(&self, msg: T) -> Result<(), SendError>
     where
-        T: 'static,
         A: Receive<T>,
         S: CanSend<A, T>,
     {
@@ -1179,6 +1155,46 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         };
         let erased = S::erase_ticket(ticket);
         self.sender.send(erased).await.ok().context(SendSnafu)?;
+        Ok(())
+    }
+
+    pub fn try_send<T>(&self, msg: T) -> Result<(), TrySendError>
+    where
+        A: Receive<T>,
+        S: CanSend<A, T>,
+    {
+        trace!(
+            "to" = type_name::<A>(),
+            "msg" = type_name::<T>(),
+            "Try send message"
+        );
+        let ticket = OneWayTicket {
+            msg,
+            erased: self.erased(),
+        };
+        let erased = S::erase_ticket(ticket);
+        self.sender.try_send(erased).map_err(|err| match err {
+            async_channel::TrySendError::Full(_) => try_send_error::Full.build(),
+            async_channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
+        })
+    }
+
+    pub fn send_blocking<T>(&self, msg: T) -> Result<(), SendError>
+    where
+        A: Receive<T>,
+        S: CanSend<A, T>,
+    {
+        trace!(
+            "to" = type_name::<A>(),
+            "msg" = type_name::<T>(),
+            "Send blocking message"
+        );
+        let ticket = OneWayTicket {
+            msg,
+            erased: self.erased(),
+        };
+        let erased = S::erase_ticket(ticket);
+        self.sender.send_blocking(erased).ok().context(SendSnafu)?;
         Ok(())
     }
 
@@ -1242,17 +1258,23 @@ impl<T> Clone for Box<dyn SecretSend<T> + Send> {
 
 trait SecretSend<T> {
     // RANT: this can't be a simple async fn, cuz that is not object safe...
-    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>>;
+    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+    where
+        T: 'a;
+    fn try_send(&self, msg: T) -> Result<(), TrySendError>;
+    fn send_blocking(&self, msg: T) -> Result<(), SendError>;
     fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send>;
 }
 
 impl<A, S, T> SecretSend<T> for GenericAddress<A, S>
 where
     A: Receive<T>,
-    T: 'static,
     S: CanSend<A, T>,
 {
-    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+    where
+        T: 'a,
+    {
         self.send(msg).boxed_local()
     }
 
@@ -1260,18 +1282,37 @@ where
         let clone: Self = self.clone();
         S::erase_address(clone)
     }
+
+    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+        self.try_send(msg)
+    }
+
+    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+        self.send_blocking(msg)
+    }
 }
 
 impl<T, SS> SecretSend<T> for UnsafeSendWrapper<SS>
 where
     SS: SecretSend<T>,
 {
-    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+    where
+        T: 'a,
+    {
         self.inner().send(msg)
     }
 
     fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
         self.inner().clone_secret_send()
+    }
+
+    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+        self.inner().try_send(msg)
+    }
+
+    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+        self.inner().send_blocking(msg)
     }
 }
 
@@ -1279,12 +1320,26 @@ impl<T> SecretSend<T> for channel::Sender<T>
 where
     T: Send + 'static,
 {
-    fn send(&self, msg: T) -> LocalBoxFuture<'_, Result<(), SendError>> {
+    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+    where
+        T: 'a,
+    {
         self.send(msg).map_err(|_| SendError).boxed_local()
     }
 
     fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
         Box::new(self.clone())
+    }
+
+    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+        self.try_send(msg).map_err(|err| match err {
+            async_channel::TrySendError::Full(_) => try_send_error::Full.build(),
+            async_channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
+        })
+    }
+
+    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+        self.send_blocking(msg).map_err(|_| SendError)
     }
 }
 
@@ -1324,6 +1379,14 @@ impl<T> SecretAddress<T> {
     pub async fn send(&self, msg: T) -> Result<(), SendError> {
         self.secret.send(msg).await
     }
+
+    pub fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+        self.secret.try_send(msg)
+    }
+
+    pub fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+        self.secret.send_blocking(msg)
+    }
 }
 
 // TODO: use tracing and/or metrics crate to collect how full all mailboxes are and present in some
@@ -1343,44 +1406,34 @@ async fn actor_main<A: Actor>(
     enum Event<A: Actor> {
         Delivery(ErasedDeliverable<A>),
         LocalDelivery(ErasedLocalDeliverable<A>),
-        Signal,
+        Eof,
     }
-    let mut events = {
-        let delivery_stream = rcv.map(Event::Delivery);
-        pin!(delivery_stream)
-    };
+    let mut mailbox = pin!(
+        rcv.map(Event::Delivery)
+            .chain(stream::once(async { Event::Eof }))
+    );
     let mut poll_next = stream::PollNext::default();
 
     yield_guard(A::YIELD_POLICY, async |guard| {
         loop {
-            {
-                let delivery_stream = events.get_ref();
-                let delivery_len = delivery_stream.len();
-                trace!(
-                    bg_jobs.len = ctl.bg_jobs.len(),
-                    events.len = delivery_len,
-                    addresses.count.estimation = delivery_stream.sender_count() - delivery_len,
-                    mailbox.size = ?A::MAIL_BOX_SIZE, // TODO: make the string prettier
-                    "Awaiting next event"
-                );
-            }
-
             let mut events = stream::select_with_strategy(
-                events.as_mut(),
+                mailbox.as_mut(),
                 (&mut ctl.bg_jobs).map(Event::LocalDelivery),
                 |()| poll_next.toggle(),
             );
             match events.next().await {
-                // TODO: this event can't be processed if some other event is stuck. The only way i
-                // can think of to solve this is to add an async fn to Control that listens for
-                // interrupts. It can't be safe in general to just cancel a message handler, so let
-                // them decide themselves when it is appropriate
-                Some(Event::Signal) => {
-                    trace!("Signal event");
+                None => {
+                    trace!("No more events");
+                    break;
+                }
+                Some(Event::Eof) => {
                     actor
-                        .interrupted(&mut ctl)
-                        .instrument(debug_span!("interrupt"))
-                        .await
+                        .mailbox_eof(&mut ctl)
+                        .instrument(debug_span!("eof"))
+                        .await;
+                }
+                Some(Event::Delivery(_) | Event::LocalDelivery(_)) if ctl.drain_mailbox => {
+                    trace!("Dropping a delivery");
                 }
                 Some(Event::Delivery(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
@@ -1392,15 +1445,6 @@ async fn actor_main<A: Actor>(
                     // it has the concrete types.
                     delivery.deliver(&mut actor, &mut ctl).await
                 }
-                None => {
-                    trace!("No more events");
-                    break;
-                }
-            }
-
-            if ctl.state == State::HardExiting {
-                debug!("Hard exit, breaking loop");
-                break;
             }
 
             guard.yield_point().await;
@@ -1422,55 +1466,59 @@ async fn actor_main<A: Actor>(
     }
 }
 
+#[derive(Debug, Snafu)]
+pub enum StageError {
+    #[snafu(display("One or more actors panicked"))]
+    ActorPanic { source: PanicError },
+    #[snafu(display("Abruptly interrupted"))]
+    Interrupted,
+}
+
 #[derive(Clone)]
 pub struct StageCore {
-    signal_stream: InactiveSignalStream,
     idgen: IdGenerator,
 }
 assert_impl_all!(StageCore: Send, Sync);
 
 pub struct Stage {
     ex: Rc<LocalExecutor<'static>>,
-    heart: Heart,
-    rune: Rune,
-    signal_stream: InactiveSignalStream,
+    actor_heart: Heart,
+    actor_rune: Rune,
     idgen: IdGenerator,
     thread_root_span: Span,
+    sig_bomb: Bomb,
+    sig_guard: Option<StageGuard>,
 }
 assert_not_impl_any!(Stage: Send, Sync);
 
 impl Stage {
     pub fn from_core(core: StageCore) -> Self {
-        let (heart, rune) = heart::create();
+        let (actor_heart, actor_rune) = heart::create();
         Self {
             ex: Rc::new(LocalExecutor::new()),
-            heart,
-            rune,
-            signal_stream: core.signal_stream,
+            actor_heart,
+            actor_rune,
+            sig_bomb: Bomb::new(),
+            sig_guard: None,
             idgen: core.idgen,
-            // NOTE: this span is allowed to be anything
             thread_root_span: Span::current(),
         }
     }
 
-    fn new(signal_stream: InactiveSignalStream) -> Self {
+    pub fn new() -> Self {
         Self::from_core(StageCore {
-            signal_stream,
             idgen: IdGenerator::new(),
         })
     }
 
-    pub fn without_signals() -> Self {
-        Self::new(crate::signals::dummy_signal_stream())
-    }
-
-    pub fn with_signals(signals: &crate::signals::Signals) -> Self {
-        Self::new(signals.inactive_signal_stream())
+    pub fn register_signals(&mut self, sig_reg: &SigRegistry) {
+        assert!(self.sig_guard.is_none()); // TODO: solve this with type state or smth instead?
+        let guard = sig_reg.register_stage(self.sig_bomb.get_switch());
+        self.sig_guard = Some(guard);
     }
 
     pub fn core(&self) -> StageCore {
         StageCore {
-            signal_stream: self.signal_stream.clone(),
             idgen: self.idgen.clone(),
         }
     }
@@ -1479,8 +1527,7 @@ impl Stage {
         ActorBuilder::new(
             actor,
             Rc::clone(&self.ex),
-            self.rune.clone(),
-            self.signal_stream.clone(),
+            self.actor_rune.clone(),
             self.idgen.clone(),
             self.thread_root_span.clone(),
         )
@@ -1494,13 +1541,20 @@ impl Stage {
         self.actor_builder(actor).spawn_multiplex(additional)
     }
 
-    pub fn play(self) -> Result<(), PanicError> {
-        self.play_internal(|heart, ex| block_on(ex.run(heart.wait())))
+    pub fn play(self) -> Result<(), StageError> {
+        self.play_internal(|heart, ex, bomb| {
+            block_on(ex.run(async {
+                match bomb.attach_future(heart.wait()).await {
+                    kill_switch::Tick::Tock(res) => res.context(ActorPanicSnafu),
+                    kill_switch::Tick::Boom => InterruptedSnafu.fail(),
+                }
+            }))
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn assert_plays_within(self, ticks: usize) {
-        self.play_internal(|heart, ex| {
+        self.play_internal(|heart, ex, _| {
             for _ in 0..ticks {
                 if ex.is_empty() {
                     break;
@@ -1515,26 +1569,30 @@ impl Stage {
                 .wait()
                 .now_or_never()
                 .expect("all actors should be dead")
+                .context(ActorPanicSnafu)
         })
         .expect("Actor(s) panicked");
     }
 
-    fn play_internal<F>(self, f: F) -> Result<(), PanicError>
+    fn play_internal<F>(self, f: F) -> Result<(), StageError>
     where
-        F: FnOnce(Heart, &Rc<LocalExecutor<'static>>) -> Result<(), PanicError>,
+        F: FnOnce(Heart, &Rc<LocalExecutor<'static>>, Bomb) -> Result<(), StageError>,
     {
-        fn take_essentials_drop_the_rest(this: Stage) -> (Heart, Rc<LocalExecutor<'static>>) {
-            (this.heart, this.ex)
+        fn take_essentials_drop_the_rest(
+            this: Stage,
+        ) -> (Heart, Rc<LocalExecutor<'static>>, Bomb, Option<StageGuard>) {
+            (this.actor_heart, this.ex, this.sig_bomb, this.sig_guard)
         }
-        let (heart, ex) = take_essentials_drop_the_rest(self);
+        let (heart, ex, sig_bomb, sig_guard) = take_essentials_drop_the_rest(self);
         let _span = debug_span!("stage").entered();
 
         debug!(num_actors = heart.rune_count(), "Action!");
-        let res = f(heart, &ex);
+        let res = f(heart, &ex, sig_bomb);
         debug!(?res, "Exited");
 
-        assert!(ex.is_empty());
-        assert_eq!(Rc::strong_count(&ex), 1);
+        let executor = Rc::into_inner(ex).expect("There should only be one strong reference");
+        drop(sig_guard);
+        drop(executor);
         res
     }
 }
@@ -1548,13 +1606,13 @@ mod tests {
 
         #[test]
         fn no_actors_added() {
-            let stage = Stage::without_signals();
+            let stage = Stage::new();
             assert!(stage.play().is_ok());
         }
 
         #[test]
         fn terminate_when_all_addresses_gone() {
-            let stage = Stage::without_signals();
+            let stage = Stage::new();
             let (fut, _) = stage.actor_builder(DummyActor).no_spawn();
             let mut fut = pin!(fut);
             assert_future_ready!(fut);
@@ -1562,7 +1620,7 @@ mod tests {
 
         #[test]
         fn terminate_when_all_addresses_gone_after_one_poll_ready() {
-            let stage = Stage::without_signals();
+            let stage = Stage::new();
             let (fut, adr) = stage.actor_builder(DummyActor).no_spawn();
             let mut fut = pin!(fut);
             assert_future_pending!(fut);
@@ -1572,9 +1630,12 @@ mod tests {
         }
     }
 
+    // TODO: more tests to make sure send is not required in cases where it isn't. There are many
+    // types that needs to be conditional now, so it's hard to make sure everything is correct. It's
+    // difficult though to make negative tests, i.e. cases that should fail to compile.
     mod multi_thread {
         use super::*;
-        use crate::utils::thread_info_span;
+        use crate::{deferred_span, utils::thread_info_span};
         use tracing::info;
 
         #[test]
@@ -1616,7 +1677,7 @@ mod tests {
             }
 
             let _span = thread_info_span().entered();
-            let main_stage = Stage::without_signals();
+            let main_stage = Stage::new();
             let alice_adr = main_stage.summon(Alice);
 
             let t1 = std::thread::spawn({

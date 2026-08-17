@@ -23,18 +23,36 @@ impl Switch {
 pub struct Bomb {
     // RANT: this channel is !Unpin even though it doesn't have to be
     inner: channel::Receiver<()>,
+    // NOTE: keep itself alive, only explicit detonates will explode this bomb
+    switch: Switch,
 }
 
 impl Bomb {
+    pub fn new() -> Self {
+        // NOTE: bounded(1) takes less space than unused unbounded, i hope
+        let (snd, rcv) = channel::bounded(1);
+        Bomb {
+            inner: rcv,
+            switch: Switch { inner: snd },
+        }
+    }
+
     pub fn has_exploded(&self) -> bool {
         self.inner.is_closed()
     }
 
     pub async fn wait(&self) {
+        // NOTE: this can wait forever if there are no external switches, since there is at least
+        // one sender always. But since this function is borrowing &self, then there can be other
+        // references to self that could create new switches.
         // TODO: this could clone the receiver and return a future that is static
         if let Ok(()) = self.inner.recv().await {
             panic!("Nothing is ever sent here");
         }
+    }
+
+    pub fn get_switch(&self) -> Switch {
+        self.switch.clone()
     }
 
     pub async fn attach_future<T>(&self, fut: impl Future<Output = T>) -> Tick<T> {
@@ -54,10 +72,11 @@ impl Bomb {
     }
 }
 
+#[deprecated = "The switch is included in the bomb nowadays, use Bomb::new() instead"]
 pub fn create() -> (Bomb, Switch) {
-    // NOTE: bounded(1) takes less space than unused unbounded, i hope
-    let (snd, rcv) = channel::bounded(1);
-    (Bomb { inner: rcv }, Switch { inner: snd })
+    let bomb = Bomb::new();
+    let switch = bomb.get_switch();
+    (bomb, switch)
 }
 
 #[derive(Debug, PartialEq, Eq)]
