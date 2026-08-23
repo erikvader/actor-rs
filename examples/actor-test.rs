@@ -1,5 +1,5 @@
 use actor_rs::{
-    actor::{Actor, Control, Receive, Stage},
+    actor::{Actor, Control, IntoActorExt, Receive, Stage},
     actors,
     signals::Signals,
     whatever::*,
@@ -37,22 +37,37 @@ fn setup_tracing() {
             .location()
             .map(|l| l.to_string())
             .unwrap_or_else(|| "no location".to_string());
-        tracing::error!(target: "panic", location, "{payload}");
+
+        let current = std::thread::current();
+        let rust_id = current.id();
+        let name = current
+            .name()
+            .map_or_else(|| "unnamed".to_string(), |s| s.to_string());
+
+        tracing::error!(target: "panic", location, name, ?rust_id, "{payload}");
+
+        // NOTE: the panic will be printed twice like this, but it's not really possible to ignore
+        // the whole chain of hooks, since there can be important stuff in there that needs to be
+        // executed.
         prev_hook(arg);
     }));
 }
 
-#[snafu::report]
-fn main() -> Result<(), Whatever> {
+fn main() -> actor_rs::signals::SigTerminate<actor_rs::whatever::Report> {
     setup_tracing();
     let _span = actor_rs::utils::thread_info_span().entered();
-    let grace = Signals::new().whatever_context("Couldn't create signal handler")?;
-    let stage = Stage::new();
-    // TODO: register stage
+    let signals = Signals::new().expect("Couldn't create signal handler");
+    let res = inner_main(&signals);
+    signals.terminate(res.into())
+}
+
+fn inner_main(signals: &Signals) -> Result<(), Whatever> {
+    let mut stage = Stage::new();
+    stage.register_signals(signals);
 
     {
         let printer_adr = stage.summon(actors::logger::Logger);
-        stage.summon(actors::line_reader::stdin(printer_adr.secret()));
+        stage.summon(actors::line_reader::stdin(printer_adr.secret()).interruptable(signals));
     }
 
     stage.play().whatever_context("Stage failed")

@@ -1,8 +1,9 @@
+use std::process::{ExitCode, Termination};
 use std::sync::{Arc, Mutex};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Handle as SigHookHandle;
-use tracing::{debug, info_span, warn};
+use tracing::{debug, debug_span, info_span, warn};
 
 use registry::*;
 
@@ -16,8 +17,9 @@ mod registry {
 
     type Id = u64;
 
-    pub struct Registry<T> {
-        // TODO: this should/could be some concurrent hashmap to avoid the mutex
+    pub(crate) struct Registry<T> {
+        // TODO: this could be some concurrent hashmap to avoid the mutex, but it probably doesn't
+        // make a noticeable difference
         regs: Arc<Mutex<HashMap<Id, T>>>,
         next: Id,
     }
@@ -55,7 +57,7 @@ mod registry {
         }
     }
 
-    pub struct Iter<'a, T> {
+    pub(crate) struct Iter<'a, T> {
         guard: MutexGuard<'a, HashMap<Id, T>>,
     }
 
@@ -66,7 +68,7 @@ mod registry {
     }
 
     // TODO: this shouldn't actually need to know T, since it doesn't do anything with it
-    pub struct Guard<T> {
+    pub(crate) struct Guard<T> {
         regs: Arc<Mutex<HashMap<Id, T>>>,
         id: Id,
     }
@@ -107,10 +109,18 @@ impl From<Signal> for i32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Interrupted;
+impl Signal {
+    // TODO: this should return the never type
+    fn execute_default_action(self) {
+        debug!("Executing default signal handler for {self:?}");
+        signal_hook::low_level::emulate_default_handler(self.into()).expect("The signal exists");
+    }
+}
 
-#[derive(Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy)]
+pub struct Interrupt;
+
+#[derive(Ord, PartialOrd, Eq, PartialEq, Debug)]
 enum State {
     Running,
     Interrupted,
@@ -131,7 +141,7 @@ impl State {
 
 pub struct Signals {
     signals_handle: SigHookHandle,
-    thread_handle: Option<std::thread::JoinHandle<()>>,
+    thread_handle: Option<std::thread::JoinHandle<Option<Signal>>>,
     sig_reg: SigRegistry,
 }
 
@@ -141,10 +151,9 @@ impl Signals {
         let signals_handle = signals.handle();
         let sig_reg = SigRegistry::new(SigInner::new());
 
-        let thread_handle = std::thread::spawn({
+        let thread_handle = crate::utils::spawn("signals", {
             let sig_reg = sig_reg.clone();
             move || {
-                let _span = info_span!("signals").entered();
                 debug!("Started");
 
                 let mut largest: Option<Signal> = None;
@@ -161,26 +170,27 @@ impl Signals {
 
                     let mut lock = sig_reg.lock();
                     lock.state = lock.state.next();
+                    debug!("Entering state {:?}", lock.state);
 
                     match lock.state {
-                        State::Running => (),
+                        State::Running => {
+                            unreachable!("this is the first state, next() can't return this")
+                        }
                         State::Interrupted => send_interrupts(lock.actor_registry.values()),
                         State::InterruptedTwice => {
                             for swt in lock.stage_registry.values().iter() {
                                 swt.detonate();
                             }
                         }
-                        State::InterruptedMore => break,
+                        State::InterruptedMore => {
+                            let signal = largest.expect("this will be set at this point");
+                            signal.execute_default_action();
+                        }
                     }
                 }
 
-                if let Some(signal) = largest {
-                    debug!(?signal, "Executing default signal handler");
-                    signal_hook::low_level::emulate_default_handler(signal.into())
-                        .expect("The signal exists");
-                }
-
-                debug!("Exited");
+                debug!(?largest, "Exited");
+                largest
             }
         });
 
@@ -191,15 +201,35 @@ impl Signals {
         })
     }
 
-    pub fn registry(&self) -> &SigRegistry {
-        &self.sig_reg
+    pub fn registry(&self) -> SigRegistry {
+        self.sig_reg.clone()
+    }
+
+    fn kill_thread(&mut self) -> Option<Signal> {
+        self.signals_handle.close();
+        if let Some(thread_handle) = self.thread_handle.take() {
+            debug!("Waiting for the signals thread to die");
+            match thread_handle.join() {
+                Ok(val) => val,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn terminate<T>(self, wrap: T) -> SigTerminate<T> {
+        SigTerminate {
+            signals: self,
+            wrapped: wrap,
+        }
     }
 }
 
-fn send_interrupts(values: Iter<'_, SecretAddress<Interrupted>>) {
+fn send_interrupts(values: Iter<'_, SecretAddress<Interrupt>>) {
     let mut fulls = Vec::new();
     for adr in values.iter() {
-        if let Err(err) = adr.try_send(Interrupted) {
+        if let Err(err) = adr.try_send(Interrupt) {
             match err {
                 crate::actor::TrySendError::Full => fulls.push(adr.clone()),
                 crate::actor::TrySendError::Closed => (),
@@ -208,25 +238,26 @@ fn send_interrupts(values: Iter<'_, SecretAddress<Interrupted>>) {
     }
 
     if !fulls.is_empty() {
-        tracing::trace!("Some actors had full mailboxes, spawning thread and sending to them");
-        std::thread::spawn(move || {
-            let _span = tracing::debug_span!("interrupter").entered();
+        tracing::trace!("Some actors had full mailboxes, spawning a thread and sending to them");
+        crate::utils::spawn("interrupter", move || {
             for adr in fulls {
-                let _: Result<(), _> = adr.send_blocking(Interrupted);
+                tracing::trace!("Trying to send an interrupt");
+                let _: Result<(), _> = adr.send_blocking(Interrupt);
             }
-            tracing::debug!("Interrupter thread done");
+            tracing::trace!("Done");
         });
+    }
+}
+
+impl AsRef<SigRegistry> for Signals {
+    fn as_ref(&self) -> &SigRegistry {
+        &self.sig_reg
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
-        let _span = info_span!("signals_drop").entered();
-        self.signals_handle.close();
-        if let Some(thread_handle) = self.thread_handle.take() {
-            debug!("Waiting for thread to die");
-            let _: Result<_, _> = thread_handle.join();
-        }
+        self.kill_thread();
     }
 }
 
@@ -246,25 +277,31 @@ impl SigRegistry {
         self.inner.lock().unwrap()
     }
 
-    pub fn register_stage(&self, switch: Switch) -> StageGuard {
+    pub(crate) fn register_stage(&self, switch: Switch) -> StageGuard {
         self.lock().stage_registry.register(switch)
     }
 
-    pub fn register_actor(&self, adr: SecretAddress<Interrupted>) -> ActorGuard {
+    pub(crate) fn register_actor(&self, adr: SecretAddress<Interrupt>) -> ActorGuard {
         let mut lock = self.lock();
         let guard = lock.actor_registry.register(adr);
         ActorGuard {
-            guard,
+            _guard: guard,
             is_interrupted: lock.state >= State::Interrupted,
         }
     }
 }
 
-pub type StageGuard = Guard<Switch>;
+impl AsRef<SigRegistry> for SigRegistry {
+    fn as_ref(&self) -> &SigRegistry {
+        self
+    }
+}
 
-pub struct ActorGuard {
-    guard: Guard<SecretAddress<Interrupted>>,
-    // NOTE: is true if the actor gets registerd after the first interrupts signal has been sent. An
+pub(crate) type StageGuard = Guard<Switch>;
+
+pub(crate) struct ActorGuard {
+    _guard: Guard<SecretAddress<Interrupt>>,
+    // NOTE: is true if the actor gets registered after the first interrupt signal has been sent. An
     // alternate solution could have been to send the message to the address directly, but that is
     // not guaranteed to arrive if it had been closed, and the actor could dead lock itself if the
     // mailbox was full.
@@ -273,7 +310,7 @@ pub struct ActorGuard {
 
 struct SigInner {
     stage_registry: Registry<Switch>,
-    actor_registry: Registry<SecretAddress<Interrupted>>,
+    actor_registry: Registry<SecretAddress<Interrupt>>,
     state: State,
 }
 
@@ -284,5 +321,24 @@ impl SigInner {
             actor_registry: Registry::new(),
             state: State::Running,
         }
+    }
+}
+
+pub struct SigTerminate<T> {
+    signals: Signals,
+    wrapped: T,
+}
+
+impl<T: Termination> Termination for SigTerminate<T> {
+    fn report(mut self) -> ExitCode {
+        let _span = debug_span!("sig_post_main").entered();
+        let inner_code = self.wrapped.report();
+        debug!(?inner_code);
+
+        if let Some(sig) = self.signals.kill_thread() {
+            sig.execute_default_action();
+        }
+
+        inner_code
     }
 }

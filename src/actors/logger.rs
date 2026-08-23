@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use crate::{
     actor::{Actor, Receive},
     deferred_info_span,
-    utils::DeferredSpan,
+    deferred_span::DeferredSpan,
 };
 
 pub struct Logger;

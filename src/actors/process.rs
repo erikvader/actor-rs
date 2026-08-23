@@ -6,7 +6,7 @@ use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::Buf
 use crate::{
     actor::{Actor, Control, Receive, SecretAddress},
     deferred_info_span,
-    utils::DeferredSpan,
+    deferred_span::DeferredSpan,
 };
 
 // TODO: add ways to modify the environment?

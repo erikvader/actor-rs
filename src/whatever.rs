@@ -1,4 +1,7 @@
-use std::error::Error;
+use std::{
+    error::Error,
+    process::{ExitCode, Termination},
+};
 
 pub use snafu::prelude::*;
 
@@ -10,7 +13,6 @@ pub use snafu::prelude::*;
 // TODO: an alternative could be to create a custom snafu::Report that maybe only prints the
 // innermost span trace at the bottom, like how the backtrace works in the default snafu::Whatever
 // type.
-// TODO: Custom report that logs the error instead of printing to stderr?
 #[snafu(display("{message}\n-> {location}\n{span_trace}"))]
 pub struct Whatever {
     #[snafu(source(from(Box<dyn Error + Send + Sync>, Some)))]
@@ -34,5 +36,37 @@ impl std::fmt::Display for SpanTrace {
 impl snafu::GenerateImplicitData for SpanTrace {
     fn generate() -> Self {
         Self(tracing_error::SpanTrace::capture())
+    }
+}
+
+pub struct Report {
+    result: Result<(), Whatever>,
+}
+
+impl<E> From<Result<(), E>> for Report
+where
+    E: Into<Whatever>,
+{
+    fn from(value: Result<(), E>) -> Self {
+        Self {
+            result: value.map_err(|e| e.into()),
+        }
+    }
+}
+
+impl Termination for Report {
+    fn report(self) -> ExitCode {
+        match self.result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(whatever) => {
+                let snafu_report = snafu::Report::from_error(whatever);
+                if tracing::event_enabled!(tracing::Level::ERROR) {
+                    tracing::error!("Error: {}", snafu_report);
+                } else {
+                    eprintln!("Error: {}", snafu_report);
+                }
+                ExitCode::FAILURE
+            }
+        }
     }
 }

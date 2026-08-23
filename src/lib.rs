@@ -7,10 +7,10 @@ pub mod utils;
 // maximum, i.e. std::task::Waker
 pub mod actor;
 pub mod actors;
+pub mod deferred_span;
 mod heart;
 mod kill_switch;
 pub mod signals;
 mod stream_utils;
 
-// TODO: should this really be here?
-pub mod whatever;
+pub mod whatever; // TODO: should this really be here?

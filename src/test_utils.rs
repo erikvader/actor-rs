@@ -17,6 +17,8 @@ pub fn init_tracing() {
                 .map(|l| l.to_string())
                 .unwrap_or_else(|| "no location".to_string());
             tracing::error!(target: "panic", location, "{payload}");
+            // NOTE: the testing harness seems to install some hook, so it needs to execute for the
+            // tests to work.
             prev_hook(arg);
         }));
     }

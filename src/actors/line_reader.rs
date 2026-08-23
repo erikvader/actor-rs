@@ -2,13 +2,13 @@ use std::{convert::Infallible, pin::pin};
 
 use blocking::Unblock;
 use futures_util::{AsyncBufRead, AsyncBufReadExt, AsyncRead, StreamExt, io::BufReader};
-use tracing::Instrument;
 
 use crate::{
-    actor::{Actor, Address, Control, Receive, SecretAddress, bg_job::Job},
+    actor::{Actor, Control, Receive, SecretAddress, bg_job::Job},
     deferred_info_span,
-    kill_switch::{self, Bomb, Tick},
-    utils::DeferredSpan,
+    deferred_span::DeferredSpan,
+    kill_switch::{Bomb, Switch, Tick},
+    signals::Interrupt,
 };
 
 #[derive(Debug)]
@@ -30,6 +30,7 @@ pub struct LineReader<R, C = ()> {
     send_to: Option<SecretAddress<Line>>,
     read_from: Option<R>,
     cleaner: Option<C>,
+    task_killer: Option<Switch>,
 }
 
 impl<R> LineReader<R>
@@ -37,11 +38,7 @@ where
     R: AsyncBufRead + 'static,
 {
     pub fn new(reader: R, to: SecretAddress<Line>) -> Self {
-        Self {
-            read_from: Some(reader),
-            send_to: Some(to),
-            cleaner: Some(()),
-        }
+        Self::with_cleanup(reader, to, ())
     }
 }
 
@@ -55,6 +52,7 @@ where
             read_from: Some(reader),
             send_to: Some(to),
             cleaner: Some(cleanup),
+            task_killer: None,
         }
     }
 }
@@ -78,9 +76,9 @@ where
 }
 
 /// Cleanup when a normal Drop is not enough.
-// TODO: this should ideally take the reader, or at least a pinned one, but it is wrapped in a bunch
-// of streams and stuff at the moment, so it is not easy to extract the reader again. I'm not super
-// convinced this is even needed either?
+// TODO: this should ideally take the reader, or at least a pinned one, for maximum flexibility, but
+// it is wrapped in a bunch of streams and stuff at the moment, so it is not easy to extract the
+// reader again. I'm not super convinced this is even needed either?
 pub trait AsyncCleanup {
     #[expect(async_fn_in_trait, reason = "I don't really understand this warning")]
     async fn cleanup(self);
@@ -95,6 +93,8 @@ where
     R: AsyncBufRead + 'static,
     C: AsyncCleanup + 'static,
 {
+    // TODO: If the reader failed with anything that makes it unable to continue, like not utf-8
+    // error, then it should be returned here.
     type Error = Infallible;
 
     async fn enter(&mut self, ctl: &mut Control<Self>) {
@@ -102,8 +102,9 @@ where
         let read_from = self.read_from.take().expect("will exist here");
         let cleanup = self.cleaner.take().expect("will exist here");
 
-        // TODO: activate the switch on shutdown
-        let (bomb, switch) = kill_switch::create();
+        let bomb = Bomb::new();
+        self.task_killer = Some(bomb.get_switch());
+
         Job::new(async move {
             let mut lines = pin!(bomb.attach_stream(read_from.lines()));
             while let Some(watch) = lines.next().await {
@@ -111,6 +112,7 @@ where
                     Tick::Tock(Ok(line)) => {
                         if send_to.send(Line(line)).await.is_err() {
                             tracing::warn!("Receiver closed");
+                            break;
                         }
                     }
                     Tick::Tock(Err(error)) => {
@@ -134,18 +136,11 @@ where
             cleanup.cleanup().await;
 
             tracing::debug!("Exited");
-        });
-        // TODO:
-        // .start(ctl);
-
-        // TODO: re-add the span to the job
-        // ctl.start_job(fut, |parent| tracing::info_span!(parent: parent, "bg_job"));
+        })
+        .then(async |_, ctl, ()| ctl.close_mailbox())
+        .instrument(deferred_info_span!("bg_job"))
+        .start(ctl);
     }
-
-    // async fn interrupted(&mut self, ctl: &mut Control<Self>) {
-    //     tracing::debug!("Interrupt received");
-    //     ctl.escalating_exit();
-    // }
 
     fn span(&self) -> DeferredSpan<'_> {
         // TODO: add what is being read from somehow?
@@ -153,17 +148,18 @@ where
     }
 }
 
-pub struct Exit;
-impl<R> Receive<Exit> for LineReader<R>
+impl<R> Receive<Interrupt> for LineReader<R>
 where
     R: AsyncBufRead + 'static,
 {
     type Retval = ();
 
-    async fn receive(&mut self, _msg: Exit, ctl: &mut Control<Self>) -> Self::Retval {
-        tracing::debug!("Exit message received");
-        // TODO:
-        // ctl.escalating_exit();
+    async fn receive(&mut self, _msg: Interrupt, ctl: &mut Control<Self>) -> Self::Retval {
+        tracing::debug!("Interrupt message received");
+        ctl.close_mailbox();
+        if let Some(switch) = self.task_killer.as_mut() {
+            switch.detonate();
+        }
     }
 }
 

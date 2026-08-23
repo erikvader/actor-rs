@@ -201,6 +201,7 @@ pub trait StreamExt: Stream {
 
 impl<S> StreamExt for S where S: Stream {}
 
+#[derive(Debug, Clone, Copy)]
 pub enum YieldPolicy {
     Never,
     Every(NonZeroU32),
@@ -208,7 +209,12 @@ pub enum YieldPolicy {
 
 impl YieldPolicy {
     pub const fn default() -> Self {
-        Self::Every(const { NonZeroU32::new(8).unwrap() })
+        if cfg!(test) {
+            // NOTE: makes testing easier by removing a source of Poll::pending
+            Self::Never
+        } else {
+            Self::Every(const { NonZeroU32::new(8).unwrap() })
+        }
     }
 
     pub const fn always() -> Self {

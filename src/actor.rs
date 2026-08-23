@@ -3,32 +3,29 @@ use crate::{
         id_generator::{Id, IdGenerator},
         unsafe_wrapper::UnsafeSendWrapper,
     },
+    deferred_span::DeferredSpan,
     heart::{self, Heart, PanicError, Rune},
-    kill_switch::{self, Bomb, Switch},
-    signals::{SigRegistry, StageGuard},
+    kill_switch::{self, Bomb},
+    signals::{ActorGuard, SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
-    utils::DeferredSpan,
 };
-use async_broadcast as bhannel;
 use async_channel as channel;
 use async_executor::LocalExecutor;
 use async_io::block_on;
 use futures_core::future::LocalBoxFuture;
 use futures_util::{
-    FutureExt as _, StreamExt as _, TryFutureExt,
+    FutureExt as _, StreamExt as _,
     stream::{self, FuturesUnordered},
 };
-use pin_project::pin_project;
 use snafu::prelude::*;
-use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
+use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
-    any::{Any, type_name},
+    any::type_name,
     convert::Infallible,
     marker::PhantomData,
     num::NonZeroUsize,
-    pin::{Pin, pin},
+    pin::pin,
     rc::{Rc, Weak},
-    task::ready,
 };
 use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, trace_span};
 
@@ -37,16 +34,22 @@ use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, tr
 
 // NOTE: Since the output of `type_name` usually is long, i only use it on spans of level trace and
 // events of levels debug or higher (verbosity).
+// TODO: it would be cool if there was some nice way to shorten those type names
 
 #[derive(Debug, Clone, Copy)]
-pub enum MailBoxSize {
+pub enum MailboxSize {
     Unbounded,
     Bounded(NonZeroUsize),
 }
 
-impl MailBoxSize {
+impl MailboxSize {
     pub const fn default() -> Self {
-        Self::Bounded(const { NonZeroUsize::new(16).unwrap() })
+        if cfg!(test) {
+            // NOTE: makes testing easier by removing a source of Poll::pending
+            Self::Unbounded
+        } else {
+            Self::Bounded(const { NonZeroUsize::new(16).unwrap() })
+        }
     }
 }
 
@@ -58,9 +61,6 @@ impl MailBoxSize {
     note = "implement `Actor`"
 )]
 pub trait Actor: Sized + 'static {
-    const MAIL_BOX_SIZE: MailBoxSize = MailBoxSize::default();
-    const YIELD_POLICY: YieldPolicy = YieldPolicy::default();
-
     // RANT: these, annoyingly, can't have default values
     type Error: std::error::Error + Clone; // = Infallible; will never error
 
@@ -87,9 +87,7 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn mailbox_eof(&mut self, ctl: &mut Control<Self>) {
-        debug!("The mailbox is closed and empty");
-    }
+    async fn mailbox_eof(&mut self, ctl: &mut Control<Self>) {}
 }
 
 // NOTE: for static assertions
@@ -120,11 +118,12 @@ pub struct Control<A: Actor> {
     idgen: IdGenerator,
     thread_root_span: Span,
     actor_span: Span,
+    _signal_guard: Option<ActorGuard>,
     // HACK: these are last so they are dropped last, right before the task terminates. The actor is
     // as dead as possible as this point. The absolute best thing would be to track the task handle
     // itself, but that wasn't as easy.
     actor_rune: Rune,
-    exit_send: ExitSend<A::Error>,
+    exit_send: Option<ExitSend<A::Error>>,
 }
 
 mod id_generator {
@@ -134,7 +133,7 @@ mod id_generator {
     pub type Id = u64;
 
     #[derive(Clone)]
-    pub struct IdGenerator {
+    pub(super) struct IdGenerator {
         counter: Arc<AtomicU64>,
     }
 
@@ -154,160 +153,229 @@ mod id_generator {
     }
 }
 
-type AdrSnd<A> = channel::Sender<ErasedDeliverable<A>>;
-type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
+use builder::ActorBuilder;
+pub use builder::{IntoActor, IntoActorExt, WithMailboxSize};
+mod builder {
+    use crate::signals::Interrupt;
 
-#[derive(Clone)]
-struct ActorBuilder<A: Actor> {
-    actor: A,
-    ex: Rc<LocalExecutor<'static>>,
-    rune: Rune,
-    idgen: IdGenerator,
-    thread_root_span: Span,
-}
+    use super::*;
 
-const GROUP_KEY: &str = "group";
-
-impl<A: Actor> ActorBuilder<A> {
-    fn new(
-        actor: A,
+    pub(super) struct ActorBuilder<A: Actor> {
+        actor: PhantomData<A>,
         ex: Rc<LocalExecutor<'static>>,
         rune: Rune,
         idgen: IdGenerator,
         thread_root_span: Span,
-    ) -> Self {
-        Self {
-            actor,
-            ex,
-            rune,
-            idgen,
-            thread_root_span,
-        }
+        mailbox_size: MailboxSize,
+        yield_policy: YieldPolicy,
     }
 
-    fn create_channel() -> (AdrSnd<A>, AdrRcv<A>) {
-        match A::MAIL_BOX_SIZE {
-            MailBoxSize::Unbounded => channel::unbounded(),
-            MailBoxSize::Bounded(size) => channel::bounded(size.get()),
-        }
-    }
-
-    fn create_exit_channel() -> (ExitSend<A::Error>, ExitRecv<A::Error>) {
-        // NOTE: up to one message will be sent on this, so the overflow flag doesn't matter.
-        // NOTE: the receiver will never be inactive, so the await_active flag doesn't matter
-        bhannel::broadcast(1)
-    }
-
-    fn create_root_span(id: Id, parent: &Span) -> Span {
-        span!(
-            parent: parent,
-            Level::DEBUG,
-            "actor",
-            id,
-            {GROUP_KEY} = field::Empty,
-        )
-    }
-
-    fn raw(
-        self,
-        (snd, rcv): (AdrSnd<A>, AdrRcv<A>),
-        (exit_snd, exit_rcv): (ExitSend<A::Error>, ExitRecv<A::Error>),
-        id: Id,
-        group_id: Option<Id>,
-    ) -> (impl Future<Output = ()>, Address<A>) {
-        // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
-        // sender from another address.
-        let home = unsafe { Address::new(snd, exit_rcv) };
-
-        let span = {
-            let span = Self::create_root_span(id, &self.thread_root_span);
-            if let Some(group_id) = group_id {
-                span.record(GROUP_KEY, group_id);
+    impl<A: Actor> ActorBuilder<A> {
+        pub fn new(
+            ex: Rc<LocalExecutor<'static>>,
+            rune: Rune,
+            idgen: IdGenerator,
+            thread_root_span: Span,
+        ) -> Self {
+            Self {
+                actor: PhantomData,
+                ex,
+                rune,
+                idgen,
+                thread_root_span,
+                mailbox_size: MailboxSize::default(),
+                yield_policy: YieldPolicy::default(),
             }
-
-            let span = if span.is_disabled() {
-                self.thread_root_span.clone()
-            } else {
-                span
-            };
-            self.actor.span().create_or_parent(span)
-        };
-
-        let ctl = Control::new(
-            Rc::downgrade(&self.ex),
-            self.rune,
-            home.downgrade(),
-            self.idgen,
-            self.thread_root_span,
-            span.clone(),
-            exit_snd,
-        );
-
-        // NOTE: I am pretty certain that if span is thread_root_span here it's actually redundant
-        // cuz it gets entered twice, but i don't feel like that special case is worth worrying
-        // about. This is of course only the case if the future is spawned as a task on an executor
-        // that is blocked on its event loop where thread_root_span is active.
-        let fut = actor_main(ctl, self.actor, rcv, home.clone()).instrument(span);
-        (fut, home)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn no_spawn(self) -> (impl Future<Output = ()>, Address<A>) {
-        let id = self.idgen.generate();
-        debug!(id, "type" = type_name::<A>(), "Non-spawn new actor");
-        self.raw(
-            Self::create_channel(),
-            Self::create_exit_channel(),
-            id,
-            None,
-        )
-    }
-
-    fn spawn(self) -> Address<A> {
-        let ex = Rc::clone(&self.ex);
-        let id = self.idgen.generate();
-        let (fut, adr) = self.raw(
-            Self::create_channel(),
-            Self::create_exit_channel(),
-            id,
-            None,
-        );
-        debug!(id, "type" = type_name::<A>(), "Spawn new actor");
-        ex.spawn(fut).detach();
-        adr
-    }
-
-    fn spawn_multiplex(self, additional: usize) -> Address<A>
-    where
-        A: Clone,
-    {
-        let ex = Rc::clone(&self.ex);
-        let channel = Self::create_channel();
-        let exit_channel = Self::create_exit_channel();
-        let group_id = self.idgen.generate();
-        debug!(
-            group_id,
-            additional,
-            "type" = type_name::<A>(),
-            "Spawn new multiplex actor"
-        );
-
-        for _ in 0..additional {
-            let id = self.idgen.generate();
-            let (fut, _) =
-                self.clone()
-                    .raw(channel.clone(), exit_channel.clone(), id, Some(group_id));
-            ex.spawn(fut).detach();
         }
 
-        let (fut, adr) = self.raw(channel, exit_channel, group_id, Some(group_id));
-        ex.spawn(fut).detach();
-        adr
+        fn create_channel(&self) -> (AdrCore<A>, AdrRcv<A>) {
+            match self.mailbox_size {
+                MailboxSize::Unbounded => AdrCore::unbounded(),
+                MailboxSize::Bounded(size) => AdrCore::bounded(size.get()),
+            }
+        }
+
+        fn create_exit_channel() -> (ExitSend<A::Error>, ExitRecv<A::Error>) {
+            oneshot_broadcast::create()
+        }
+
+        fn create_root_span(id: Id, parent: &Span) -> Span {
+            span!(
+                parent: parent,
+                Level::DEBUG,
+                "actor",
+                id,
+            )
+        }
+
+        fn raw(
+            mut self,
+            mut into_actor: impl IntoActor<A>,
+        ) -> (impl Future<Output = ()> + 'static, Address<A>) {
+            into_actor.adjust_builder(&mut self);
+
+            let (snd, rcv) = self.create_channel();
+            let (exit_snd, exit_rcv) = Self::create_exit_channel();
+            let id = self.idgen.generate();
+            debug!(id, "type" = type_name::<A>(), "Spawn new actor");
+
+            // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
+            // sender from another address.
+            let home = unsafe { Address::new(snd, exit_rcv) };
+
+            let sig_guard = into_actor.install_signals(&home);
+
+            let actor = into_actor.into_actor();
+            let span = {
+                let span = Self::create_root_span(id, &self.thread_root_span);
+                let span = if span.is_disabled() {
+                    self.thread_root_span.clone()
+                } else {
+                    span
+                };
+                actor.span().create_or_parent(span)
+            };
+
+            let ctl = Control::new(
+                Rc::downgrade(&self.ex),
+                self.rune,
+                home.downgrade(),
+                self.idgen,
+                self.thread_root_span,
+                span.clone(),
+                exit_snd,
+                sig_guard,
+            );
+
+            // NOTE: I am pretty certain that if span is thread_root_span here it's actually redundant
+            // cuz it gets entered twice, but i don't feel like that special case is worth worrying
+            // about. This is of course only the case if the future is spawned as a task on an executor
+            // that is blocked on its event loop where thread_root_span is active.
+            let fut = actor_main(ctl, actor, rcv, home.clone(), self.yield_policy).instrument(span);
+            (fut, home)
+        }
+
+        #[cfg(test)]
+        pub fn no_spawn(self, actor: impl IntoActor<A>) -> (impl Future<Output = ()>, Address<A>) {
+            self.raw(actor)
+        }
+
+        pub fn spawn(self, actor: impl IntoActor<A>) -> Address<A> {
+            let ex = Rc::clone(&self.ex);
+            let (fut, adr) = self.raw(actor);
+            ex.spawn(fut).detach();
+            adr
+        }
+    }
+
+    #[expect(private_bounds, reason = "The builder should be private")]
+    pub trait IntoActor<A: Actor>: IntoActorPriv<A> {}
+    impl<A: Actor, I: IntoActorPriv<A>> IntoActor<A> for I {}
+
+    trait IntoActorPriv<A: Actor> {
+        fn adjust_builder(&mut self, _builder: &mut ActorBuilder<A>) {}
+        fn install_signals(&mut self, _adr: &Address<A>) -> Option<ActorGuard> {
+            None
+        }
+        fn into_actor(self) -> A;
+    }
+
+    impl<A: Actor> IntoActorPriv<A> for A {
+        fn into_actor(self) -> A {
+            self
+        }
+    }
+
+    pub trait IntoActorExt<A: Actor>: IntoActor<A>
+    where
+        Self: Sized,
+    {
+        fn mailbox_size(self, mailbox_size: MailboxSize) -> WithMailboxSize<Self> {
+            WithMailboxSize {
+                wrapped: self,
+                mailbox_size,
+            }
+        }
+
+        fn yield_policy(self, policy: YieldPolicy) -> WithYieldPolicy<Self> {
+            WithYieldPolicy {
+                wrapped: self,
+                policy,
+            }
+        }
+
+        fn interruptable<R>(self, registry: R) -> WithInterruptable<Self, R> {
+            WithInterruptable {
+                wrapped: self,
+                registry,
+            }
+        }
+    }
+    impl<A: Actor, I: IntoActorPriv<A>> IntoActorExt<A> for I {}
+
+    pub struct WithMailboxSize<W> {
+        wrapped: W,
+        mailbox_size: MailboxSize,
+    }
+
+    impl<A: Actor, W: IntoActorPriv<A>> IntoActorPriv<A> for WithMailboxSize<W> {
+        fn into_actor(self) -> A {
+            self.wrapped.into_actor()
+        }
+
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<A>) {
+            builder.mailbox_size = self.mailbox_size;
+        }
+    }
+
+    pub struct WithYieldPolicy<W> {
+        wrapped: W,
+        policy: YieldPolicy,
+    }
+
+    impl<A: Actor, W: IntoActorPriv<A>> IntoActorPriv<A> for WithYieldPolicy<W> {
+        fn into_actor(self) -> A {
+            self.wrapped.into_actor()
+        }
+
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<A>) {
+            builder.yield_policy = self.policy;
+        }
+    }
+
+    pub struct WithInterruptable<W, R> {
+        wrapped: W,
+        registry: R,
+    }
+
+    impl<A, W, R> IntoActorPriv<A> for WithInterruptable<W, R>
+    where
+        A: Receive<Interrupt>,
+        W: IntoActorPriv<A>,
+        R: AsRef<SigRegistry>,
+    {
+        fn into_actor(self) -> A {
+            self.wrapped.into_actor()
+        }
+
+        fn install_signals(&mut self, adr: &Address<A>) -> Option<ActorGuard> {
+            let secret = adr.secret::<Interrupt>();
+            let guard = self.registry.as_ref().register_actor(secret);
+            if guard.is_interrupted {
+                adr.try_send(Interrupt).expect(
+                    "This address is freshly created, \
+                     it has a size of at least one, and there is no \
+                     other place that \"preloads\" it with messages, \
+                     this will succeed",
+                );
+            }
+            Some(guard)
+        }
     }
 }
 
 impl<A: Actor> Control<A> {
-    pub fn summon<A2>(&self, actor: A2) -> Address<A2>
+    pub fn summon<A2>(&self, actor: impl IntoActor<A2>) -> Address<A2>
     where
         A2: Actor,
     {
@@ -317,13 +385,12 @@ impl<A: Actor> Control<A> {
             .expect("the executor is always alive here, it's what is running this function");
 
         ActorBuilder::new(
-            actor,
             ex,
             self.actor_rune.clone(),
             self.idgen.clone(),
             self.thread_root_span.clone(),
         )
-        .spawn()
+        .spawn(actor)
     }
 
     fn new(
@@ -334,6 +401,7 @@ impl<A: Actor> Control<A> {
         thread_root_span: Span,
         actor_span: Span,
         exit_send: ExitSend<A::Error>,
+        signal_guard: Option<ActorGuard>,
     ) -> Self {
         Self {
             ex,
@@ -344,20 +412,18 @@ impl<A: Actor> Control<A> {
             idgen,
             thread_root_span,
             actor_span,
-            exit_send,
+            exit_send: Some(exit_send),
+            _signal_guard: signal_guard,
         }
     }
 
-    // TODO: and create a close_and_clear_mail_box
     pub fn close_mailbox(&mut self) {
-        trace!("Closing the mailbox");
-        // NOTE: this will only fail if already closed
-        if let Some(adr) = self.home.upgrade() {
-            adr.sender.close();
+        if self.home.close() {
+            trace!("Closed the mailbox");
         }
     }
 
-    pub fn close_and_clear_mail_box(&mut self) {
+    pub fn close_and_clear_mailbox(&mut self) {
         self.close_mailbox();
         trace!("Draining the mailbox");
         self.drain_mailbox = true;
@@ -390,8 +456,74 @@ pub enum WaitError<T: std::error::Error + 'static> {
     Exited { source: T },
 }
 
-type ExitRecv<E> = bhannel::Receiver<Result<(), E>>;
-type ExitSend<E> = bhannel::Sender<Result<(), E>>;
+type ExitRecv<E> = ob::MultiReceiver<Result<(), E>>;
+type ExitSend<E> = ob::UniqueSender<Result<(), E>>;
+
+use oneshot_broadcast as ob;
+mod oneshot_broadcast {
+    use async_broadcast as bhannel;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+
+    pub(super) struct UniqueSender<T> {
+        inner: bhannel::Sender<T>,
+    }
+    assert_not_impl_any!(UniqueSender<()>: Clone);
+
+    impl<T: Clone> UniqueSender<T> {
+        fn new(sender: bhannel::Sender<T>) -> Option<Self> {
+            if sender.sender_count() != 1 {
+                return None;
+            }
+            Some(Self { inner: sender })
+        }
+
+        pub fn broadcast(self, msg: T) {
+            use bhannel::TrySendError;
+            match self.inner.try_broadcast(msg) {
+                Ok(None) | Err(TrySendError::Closed(_)) => (),
+                Ok(Some(_)) | Err(TrySendError::Full(_)) | Err(TrySendError::Inactive(_)) => {
+                    panic!("should not happen")
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct MultiReceiver<T> {
+        inner: bhannel::Receiver<T>,
+    }
+    assert_impl_all!(MultiReceiver<()>: Clone);
+
+    impl<T: Clone> MultiReceiver<T> {
+        fn new(receiver: bhannel::Receiver<T>) -> Self {
+            Self { inner: receiver }
+        }
+
+        pub async fn recv(&mut self) -> Option<T> {
+            debug_assert!(self.inner.sender_count() <= 1);
+            match self.inner.recv_direct().await {
+                Ok(x) => Some(x),
+                Err(async_broadcast::RecvError::Closed) => None,
+                Err(async_broadcast::RecvError::Overflowed(_)) => panic!("this can't overflow"),
+            }
+        }
+
+        pub fn is_sender_alive(&self) -> bool {
+            debug_assert!(self.inner.sender_count() <= 1);
+            !self.inner.is_closed()
+        }
+    }
+
+    pub(super) fn create<T: Clone>() -> (UniqueSender<T>, MultiReceiver<T>) {
+        // NOTE: up to one message will be sent on this, so the overflow flag doesn't matter.
+        // NOTE: the receiver will never be inactive, so the await_active flag doesn't matter
+        let (snd, rcv) = bhannel::broadcast(1);
+        (
+            UniqueSender::new(snd).expect("there is only one of them"),
+            MultiReceiver::new(rcv),
+        )
+    }
+}
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 #[diagnostic::on_unimplemented(
@@ -415,30 +547,266 @@ pub trait Receive<T>: Actor {
 type ErasedDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 type ErasedLocalDeliverable<A> = Box<dyn Deliverable<A>>;
 
-mod private {
-    pub trait Sealed {}
+use scope::{Local, Remote, Scope};
+mod scope {
+    use std::{marker::PhantomData, rc::Rc};
+
+    use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
+
+    mod private {
+        pub trait Sealed {}
+    }
+
+    pub trait Scope: private::Sealed + 'static {}
+
+    pub struct Local {
+        _priv: PhantomData<Rc<()>>,
+    }
+    impl private::Sealed for Local {}
+    impl Scope for Local {}
+    assert_not_impl_any!(Local: Send, Sync);
+    const_assert_eq!(std::mem::size_of::<Local>(), 0);
+
+    pub struct Remote {
+        _priv: (),
+    }
+    impl private::Sealed for Remote {}
+    impl Scope for Remote {}
+    assert_impl_all!(Remote: Send, Sync);
+    const_assert_eq!(std::mem::size_of::<Remote>(), 0);
 }
 
-pub trait Scope: private::Sealed + 'static {}
+use adr_core::{AdrCore, AdrRcv, ErasedAdr, WeakAdrCore};
+pub use adr_core::{Reply, ReplyError, SendError, TrySendError};
+mod adr_core {
+    use super::{
+        Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, OneWayTicket, Package,
+        Receive,
+    };
+    use async_channel as channel;
+    use pin_project::pin_project;
+    use snafu::{OptionExt, Snafu};
+    use static_assertions::assert_impl_all;
+    use std::any::{Any, type_name};
 
-pub struct Local {
-    _priv: PhantomData<Rc<()>>,
-}
-impl private::Sealed for Local {}
-impl Scope for Local {}
-assert_not_impl_any!(Local: Send, Sync);
-const_assert_eq!(std::mem::size_of::<Local>(), 0);
+    pub(super) type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
 
-pub struct Remote {
-    _priv: (),
+    pub(super) struct AdrCore<A: Actor> {
+        sender: channel::Sender<ErasedDeliverable<A>>,
+    }
+    assert_impl_all!(AdrCore<DummyActor>: Send);
+
+    impl<A: Actor> Clone for AdrCore<A> {
+        fn clone(&self) -> Self {
+            Self {
+                sender: self.sender.clone(),
+            }
+        }
+    }
+
+    impl<A: Actor> AdrCore<A> {
+        pub fn unbounded() -> (Self, AdrRcv<A>) {
+            let (snd, rcv) = channel::unbounded();
+            (Self { sender: snd }, rcv)
+        }
+
+        pub fn bounded(capacity: usize) -> (Self, AdrRcv<A>) {
+            let (snd, rcv) = channel::bounded(capacity);
+            (Self { sender: snd }, rcv)
+        }
+
+        pub fn downgrade(&self) -> WeakAdrCore<A> {
+            let weak = self.sender.downgrade();
+            WeakAdrCore { sender: weak }
+        }
+
+        pub fn is_closed(&self) -> bool {
+            self.sender.is_closed()
+        }
+
+        #[expect(dead_code, reason = "unused for now")]
+        pub fn close(&self) {
+            self.sender.close();
+        }
+
+        pub fn erased(&self) -> ErasedAdr
+        where
+            A: 'static,
+        {
+            ErasedAdr {
+                _inner: Box::new(self.sender.clone()),
+            }
+        }
+
+        pub async fn send_ticket<S, T>(&self, msg: T) -> Result<(), SendError>
+        where
+            A: Receive<T>,
+            S: CanSendTicket<A, T>,
+        {
+            tracing::trace!(
+                "to" = type_name::<A>(),
+                "msg" = type_name::<T>(),
+                "Send message"
+            );
+            let ticket = OneWayTicket {
+                msg,
+                erased: self.erased(),
+            };
+            let erased = S::erase_ticket(ticket);
+            self.sender.send(erased).await?;
+            Ok(())
+        }
+
+        pub async fn send_package<S, T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
+        where
+            A: Receive<T>,
+            S: CanSendPackage<A, T>,
+        {
+            tracing::trace!(
+                "to" = type_name::<A>(),
+                "msg" = type_name::<T>(),
+                "return" = type_name::<A::Retval>(),
+                "Send and receive"
+            );
+            let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
+            let package = Package {
+                msg,
+                returner,
+                erased: self.erased(),
+            };
+            let erased = S::erase_package(package);
+            self.sender.send(erased).await?;
+            Ok(Reply { recv: ret_rcv })
+        }
+
+        pub fn try_send_ticket<S, T>(&self, msg: T) -> Result<(), TrySendError>
+        where
+            A: Receive<T>,
+            S: CanSendTicket<A, T>,
+        {
+            tracing::trace!(
+                "to" = type_name::<A>(),
+                "msg" = type_name::<T>(),
+                "Try send message"
+            );
+            let ticket = OneWayTicket {
+                msg,
+                erased: self.erased(),
+            };
+            let erased = S::erase_ticket(ticket);
+            self.sender.try_send(erased)?;
+            Ok(())
+        }
+
+        pub fn send_blocking_ticket<S, T>(&self, msg: T) -> Result<(), SendError>
+        where
+            A: Receive<T>,
+            S: CanSendTicket<A, T>,
+        {
+            tracing::trace!(
+                "to" = type_name::<A>(),
+                "msg" = type_name::<T>(),
+                "Send blocking message"
+            );
+            let ticket = OneWayTicket {
+                msg,
+                erased: self.erased(),
+            };
+            let erased = S::erase_ticket(ticket);
+            self.sender.send_blocking(erased)?;
+            Ok(())
+        }
+    }
+
+    pub(super) struct WeakAdrCore<A: Actor> {
+        sender: channel::WeakSender<ErasedDeliverable<A>>,
+    }
+    assert_impl_all!(WeakAdrCore<DummyActor>: Send);
+
+    impl<A: Actor> Clone for WeakAdrCore<A> {
+        fn clone(&self) -> Self {
+            Self {
+                sender: self.sender.clone(),
+            }
+        }
+    }
+
+    impl<A: Actor> WeakAdrCore<A> {
+        pub fn upgrade(&self) -> Option<AdrCore<A>> {
+            self.sender.upgrade().map(|snd| AdrCore { sender: snd })
+        }
+
+        pub fn close(&self) -> bool {
+            // NOTE: this will only fail if already closed
+            if let Some(upgraded) = self.sender.upgrade() {
+                return upgraded.close();
+            }
+            false
+        }
+    }
+
+    pub(super) struct ErasedAdr {
+        _inner: Box<dyn Any + Send>,
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("Could not send message, actor dead :("))]
+    // TODO: make these send errors return the value that was attempted to be sent? It's difficult to
+    // get them back since they are erased in a Box, but it should be possible to downcast them back i
+    // think.
+    pub struct SendError;
+
+    impl<T> From<channel::SendError<T>> for SendError {
+        fn from(_value: channel::SendError<T>) -> Self {
+            SendSnafu.build()
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(module, context(suffix(false)))]
+    pub enum TrySendError {
+        #[snafu(display("Could not send message, mailbox full"))]
+        Full,
+        #[snafu(display("Could not send message, actor dead :("))]
+        Closed,
+    }
+
+    impl<T> From<channel::TrySendError<T>> for TrySendError {
+        fn from(value: channel::TrySendError<T>) -> Self {
+            match value {
+                channel::TrySendError::Full(_) => try_send_error::Full.build(),
+                channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
+            }
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("Could not receive reply, actor dead :("))]
+    pub struct ReplyError;
+
+    #[must_use = "this does nothing unless polled"]
+    #[pin_project]
+    pub struct Reply<R> {
+        #[pin]
+        recv: oneshot::AsyncReceiver<R>,
+    }
+
+    impl<R> Future for Reply<R> {
+        type Output = Result<R, ReplyError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let this = self.project();
+            let reply = std::task::ready!(this.recv.poll(cx));
+            std::task::Poll::Ready(reply.ok().context(ReplySnafu))
+        }
+    }
 }
-impl private::Sealed for Remote {}
-impl Scope for Remote {}
-assert_impl_all!(Remote: Send, Sync);
-const_assert_eq!(std::mem::size_of::<Remote>(), 0);
 
 pub struct GenericAddress<A: Actor, S: Scope> {
-    sender: channel::Sender<ErasedDeliverable<A>>,
+    core: AdrCore<A>,
     status: ExitRecv<A::Error>,
     _scope: PhantomData<S>,
 }
@@ -450,7 +818,7 @@ pub type RemoteAddress<A> = GenericAddress<A, Remote>;
 assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
 
 pub struct GenericWeakAddress<A: Actor, S: Scope> {
-    sender: channel::WeakSender<ErasedDeliverable<A>>,
+    core: WeakAdrCore<A>,
     status: ExitRecv<A::Error>,
     _scope: PhantomData<S>,
 }
@@ -463,7 +831,7 @@ assert_impl_all!(RemoteWeakAddress<DummyActor>: Send, Sync);
 
 impl<A: Actor, S: Scope> Clone for GenericAddress<A, S> {
     fn clone(&self) -> Self {
-        let c = self.sender.clone();
+        let c = self.core.clone();
         let b = self.status.clone();
         // SAFETY: this gets the same scope as the original
         unsafe { Self::new(c, b) }
@@ -472,7 +840,7 @@ impl<A: Actor, S: Scope> Clone for GenericAddress<A, S> {
 
 impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
     fn clone(&self) -> Self {
-        let c = self.sender.clone();
+        let c = self.core.clone();
         let b = self.status.clone();
         // SAFETY: this gets the same scope as the original
         unsafe { Self::new(c, b) }
@@ -482,39 +850,35 @@ impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
 async fn wait_on_exit_recv<A: Actor>(
     exit_recv: &mut ExitRecv<A::Error>,
 ) -> Result<(), WaitError<A::Error>> {
-    let actor_res = match exit_recv.recv_direct().await {
-        Ok(x) => x,
-        Err(async_broadcast::RecvError::Closed) => return PanickedSnafu.fail(),
-        Err(async_broadcast::RecvError::Overflowed(_)) => panic!("this can't overflow"),
-    };
-    actor_res.context(ExitedSnafu)
+    exit_recv
+        .recv()
+        .await
+        .map(|ok| ok.context(ExitedSnafu))
+        .unwrap_or_else(|| PanickedSnafu.fail())
 }
 
 fn actor_is_dead<A: Actor>(exit_recv: &ExitRecv<A::Error>) -> bool {
     // NOTE: there is only supposed to be one sender but many receivers, there is one receiver
     // here, so if the channel is closed it must mean that the actor dropped its handle, hence
     // it has died.
-    debug_assert!(exit_recv.sender_count() <= 1);
-    debug_assert!(exit_recv.receiver_count() >= 1);
-    exit_recv.is_closed()
+    !exit_recv.is_sender_alive()
 }
 
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(
-        sender: channel::Sender<ErasedDeliverable<A>>,
-        status: ExitRecv<A::Error>,
-    ) -> Self {
+    unsafe fn new(core: AdrCore<A>, status: ExitRecv<A::Error>) -> Self {
         Self {
-            sender,
+            core,
             status,
             _scope: PhantomData,
         }
     }
 
+    // TODO: getters for retrieving the channel capacity and size
+
     pub fn downgrade(&self) -> GenericWeakAddress<A, S> {
-        let c = self.sender.downgrade();
+        let c = self.core.downgrade();
         let b = self.status.clone();
         // SAFETY: this gets the same scope as the original
         unsafe { GenericWeakAddress::new(c, b) }
@@ -522,7 +886,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 
     /// Can't send any more messages, but the actor might still be alive
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        self.core.is_closed()
     }
 
     /// The actor is dead
@@ -543,25 +907,26 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(
-        sender: channel::WeakSender<ErasedDeliverable<A>>,
-        status: ExitRecv<A::Error>,
-    ) -> Self {
+    unsafe fn new(core: WeakAdrCore<A>, status: ExitRecv<A::Error>) -> Self {
         Self {
-            sender,
+            core,
             status,
             _scope: PhantomData,
         }
     }
 
     pub fn upgrade(&self) -> Option<GenericAddress<A, S>> {
-        self.sender
+        self.core
             .upgrade()
             // SAFETY: this gets the same scope as the original
             .map(|sender| {
                 let b = self.status.clone();
                 unsafe { GenericAddress::new(sender, b) }
             })
+    }
+
+    pub fn close(&self) -> bool {
+        self.core.close()
     }
 
     /// The actor is dead
@@ -579,7 +944,7 @@ impl<A: Actor> Address<A> {
     pub fn remote(&self) -> RemoteAddress<A> {
         // SAFETY: It's safe to go from a local address to a remote one, but not the other way
         // around, since a remote address can only send data that is Send.
-        let c = self.sender.clone();
+        let c = self.core.clone();
         let b = self.status.clone();
         unsafe { RemoteAddress::new(c, b) }
     }
@@ -589,7 +954,7 @@ impl<A: Actor> WeakAddress<A> {
     pub fn remote(&self) -> RemoteWeakAddress<A> {
         // SAFETY: It's safe to go from a local address to a remote one, but not the other way
         // around, since a remote address can only send data that is Send.
-        let c = self.sender.clone();
+        let c = self.core.clone();
         let b = self.status.clone();
         unsafe { RemoteWeakAddress::new(c, b) }
     }
@@ -597,57 +962,31 @@ impl<A: Actor> WeakAddress<A> {
 
 #[expect(
     private_bounds,
-    reason = "CanSendPriv and all types it is using should be private"
+    reason = "the private trait and all types it is using should be private"
 )]
-#[diagnostic::on_unimplemented(
-    message = "can't send `{T}` to `{A}`",
-    label = "here",
-    note = "address scope is `{Self}`",
-    note = "`{T}` must implement `Send` if it is sent across threads",
-    note = "All (most) associated types of Actor must implement `Send`",
-    note = "`{T}` must be `'static`, it can't borrow anything",
-    note = "`{A}` must be able to receive `{T}`"
-)]
-pub trait CanSend<A, T>: CanSendPriv<A, T> {}
-#[diagnostic::do_not_recommend]
-impl<A, T, X> CanSend<A, T> for X where X: CanSendPriv<A, T> {}
+// NOTE: using do_not_recommend and on_unimplemented would hide the actual reason a value couldn't
+// be sent, so those are not used anymore, even though the private part is exposed
+pub trait CanSendPackage<A, T>: CanSendPackagePriv<A, T> {}
+impl<A, T, X> CanSendPackage<A, T> for X where X: CanSendPackagePriv<A, T> {}
 
-trait CanSendPriv<A, T>: Scope {
+trait CanSendPackagePriv<A, T>: Scope {
     fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A>
     where
         A: Receive<T>;
-    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
-    where
-        A: Receive<T>;
-    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send>
-    where
-        Self: Sized,
-        A: Receive<T>;
 }
 
-impl<A, T> CanSendPriv<A, T> for Remote
+impl<A, T> CanSendPackagePriv<A, T> for Remote
 where
     T: Send + 'static,
     A: Receive<T>,
     A::Retval: Send,
-    A::Error: Send, // TODO: this shouldn't need to be here, this has nothing to do with the message
-                    // being sent. This maybe fixes itself together with the TODO in the
-                    // erase_address function, which is the one requiring this.
 {
     fn erase_package(p: Package<T, A::Retval>) -> ErasedDeliverable<A> {
         Box::new(p)
     }
-
-    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A> {
-        Box::new(t)
-    }
-
-    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send> {
-        Box::new(a)
-    }
 }
 
-impl<A, T> CanSendPriv<A, T> for Local
+impl<A, T> CanSendPackagePriv<A, T> for Local
 where
     A: Receive<T>,
     T: 'static,
@@ -657,20 +996,42 @@ where
         // never left the current thread, which means it's safe to send non-send data on it.
         Box::new(unsafe { UnsafeSendWrapper::new(p) })
     }
+}
 
+#[expect(
+    private_bounds,
+    reason = "the private trait and all types it is using should be private"
+)]
+// NOTE: using do_not_recommend and on_unimplemented would hide the actual reason a value couldn't
+// be sent, so those are not used anymore, even though the private part is exposed
+pub trait CanSendTicket<A, T>: CanSendTicketPriv<A, T> {}
+impl<A, T, X> CanSendTicket<A, T> for X where X: CanSendTicketPriv<A, T> {}
+
+trait CanSendTicketPriv<A, T>: Scope {
+    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A>
+    where
+        A: Receive<T>;
+}
+
+impl<A, T> CanSendTicketPriv<A, T> for Remote
+where
+    T: Send + 'static,
+    A: Receive<T>,
+{
+    fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A> {
+        Box::new(t)
+    }
+}
+
+impl<A, T> CanSendTicketPriv<A, T> for Local
+where
+    A: Receive<T>,
+    T: 'static,
+{
     fn erase_ticket(t: OneWayTicket<T>) -> ErasedDeliverable<A> {
         // SAFETY: one of these can only be sent by a local address, which means the sender has
         // never left the current thread, which means it's safe to send non-send data on it.
         Box::new(unsafe { UnsafeSendWrapper::new(t) })
-    }
-
-    fn erase_address(a: GenericAddress<A, Self>) -> Box<dyn SecretSend<T> + Send> {
-        // SAFETY: This is only used to copy something that already was in a box<dyn ...>, so the
-        // thing has already been verified to be Send elsewhere. This is mainly here to only wrap in
-        // the unsafe send wrapper when necessary.
-        // TODO: maybe the argument to this function can be something else to make sure this
-        // function is only used in this safe scenario?
-        Box::new(unsafe { UnsafeSendWrapper::new(a) })
     }
 }
 
@@ -729,6 +1090,7 @@ mod unsafe_wrapper {
             }
         }
 
+        #[expect(dead_code, reason = "not used yet")]
         pub fn inner(&self) -> &D {
             #[cfg(debug_assertions)]
             assert_eq!(
@@ -759,7 +1121,7 @@ where
 struct Package<T, R> {
     msg: T,
     returner: oneshot::Sender<R>,
-    erased: ErasedAddress,
+    erased: ErasedAdr,
 }
 
 impl<A, T> Deliverable<A> for Package<T, A::Retval>
@@ -794,9 +1156,8 @@ where
         }
         .instrument(trace_span!(
             "snd_rcv",
-            msg = type_name::<Self>(),
+            msg = type_name::<T>(),
             return = type_name::<A::Retval>(),
-            actor = type_name::<A>()
         ))
         .boxed_local()
     }
@@ -804,7 +1165,7 @@ where
 
 struct OneWayTicket<T> {
     msg: T,
-    erased: ErasedAddress,
+    erased: ErasedAdr,
 }
 
 impl<T, A> Deliverable<A> for OneWayTicket<T>
@@ -822,11 +1183,7 @@ where
             trace!("Received message");
             let _ret = actor.receive(self.msg, ctl).await;
         }
-        .instrument(trace_span!(
-            "oneway",
-            msg = type_name::<Self>(),
-            actor = type_name::<A>()
-        ))
+        .instrument(trace_span!("oneway", msg = type_name::<T>(),))
         .boxed_local()
     }
 }
@@ -911,7 +1268,7 @@ pub mod bg_job {
     }
 
     impl<'a, F, S> Job<'a, F, NonSkip<S>> {
-        fn start<A, O>(self, ctl: &mut Control<A>)
+        pub fn start<A, O>(self, ctl: &mut Control<A>)
         where
             F: Future<Output = O> + 'static,
             S: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
@@ -944,7 +1301,7 @@ pub mod bg_job {
     }
 
     impl<'a, F> Job<'a, F, Skip> {
-        fn start<A>(self, ctl: &mut Control<A>)
+        pub fn start<A>(self, ctl: &mut Control<A>)
         where
             F: Future<Output = ()> + 'static,
             A: Actor,
@@ -1009,7 +1366,6 @@ pub mod bg_job {
             }
             impl Actor for Alice {
                 type Error = Infallible;
-                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
 
                 fn span(&self) -> DeferredSpan<'_> {
                     deferred_span!(Level::INFO, "alice")
@@ -1071,321 +1427,194 @@ pub mod bg_job {
     }
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(display("Could not send message, actor dead :("))]
-// TODO: make these send errors return the value that was attempted to be sent? It's difficult to
-// get them back since they are erased in a Box, but it should be possible to downcast them back i
-// think.
-pub struct SendError;
-
-#[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
-pub enum TrySendError {
-    #[snafu(display("Could not send message, mailbox full"))]
-    Full,
-    #[snafu(display("Could not send message, actor dead :("))]
-    Closed,
-}
-
-#[derive(Debug, Snafu)]
-#[snafu(display("Could not receive reply, actor dead :("))]
-pub struct ReplyError;
-
-#[must_use = "this does nothing unless polled"]
-#[pin_project]
-pub struct Reply<R> {
-    #[pin]
-    recv: oneshot::AsyncReceiver<R>,
-}
-
-impl<R> Future for Reply<R> {
-    type Output = Result<R, ReplyError>;
-
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.project();
-        let reply = ready!(this.recv.poll(cx));
-        std::task::Poll::Ready(reply.ok().context(ReplySnafu))
-    }
-}
-
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     pub async fn send_receive<T>(&self, msg: T) -> Result<Reply<A::Retval>, SendError>
     where
         A: Receive<T>,
-        S: CanSend<A, T>,
+        S: CanSendPackage<A, T>,
     {
-        trace!(
-            "to" = type_name::<A>(),
-            "msg" = type_name::<T>(),
-            "return" = type_name::<A::Retval>(),
-            "Send and receive"
-        );
-        let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
-        let package = Package {
-            msg,
-            returner,
-            erased: self.erased(),
-        };
-        let erased = S::erase_package(package);
-        self.sender.send(erased).await.ok().context(SendSnafu)?;
-        Ok(Reply { recv: ret_rcv })
+        self.core.send_package::<S, T>(msg).await
     }
 
-    // TODO: the return value is constrained too much here. No value is ever sent, but it's still
-    // constrained to be Send. This probably requires another trait to solve. Not sure how big of a
-    // problem this is though, I imagine that most messages sent with this will have retval = (), so
-    // it doesn't matter. This should maybe even require the retval on receive to be ()? Isn't it
-    // weird to define a return value and then ignore it?
     pub async fn send<T>(&self, msg: T) -> Result<(), SendError>
     where
         A: Receive<T>,
-        S: CanSend<A, T>,
+        S: CanSendTicket<A, T>,
     {
-        trace!(
-            "to" = type_name::<A>(),
-            "msg" = type_name::<T>(),
-            "Send message"
-        );
-        let ticket = OneWayTicket {
-            msg,
-            erased: self.erased(),
-        };
-        let erased = S::erase_ticket(ticket);
-        self.sender.send(erased).await.ok().context(SendSnafu)?;
-        Ok(())
+        self.core.send_ticket::<S, T>(msg).await
     }
 
     pub fn try_send<T>(&self, msg: T) -> Result<(), TrySendError>
     where
         A: Receive<T>,
-        S: CanSend<A, T>,
+        S: CanSendTicket<A, T>,
     {
-        trace!(
-            "to" = type_name::<A>(),
-            "msg" = type_name::<T>(),
-            "Try send message"
-        );
-        let ticket = OneWayTicket {
-            msg,
-            erased: self.erased(),
-        };
-        let erased = S::erase_ticket(ticket);
-        self.sender.try_send(erased).map_err(|err| match err {
-            async_channel::TrySendError::Full(_) => try_send_error::Full.build(),
-            async_channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
-        })
+        self.core.try_send_ticket::<S, T>(msg)
     }
 
     pub fn send_blocking<T>(&self, msg: T) -> Result<(), SendError>
     where
         A: Receive<T>,
-        S: CanSend<A, T>,
+        S: CanSendTicket<A, T>,
     {
-        trace!(
-            "to" = type_name::<A>(),
-            "msg" = type_name::<T>(),
-            "Send blocking message"
-        );
-        let ticket = OneWayTicket {
-            msg,
-            erased: self.erased(),
-        };
-        let erased = S::erase_ticket(ticket);
-        self.sender.send_blocking(erased).ok().context(SendSnafu)?;
-        Ok(())
-    }
-
-    fn erased(&self) -> ErasedAddress {
-        let clone = self.clone();
-        ErasedAddress {
-            // SAFETY: this is never accessed, it's only here to keep the channel alive, so nothing
-            // is ever sent on this channel
-            _inner: Box::new(unsafe { UnsafeSendWrapper::new(clone) }),
-        }
+        self.core.send_blocking_ticket::<S, T>(msg)
     }
 }
 
-// TODO: merge these with the other impls for specific addresses?
-impl<A: Actor> GenericAddress<A, Remote> {
-    pub fn secret<T>(&self) -> SecretAddress<T>
+pub use secret_adr::SecretAddress;
+mod secret_adr {
+    use super::{
+        Actor, AdrCore, CanSendTicket, GenericAddress, Receive, Scope, SendError, TrySendError,
+        UnsafeSendWrapper,
+    };
+    #[cfg(test)]
+    use async_channel as channel;
+    use futures_core::future::LocalBoxFuture;
+    use futures_util::FutureExt;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+    use std::{marker::PhantomData, rc::Rc};
+
+    // TODO: create a weak secret address?
+    pub struct SecretAddress<T> {
+        secret: Box<dyn SecretSend<T> + Send>,
+        _scope: PhantomData<T>,
+    }
+    assert_not_impl_any!(SecretAddress<Rc<()>>: Send);
+    assert_impl_all!(SecretAddress<()>: Send);
+
+    impl<T> Clone for SecretAddress<T> {
+        fn clone(&self) -> Self {
+            Self {
+                secret: self.secret.clone(),
+                _scope: self._scope,
+            }
+        }
+    }
+
+    impl<T> SecretAddress<T> {
+        pub async fn send(&self, msg: T) -> Result<(), SendError> {
+            self.secret.send(msg).await
+        }
+
+        pub fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+            self.secret.try_send(msg)
+        }
+
+        pub fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+            self.secret.send_blocking(msg)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn new_channel() -> (Self, channel::Receiver<T>)
+        where
+            T: Send + 'static,
+        {
+            let (snd, rcv) = channel::unbounded();
+            let adr = Self {
+                secret: Box::new((PhantomData::<super::Remote>, snd)),
+                _scope: PhantomData,
+            };
+            (adr, rcv)
+        }
+    }
+
+    trait SecretSend<T> {
+        // RANT: this can't be a simple async fn, cuz that is not object safe...
+        fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+        where
+            T: 'a;
+        fn try_send(&self, msg: T) -> Result<(), TrySendError>;
+        fn send_blocking(&self, msg: T) -> Result<(), SendError>;
+        fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send>;
+    }
+
+    impl<A, S, T> SecretSend<T> for (UnsafeSendWrapper<PhantomData<S>>, AdrCore<A>)
+    where
+        A: Receive<T>,
+        S: CanSendTicket<A, T>,
+    {
+        fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+        where
+            T: 'a,
+        {
+            self.1.send_ticket::<S, T>(msg).boxed_local()
+        }
+
+        fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
+            let core = self.1.clone();
+            // SAFETY: the scope already was in a wrapper, this is just a copy
+            let scope = unsafe { UnsafeSendWrapper::new(PhantomData::<S>) };
+            let copy: Self = (scope, core);
+            Box::new(copy)
+        }
+
+        fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+            self.1.try_send_ticket::<S, T>(msg)
+        }
+
+        fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+            self.1.send_blocking_ticket::<S, T>(msg)
+        }
+    }
+
+    #[cfg(test)]
+    impl<T> SecretSend<T> for (PhantomData<super::Remote>, channel::Sender<T>)
     where
         T: Send + 'static,
-        A: Receive<T, Retval: Send, Error: Send>,
     {
-        SecretAddress {
-            secret: Box::new(self.clone()),
-            _scope: PhantomData,
+        fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
+        where
+            T: 'a,
+        {
+            use futures_util::TryFutureExt;
+
+            self.1.send(msg).map_err(Into::into).boxed_local()
+        }
+
+        fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
+            let clone: Self = (PhantomData, self.1.clone());
+            Box::new(clone)
+        }
+
+        fn try_send(&self, msg: T) -> Result<(), TrySendError> {
+            self.1.try_send(msg).map_err(Into::into)
+        }
+
+        fn send_blocking(&self, msg: T) -> Result<(), SendError> {
+            self.1.send_blocking(msg).map_err(Into::into)
         }
     }
-}
 
-impl<A: Actor> GenericAddress<A, Local> {
-    pub fn secret<T>(&self) -> SecretAddress<T>
-    where
-        T: 'static,
-        A: Receive<T>,
-    {
-        SecretAddress {
+    impl<T> Clone for Box<dyn SecretSend<T> + Send> {
+        fn clone(&self) -> Self {
+            self.clone_secret_send()
+        }
+    }
+
+    impl<A: Actor, S: Scope> GenericAddress<A, S> {
+        pub fn secret<T>(&self) -> SecretAddress<T>
+        where
+            A: Receive<T>,
+            S: CanSendTicket<A, T>,
+        {
+            let core = self.core.clone();
             // SAFETY: It's the phantomdata, i.e. T, that determines if this secret address can be
             // sent between threads or not. For a remote address, only T: Send is safe since the
             // address could, or is going to, change thread, and sending !Send data would not be
             // good in that case. A local address can send T: !Send, since it has never and will
-            // never leave the current thread, the secret address will this never be able to leave
+            // never leave the current thread, the secret address will thus never be able to leave
             // the current thread either. It is safe though for a local address to send T: Send data
             // too, but that will make the secret address Send, so the wrapped local address will
             // thus be abe to move to another thread, but that is fine, since a local address can
             // trivially be converted to a remote address, but not the other way around. It's safe
             // to just take the local address and send it to another thread, because that is
             // basically what conversion to remote is.
-            secret: Box::new(unsafe { UnsafeSendWrapper::new(self.clone()) }),
-            _scope: PhantomData,
+            let scope = unsafe { UnsafeSendWrapper::new(PhantomData::<S>) };
+            SecretAddress {
+                secret: Box::new((scope, core)),
+                _scope: PhantomData,
+            }
         }
-    }
-}
-
-struct ErasedAddress {
-    _inner: Box<dyn Any + Send>,
-}
-
-impl<T> Clone for Box<dyn SecretSend<T> + Send> {
-    fn clone(&self) -> Self {
-        self.clone_secret_send()
-    }
-}
-
-trait SecretSend<T> {
-    // RANT: this can't be a simple async fn, cuz that is not object safe...
-    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
-    where
-        T: 'a;
-    fn try_send(&self, msg: T) -> Result<(), TrySendError>;
-    fn send_blocking(&self, msg: T) -> Result<(), SendError>;
-    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send>;
-}
-
-impl<A, S, T> SecretSend<T> for GenericAddress<A, S>
-where
-    A: Receive<T>,
-    S: CanSend<A, T>,
-{
-    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
-    where
-        T: 'a,
-    {
-        self.send(msg).boxed_local()
-    }
-
-    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
-        let clone: Self = self.clone();
-        S::erase_address(clone)
-    }
-
-    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
-        self.try_send(msg)
-    }
-
-    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
-        self.send_blocking(msg)
-    }
-}
-
-impl<T, SS> SecretSend<T> for UnsafeSendWrapper<SS>
-where
-    SS: SecretSend<T>,
-{
-    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
-    where
-        T: 'a,
-    {
-        self.inner().send(msg)
-    }
-
-    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
-        self.inner().clone_secret_send()
-    }
-
-    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
-        self.inner().try_send(msg)
-    }
-
-    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
-        self.inner().send_blocking(msg)
-    }
-}
-
-impl<T> SecretSend<T> for channel::Sender<T>
-where
-    T: Send + 'static,
-{
-    fn send<'a>(&'a self, msg: T) -> LocalBoxFuture<'a, Result<(), SendError>>
-    where
-        T: 'a,
-    {
-        self.send(msg).map_err(|_| SendError).boxed_local()
-    }
-
-    fn clone_secret_send(&self) -> Box<dyn SecretSend<T> + Send> {
-        Box::new(self.clone())
-    }
-
-    fn try_send(&self, msg: T) -> Result<(), TrySendError> {
-        self.try_send(msg).map_err(|err| match err {
-            async_channel::TrySendError::Full(_) => try_send_error::Full.build(),
-            async_channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
-        })
-    }
-
-    fn send_blocking(&self, msg: T) -> Result<(), SendError> {
-        self.send_blocking(msg).map_err(|_| SendError)
-    }
-}
-
-// TODO: create a weak secret address?
-pub struct SecretAddress<T> {
-    secret: Box<dyn SecretSend<T> + Send>,
-    _scope: PhantomData<T>,
-}
-assert_not_impl_any!(SecretAddress<Rc<()>>: Send);
-assert_impl_all!(SecretAddress<()>: Send);
-
-impl<T> SecretAddress<T> {
-    #[cfg(test)]
-    pub(crate) fn new_channel() -> (Self, channel::Receiver<T>)
-    where
-        T: Send + 'static,
-    {
-        let (snd, rcv) = channel::unbounded();
-        let adr = Self {
-            secret: Box::new(snd),
-            _scope: PhantomData,
-        };
-        (adr, rcv)
-    }
-}
-
-impl<T> Clone for SecretAddress<T> {
-    fn clone(&self) -> Self {
-        Self {
-            secret: self.secret.clone(),
-            _scope: self._scope,
-        }
-    }
-}
-
-impl<T> SecretAddress<T> {
-    pub async fn send(&self, msg: T) -> Result<(), SendError> {
-        self.secret.send(msg).await
-    }
-
-    pub fn try_send(&self, msg: T) -> Result<(), TrySendError> {
-        self.secret.try_send(msg)
-    }
-
-    pub fn send_blocking(&self, msg: T) -> Result<(), SendError> {
-        self.secret.send_blocking(msg)
     }
 }
 
@@ -1398,6 +1627,7 @@ async fn actor_main<A: Actor>(
     mut actor: A,
     rcv: channel::Receiver<ErasedDeliverable<A>>,
     home_adr: Address<A>,
+    yield_policy: YieldPolicy,
 ) {
     debug!("Enter");
     actor.enter(&mut ctl).instrument(debug_span!("enter")).await;
@@ -1414,7 +1644,7 @@ async fn actor_main<A: Actor>(
     );
     let mut poll_next = stream::PollNext::default();
 
-    yield_guard(A::YIELD_POLICY, async |guard| {
+    yield_guard(yield_policy, async |guard| {
         loop {
             let mut events = stream::select_with_strategy(
                 mailbox.as_mut(),
@@ -1457,13 +1687,10 @@ async fn actor_main<A: Actor>(
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
     debug!(?exit_reason, "Died");
 
-    use async_broadcast::TrySendError;
-    match ctl.exit_send.try_broadcast(exit_reason) {
-        Ok(None) | Err(TrySendError::Closed(_)) => (),
-        Ok(Some(_)) | Err(TrySendError::Full(_)) | Err(TrySendError::Inactive(_)) => {
-            panic!("should not happen")
-        }
-    }
+    ctl.exit_send
+        .take()
+        .expect("is only sent here")
+        .broadcast(exit_reason);
 }
 
 #[derive(Debug, Snafu)]
@@ -1511,9 +1738,9 @@ impl Stage {
         })
     }
 
-    pub fn register_signals(&mut self, sig_reg: &SigRegistry) {
+    pub fn register_signals(&mut self, signals: impl AsRef<SigRegistry>) {
         assert!(self.sig_guard.is_none()); // TODO: solve this with type state or smth instead?
-        let guard = sig_reg.register_stage(self.sig_bomb.get_switch());
+        let guard = signals.as_ref().register_stage(self.sig_bomb.get_switch());
         self.sig_guard = Some(guard);
     }
 
@@ -1523,9 +1750,8 @@ impl Stage {
         }
     }
 
-    fn actor_builder<A: Actor>(&self, actor: A) -> ActorBuilder<A> {
+    fn actor_builder<A: Actor>(&self) -> ActorBuilder<A> {
         ActorBuilder::new(
-            actor,
             Rc::clone(&self.ex),
             self.actor_rune.clone(),
             self.idgen.clone(),
@@ -1533,12 +1759,8 @@ impl Stage {
         )
     }
 
-    pub fn summon<A: Actor>(&self, actor: A) -> Address<A> {
-        self.actor_builder(actor).spawn()
-    }
-
-    pub fn summon_multiplex<A: Actor + Clone>(&self, actor: A, additional: usize) -> Address<A> {
-        self.actor_builder(actor).spawn_multiplex(additional)
+    pub fn summon<A: Actor>(&self, actor: impl IntoActor<A>) -> Address<A> {
+        self.actor_builder().spawn(actor)
     }
 
     pub fn play(self) -> Result<(), StageError> {
@@ -1597,6 +1819,12 @@ impl Stage {
     }
 }
 
+impl Default for Stage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1613,7 +1841,7 @@ mod tests {
         #[test]
         fn terminate_when_all_addresses_gone() {
             let stage = Stage::new();
-            let (fut, _) = stage.actor_builder(DummyActor).no_spawn();
+            let (fut, _) = stage.actor_builder().no_spawn(DummyActor);
             let mut fut = pin!(fut);
             assert_future_ready!(fut);
         }
@@ -1621,7 +1849,7 @@ mod tests {
         #[test]
         fn terminate_when_all_addresses_gone_after_one_poll_ready() {
             let stage = Stage::new();
-            let (fut, adr) = stage.actor_builder(DummyActor).no_spawn();
+            let (fut, adr) = stage.actor_builder().no_spawn(DummyActor);
             let mut fut = pin!(fut);
             assert_future_pending!(fut);
 
@@ -1630,20 +1858,16 @@ mod tests {
         }
     }
 
-    // TODO: more tests to make sure send is not required in cases where it isn't. There are many
-    // types that needs to be conditional now, so it's hard to make sure everything is correct. It's
-    // difficult though to make negative tests, i.e. cases that should fail to compile.
     mod multi_thread {
         use super::*;
         use crate::{deferred_span, utils::thread_info_span};
         use tracing::info;
 
         #[test]
-        fn remote() {
+        fn basic_send() {
             struct Alice;
             impl Actor for Alice {
                 type Error = Infallible;
-                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
 
                 fn span(&self) -> DeferredSpan<'_> {
                     deferred_span!(Level::INFO, "alice")
@@ -1662,7 +1886,6 @@ mod tests {
             }
             impl Actor for Bob {
                 type Error = Infallible;
-                const YIELD_POLICY: YieldPolicy = YieldPolicy::Never;
 
                 async fn enter(&mut self, _ctl: &mut Control<Self>) {
                     info!("sending to alice");
@@ -1694,6 +1917,48 @@ mod tests {
             drop(alice_adr);
             main_stage.assert_plays_within(100);
             t1.join().unwrap();
+        }
+
+        #[test]
+        fn sendness_should_not_matter_when_not_used() {
+            #[derive(Debug, Snafu, Clone)]
+            #[snafu(display("I am not sendable between threads"))]
+            struct NotSend {
+                inner: Rc<()>,
+            }
+            assert_not_impl_any!(NotSend: Send);
+
+            struct LocalAlice;
+            impl Actor for LocalAlice {
+                type Error = NotSend;
+
+                fn span(&self) -> DeferredSpan<'_> {
+                    deferred_span!(Level::INFO, "alice")
+                }
+            }
+            impl Receive<i32> for LocalAlice {
+                type Retval = NotSend;
+
+                async fn receive(&mut self, _msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
+                    NotSend { inner: Rc::new(()) }
+                }
+            }
+
+            let main_stage = Stage::new();
+            let local_adr = main_stage.summon(LocalAlice);
+            let remote_adr = local_adr.remote();
+
+            // NOTE: the whole test is to see if this compiles even though the retval is non-send.
+            let _fut = remote_adr.send(5);
+
+            // NOTE: the other whole test is to see if this also compiles, even though error is
+            // non-send.
+            let _secret_adr = remote_adr.secret();
+            // TODO: create trybuild tests or smth to verify that intended usages work and unintended usages
+            // don't work. There's a lot to keep track of now
+            // TODO: more tests to make sure send is not required in cases where it isn't. There are many
+            // types that needs to be conditional now, so it's hard to make sure everything is correct. It's
+            // difficult though to make negative tests, i.e. cases that should fail to compile.
         }
     }
 }

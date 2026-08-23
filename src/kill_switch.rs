@@ -37,6 +37,7 @@ impl Bomb {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "not used outside of tests yet"))]
     pub fn has_exploded(&self) -> bool {
         self.inner.is_closed()
     }
@@ -70,13 +71,6 @@ impl Bomb {
             done: false,
         }
     }
-}
-
-#[deprecated = "The switch is included in the bomb nowadays, use Bomb::new() instead"]
-pub fn create() -> (Bomb, Switch) {
-    let bomb = Bomb::new();
-    let switch = bomb.get_switch();
-    (bomb, switch)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,20 +142,34 @@ mod tests {
 
     #[test]
     fn future_can_be_waited_multiple_times() {
-        let (bomb, switch) = create();
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
         assert!(!bomb.has_exploded());
         assert_future_pending!(pin bomb.wait());
         assert_future_pending!(pin bomb.wait());
 
-        drop(switch);
+        switch.detonate();
         assert!(bomb.has_exploded());
         assert_future_ready!(pin bomb.wait(), ());
         assert_future_ready!(pin bomb.wait(), ());
     }
 
     #[test]
+    fn dropping_the_switch_should_not_detonate() {
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
+        assert!(!bomb.has_exploded());
+        assert_future_pending!(pin bomb.wait());
+
+        drop(switch);
+        assert!(!bomb.has_exploded());
+        assert_future_pending!(pin bomb.wait());
+    }
+
+    #[test]
     fn explode_manually() {
-        let (bomb, switch) = create();
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
         assert!(!bomb.has_exploded());
         assert_future_pending!(pin bomb.wait());
 
@@ -175,7 +183,7 @@ mod tests {
 
     #[test]
     fn attach_stream_no_abort() {
-        let (bomb, _switch) = create();
+        let bomb = Bomb::new();
         let s = fus::iter(vec![1, 2]);
         let mut s = pin!(bomb.attach_stream(s));
         assert_future_ready!(unpin s.next(), w => matches!(w.unwrap(), Tick::Tock(1)));
@@ -185,19 +193,20 @@ mod tests {
 
     #[test]
     fn attach_stream_abort() {
-        let (bomb, switch) = create();
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
         let s = fus::iter(vec![1, 2]);
         let mut s = pin!(bomb.attach_stream(s));
         assert_future_ready!(unpin s.next(), w => matches!(w.unwrap(), Tick::Tock(1)));
 
-        drop(switch);
+        switch.detonate();
         assert_future_ready!(unpin s.next(), w => matches!(w.unwrap(), Tick::Boom));
         assert_stream_done!(s);
     }
 
     #[test]
     fn attach_future_no_abort() {
-        let (bomb, _switch) = create();
+        let bomb = Bomb::new();
         let s = fuf::ready(1);
         let mut s = pin!(bomb.attach_future(s).pending_once());
         assert_future_pending!(s);
@@ -206,7 +215,8 @@ mod tests {
 
     #[test]
     fn attach_future_abort() {
-        let (bomb, switch) = create();
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
         let s = fuf::lazy(|_| panic!("I got polled!"));
         let mut s = pin!(bomb.attach_future(s));
         switch.detonate();
@@ -215,7 +225,8 @@ mod tests {
 
     #[test]
     fn attach_future_abort_switch_prioritized_no_fairness() {
-        let (bomb, switch) = create();
+        let bomb = Bomb::new();
+        let switch = bomb.get_switch();
         let s = fuf::lazy(|_| panic!("I got polled!"));
         let mut s = pin!(bomb.attach_future(s).pending_once());
 
