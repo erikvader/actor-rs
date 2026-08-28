@@ -19,7 +19,6 @@ impl Switch {
 }
 
 #[derive(Clone)]
-// TODO: this could probably be an IntoFuture, but I need a concrete type for that
 pub struct Bomb {
     // RANT: this channel is !Unpin even though it doesn't have to be
     inner: channel::Receiver<()>,
@@ -46,7 +45,6 @@ impl Bomb {
         // NOTE: this can wait forever if there are no external switches, since there is at least
         // one sender always. But since this function is borrowing &self, then there can be other
         // references to self that could create new switches.
-        // TODO: this could clone the receiver and return a future that is static
         if let Ok(()) = self.inner.recv().await {
             panic!("Nothing is ever sent here");
         }

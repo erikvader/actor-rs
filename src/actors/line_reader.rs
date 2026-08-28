@@ -1,7 +1,8 @@
-use std::{convert::Infallible, pin::pin};
+use std::{pin::pin, sync::Arc};
 
 use blocking::Unblock;
 use futures_util::{AsyncBufRead, AsyncBufReadExt, AsyncRead, StreamExt, io::BufReader};
+use snafu::{ResultExt, Snafu};
 
 use crate::{
     actor::{Actor, Control, Receive, SecretAddress, bg_job::Job},
@@ -26,11 +27,16 @@ impl Line {
     }
 }
 
+struct ThreadData<R, C> {
+    send_to: SecretAddress<Line>,
+    read_from: R,
+    cleaner: C,
+}
+
 pub struct LineReader<R, C = ()> {
-    send_to: Option<SecretAddress<Line>>,
-    read_from: Option<R>,
-    cleaner: Option<C>,
+    thread_data: Option<ThreadData<R, C>>,
     task_killer: Option<Switch>,
+    error: Result<(), Error>,
 }
 
 impl<R> LineReader<R>
@@ -47,12 +53,15 @@ where
     R: AsyncBufRead + 'static,
     C: AsyncCleanup + 'static,
 {
-    pub fn with_cleanup(reader: R, to: SecretAddress<Line>, cleanup: C) -> Self {
+    pub fn with_cleanup(read_from: R, send_to: SecretAddress<Line>, cleaner: C) -> Self {
         Self {
-            read_from: Some(reader),
-            send_to: Some(to),
-            cleaner: Some(cleanup),
+            thread_data: Some(ThreadData {
+                send_to,
+                read_from,
+                cleaner,
+            }),
             task_killer: None,
+            error: Ok(()),
         }
     }
 }
@@ -88,42 +97,58 @@ impl AsyncCleanup for () {
     async fn cleanup(self) {}
 }
 
+#[derive(Debug, Snafu, Clone)]
+pub enum Error {
+    #[snafu(display("Failed while reading the next line"))]
+    Reader {
+        #[snafu(source(from(std::io::Error, Arc::new)))]
+        source: Arc<std::io::Error>,
+    },
+    #[snafu(display("The receiver closed"))]
+    Closed,
+}
+
 impl<R, C> Actor for LineReader<R, C>
 where
     R: AsyncBufRead + 'static,
     C: AsyncCleanup + 'static,
 {
-    // TODO: If the reader failed with anything that makes it unable to continue, like not utf-8
-    // error, then it should be returned here.
-    type Error = Infallible;
+    type Error = Error;
+
+    crate::default_span!("line_reader");
 
     async fn enter(&mut self, ctl: &mut Control<Self>) {
-        let send_to = self.send_to.take().expect("will exist here");
-        let read_from = self.read_from.take().expect("will exist here");
-        let cleanup = self.cleaner.take().expect("will exist here");
+        let ThreadData {
+            send_to,
+            read_from,
+            cleaner,
+        } = self.thread_data.take().expect("will exist on start");
 
         let bomb = Bomb::new();
         self.task_killer = Some(bomb.get_switch());
 
         Job::new(async move {
+            let mut res = Ok(());
             let mut lines = pin!(bomb.attach_stream(read_from.lines()));
             while let Some(watch) = lines.next().await {
                 match watch {
                     Tick::Tock(Ok(line)) => {
                         if send_to.send(Line(line)).await.is_err() {
-                            tracing::warn!("Receiver closed");
+                            tracing::debug!("Receiver closed");
+                            res = ClosedSnafu.fail();
                             break;
                         }
                     }
                     Tick::Tock(Err(error)) => {
-                        // TODO: the lines stream will return this error if a line cannot be
-                        // converted into an UTF-8 string, it will continue as normal with the
-                        // next one though. Should I care about invalid lines? How to handle
-                        // them?
-                        tracing::error!(
-                            error = &error as &dyn std::error::Error,
-                            "Line read errored"
-                        );
+                        // NOTE: there are a lot of different recovery strategies, like continuing
+                        // with the next line if an utf-8 error occurred, sending a lossy converted
+                        // string or the raw bytes, etc. But the simplest and safest option that
+                        // never causes silent data loss is to return early on any kind of error.
+                        // What to do on certain errors depends on the context and what the Reader
+                        // actually is, so i leave that for the future.
+                        tracing::debug!(?error, "Reader errored");
+                        res = Err(error).context(ReaderSnafu);
+                        break;
                     }
                     Tick::Boom => {
                         tracing::debug!("Interrupted early");
@@ -132,19 +157,25 @@ where
                 }
             }
 
+            // TODO: collect an error from this as well? I added the cleanup as a "I think this
+            // could be useful", but I haven't actually used it yet, so fix this when i actually
+            // need it.
             tracing::trace!("Cleaning up");
-            cleanup.cleanup().await;
+            cleaner.cleanup().await;
 
             tracing::debug!("Exited");
+            res
         })
-        .then(async |_, ctl, ()| ctl.close_mailbox())
+        .then(async |actor: &mut Self, ctl, res| {
+            ctl.close_mailbox();
+            actor.error = res;
+        })
         .instrument(deferred_info_span!("bg_job"))
         .start(ctl);
     }
 
-    fn span(&self) -> DeferredSpan<'_> {
-        // TODO: add what is being read from somehow?
-        deferred_info_span!("line_reader")
+    async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+        self.error
     }
 }
 

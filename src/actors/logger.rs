@@ -1,19 +1,13 @@
-use std::convert::Infallible;
-
 use crate::{
-    actor::{Actor, Receive},
-    deferred_info_span,
+    actor::{Actor, NoError, Receive},
     deferred_span::DeferredSpan,
 };
 
 pub struct Logger;
 
 impl Actor for Logger {
-    type Error = Infallible;
-
-    fn span(&self) -> DeferredSpan<'_> {
-        deferred_info_span!("logger")
-    }
+    type Error = NoError;
+    crate::default_span!("logger");
 }
 
 impl<T: std::fmt::Debug> Receive<T> for Logger {

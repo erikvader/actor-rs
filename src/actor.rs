@@ -27,7 +27,7 @@ use std::{
     pin::pin,
     rc::{Rc, Weak},
 };
-use tracing::{Instrument, Level, Span, debug, debug_span, field, span, trace, trace_span};
+use tracing::{Instrument, Level, Span, debug, debug_span, span, trace, trace_span};
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
@@ -53,6 +53,17 @@ impl MailboxSize {
     }
 }
 
+pub type NoError = Infallible;
+
+#[macro_export]
+macro_rules! default_span {
+    ($name:expr) => {
+        fn span(&self) -> DeferredSpan<'_> {
+            $crate::deferred_info_span!($name)
+        }
+    };
+}
+
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
 #[diagnostic::on_unimplemented(
@@ -62,7 +73,7 @@ impl MailboxSize {
 )]
 pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values
-    type Error: std::error::Error + Clone; // = Infallible; will never error
+    type Error: std::error::Error + Clone; // = NoError
 
     fn span(&self) -> DeferredSpan<'_>;
 
@@ -78,7 +89,7 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn leave(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+    async fn leave(self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -93,11 +104,8 @@ pub trait Actor: Sized + 'static {
 // NOTE: for static assertions
 struct DummyActor;
 impl Actor for DummyActor {
-    type Error = Infallible;
-
-    fn span(&self) -> DeferredSpan<'_> {
-        DeferredSpan::none()
-    }
+    type Error = NoError;
+    default_span!("dummy");
 }
 
 pub struct Control<A: Actor> {
@@ -121,7 +129,14 @@ pub struct Control<A: Actor> {
     _signal_guard: Option<ActorGuard>,
     // HACK: these are last so they are dropped last, right before the task terminates. The actor is
     // as dead as possible as this point. The absolute best thing would be to track the task handle
-    // itself, but that wasn't as easy.
+    // itself, but that wasn't as easy. I tried to share the task handle using shared from
+    // futures_util, but that required the error to be send, or sync or whatever it was, because it
+    // used Arc internally, this would have been the optimal solution otherwise. So right now it's a
+    // little weird, the return value from exiting is available before aliveness checks (whether the
+    // sender is dropped or not), and all of that happens before the task has exited. I don't think
+    // this will matter at all in the end, but it's annoying to know that this discrepancy exists
+    // and could cause problems, potentially. The real solution is maybe to create a shared future
+    // that doesn't require send/sync, or to take the Watch type from tokio or something.
     actor_rune: Rune,
     exit_send: Option<ExitSend<A::Error>>,
 }
@@ -393,6 +408,10 @@ impl<A: Actor> Control<A> {
         .spawn(actor)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "it's private, it's fine, I guess"
+    )]
     fn new(
         ex: Weak<LocalExecutor<'static>>,
         rune: Rune,
@@ -449,10 +468,22 @@ impl<A: Actor> Control<A> {
 pub struct AddressClosedError;
 
 #[derive(Debug, Snafu)]
+#[snafu(module, context(suffix(false)))]
 pub enum WaitError<T: std::error::Error + 'static> {
     #[snafu(display("No error available, the actor must have panicked"))]
     Panicked,
-    #[snafu(display("Actor exited with an error: {source}"))]
+    #[snafu(display("Actor exited with an error"))]
+    Exited { source: T },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module, context(suffix(false)))]
+pub enum TryWaitError<T: std::error::Error + 'static> {
+    #[snafu(display("No error available, the actor must have panicked"))]
+    Panicked,
+    #[snafu(display("The actor is still alive"))]
+    StillAlive,
+    #[snafu(display("Actor exited with an error"))]
     Exited { source: T },
 }
 
@@ -508,10 +539,25 @@ mod oneshot_broadcast {
             }
         }
 
-        pub fn is_sender_alive(&self) -> bool {
+        pub fn try_recv(&mut self) -> Result<T, TryError> {
             debug_assert!(self.inner.sender_count() <= 1);
-            !self.inner.is_closed()
+            match self.inner.try_recv() {
+                Ok(x) => Ok(x),
+                Err(async_broadcast::TryRecvError::Overflowed(_)) => panic!("this can't overflow"),
+                Err(async_broadcast::TryRecvError::Empty) => Err(TryError::Empty),
+                Err(async_broadcast::TryRecvError::Closed) => Err(TryError::Closed),
+            }
         }
+
+        pub fn is_sender_dropped(&self) -> bool {
+            debug_assert!(self.inner.sender_count() <= 1);
+            self.inner.is_closed()
+        }
+    }
+
+    pub(super) enum TryError {
+        Closed,
+        Empty,
     }
 
     pub(super) fn create<T: Clone>() -> (UniqueSender<T>, MultiReceiver<T>) {
@@ -847,23 +893,6 @@ impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
     }
 }
 
-async fn wait_on_exit_recv<A: Actor>(
-    exit_recv: &mut ExitRecv<A::Error>,
-) -> Result<(), WaitError<A::Error>> {
-    exit_recv
-        .recv()
-        .await
-        .map(|ok| ok.context(ExitedSnafu))
-        .unwrap_or_else(|| PanickedSnafu.fail())
-}
-
-fn actor_is_dead<A: Actor>(exit_recv: &ExitRecv<A::Error>) -> bool {
-    // NOTE: there is only supposed to be one sender but many receivers, there is one receiver
-    // here, so if the channel is closed it must mean that the actor dropped its handle, hence
-    // it has died.
-    !exit_recv.is_sender_alive()
-}
-
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
@@ -875,7 +904,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         }
     }
 
-    // TODO: getters for retrieving the channel capacity and size
+    // TODO: getters for retrieving the channel capacity and size, useful for a multiplexing actor
 
     pub fn downgrade(&self) -> GenericWeakAddress<A, S> {
         let c = self.core.downgrade();
@@ -891,16 +920,20 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 
     /// The actor is dead
     pub fn is_dead(&self) -> bool {
-        actor_is_dead::<A>(&self.status)
+        self.status.is_sender_dropped()
     }
 
-    /// Wait for the actor to die. Remember that this non-weak address is keeping the actor alive.
-    /// This will return some arbitrary error if used after the exit reason has been awaited once
-    /// already.
-    pub async fn wait(&mut self) -> Result<(), WaitError<A::Error>> {
-        // TODO: shouldn't this require A::Error to be Send if the scope is remote? Or is this
-        // required to always be send or something? A local address shouldn't care.
-        wait_on_exit_recv::<A>(&mut self.status).await
+    /// Wait for the actor to die.
+    pub async fn wait(self) -> Result<(), WaitError<A::Error>> {
+        let weak = self.downgrade();
+        drop(self);
+        weak.wait().await
+    }
+
+    pub fn try_wait(self) -> Result<(), TryWaitError<A::Error>> {
+        let weak = self.downgrade();
+        drop(self);
+        weak.try_wait()
     }
 }
 
@@ -931,12 +964,26 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
 
     /// The actor is dead
     pub fn is_dead(&self) -> bool {
-        actor_is_dead::<A>(&self.status)
+        self.status.is_sender_dropped()
     }
 
     /// Wait for the actor to die.
-    pub async fn wait(&mut self) -> Result<(), WaitError<A::Error>> {
-        wait_on_exit_recv::<A>(&mut self.status).await
+    pub async fn wait(mut self) -> Result<(), WaitError<A::Error>> {
+        self.status
+            .recv()
+            .await
+            .map(|ok| ok.context(wait_error::Exited))
+            .unwrap_or_else(|| wait_error::Panicked.fail())
+    }
+
+    pub fn try_wait(mut self) -> Result<(), TryWaitError<A::Error>> {
+        self.status
+            .try_recv()
+            .map(|ok| ok.context(try_wait_error::Exited))
+            .unwrap_or_else(|err| match err {
+                ob::TryError::Empty => try_wait_error::StillAlive.fail(),
+                ob::TryError::Closed => try_wait_error::Panicked.fail(),
+            })
     }
 }
 
@@ -1591,6 +1638,79 @@ mod secret_adr {
         }
     }
 
+    // TODO: figure out how to generalize this to more than two types.
+    pub enum Multi<T1, T2> {
+        Left(T1),
+        Right(T2),
+    }
+
+    // HACK: the extra unit here is just to distinguish it from the other impl
+    impl<A, S, T1, T2> SecretSend<Multi<T1, T2>> for (UnsafeSendWrapper<PhantomData<S>>, AdrCore<A>, ())
+    where
+        A: Receive<T1> + Receive<T2>,
+        S: CanSendTicket<A, T1> + CanSendTicket<A, T2>,
+    {
+        fn send<'a>(&'a self, msg: Multi<T1, T2>) -> LocalBoxFuture<'a, Result<(), SendError>>
+        where
+            Multi<T1, T2>: 'a,
+        {
+            match msg {
+                Multi::Left(m) => self.1.send_ticket::<S, T1>(m).boxed_local(),
+                Multi::Right(m) => self.1.send_ticket::<S, T2>(m).boxed_local(),
+            }
+        }
+
+        fn try_send(&self, msg: Multi<T1, T2>) -> Result<(), TrySendError> {
+            match msg {
+                Multi::Left(m) => self.1.try_send_ticket::<S, T1>(m),
+                Multi::Right(m) => self.1.try_send_ticket::<S, T2>(m),
+            }
+        }
+
+        fn send_blocking(&self, msg: Multi<T1, T2>) -> Result<(), SendError> {
+            match msg {
+                Multi::Left(m) => self.1.send_blocking_ticket::<S, T1>(m),
+                Multi::Right(m) => self.1.send_blocking_ticket::<S, T2>(m),
+            }
+        }
+
+        fn clone_secret_send(&self) -> Box<dyn SecretSend<Multi<T1, T2>> + Send> {
+            let core = self.1.clone();
+            // SAFETY: the scope already was in a wrapper, this is just a copy
+            let scope = unsafe { UnsafeSendWrapper::new(PhantomData::<S>) };
+            let copy: Self = (scope, core, ());
+            Box::new(copy)
+        }
+    }
+
+    pub type SecretMultiAddress<T1, T2> = SecretAddress<Multi<T1, T2>>;
+
+    impl<T1, T2> SecretMultiAddress<T1, T2> {
+        pub async fn send_left(&self, msg: T1) -> Result<(), SendError> {
+            self.secret.send(Multi::Left(msg)).await
+        }
+
+        pub async fn send_right(&self, msg: T2) -> Result<(), SendError> {
+            self.secret.send(Multi::Right(msg)).await
+        }
+
+        pub async fn try_send_left(&self, msg: T1) -> Result<(), TrySendError> {
+            self.secret.try_send(Multi::Left(msg))
+        }
+
+        pub async fn try_send_right(&self, msg: T2) -> Result<(), TrySendError> {
+            self.secret.try_send(Multi::Right(msg))
+        }
+
+        pub async fn send_blocking_left(&self, msg: T1) -> Result<(), SendError> {
+            self.secret.send_blocking(Multi::Left(msg))
+        }
+
+        pub async fn send_blocking_right(&self, msg: T2) -> Result<(), SendError> {
+            self.secret.send_blocking(Multi::Right(msg))
+        }
+    }
+
     impl<A: Actor, S: Scope> GenericAddress<A, S> {
         pub fn secret<T>(&self) -> SecretAddress<T>
         where
@@ -1613,6 +1733,102 @@ mod secret_adr {
             SecretAddress {
                 secret: Box::new((scope, core)),
                 _scope: PhantomData,
+            }
+        }
+
+        pub fn secret_multi<T1, T2>(&self) -> SecretMultiAddress<T1, T2>
+        where
+            A: Receive<T1> + Receive<T2>,
+            S: CanSendTicket<A, T1> + CanSendTicket<A, T2>,
+        {
+            let core = self.core.clone();
+            // SAFETY: the same reasoning as Self::secret()
+            let scope = unsafe { UnsafeSendWrapper::new(PhantomData::<S>) };
+            SecretAddress {
+                secret: Box::new((scope, core, ())),
+                _scope: PhantomData,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::*;
+        use crate::deferred_span;
+
+        #[test]
+        fn multi_send_can_send_both_halves() {
+            #[derive(Debug, Snafu, Clone)]
+            #[snafu(display("counted this much {count}"))]
+            struct Counter {
+                count: i32,
+            }
+
+            struct Bob {
+                counter: i32,
+            }
+            impl Actor for Bob {
+                type Error = Counter;
+
+                fn span(&self) -> DeferredSpan<'_> {
+                    deferred_span!(Level::INFO, "bob")
+                }
+
+                async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+                    Err(Counter {
+                        count: self.counter,
+                    })
+                }
+            }
+
+            impl Receive<bool> for Bob {
+                type Retval = ();
+
+                async fn receive(&mut self, _msg: bool, _ctl: &mut Control<Self>) -> Self::Retval {
+                    self.counter += 5;
+                }
+            }
+
+            impl Receive<i32> for Bob {
+                type Retval = ();
+
+                async fn receive(&mut self, _msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
+                    self.counter += 7;
+                }
+            }
+
+            let main_stage = Stage::new();
+            let weak_adr = {
+                let bob_adr = main_stage.summon(Bob { counter: 0 });
+                let multi_adr = bob_adr.secret_multi::<bool, i32>();
+
+                multi_adr
+                    .send_left(true)
+                    .now_or_never()
+                    .expect("the future is ready")
+                    .expect("the send succeeded");
+
+                multi_adr
+                    .send_right(8)
+                    .now_or_never()
+                    .expect("the future is ready")
+                    .expect("the send succeeded");
+
+                bob_adr.downgrade()
+            };
+
+            main_stage.assert_plays_within(10);
+            let res = weak_adr
+                .wait()
+                .now_or_never()
+                .expect("this should resolve immediately");
+
+            let err = res.expect_err("should have returned an err");
+            match err {
+                WaitError::Exited {
+                    source: Counter { count },
+                } => assert_eq!(count, 12),
+                e => panic!("returned the wrong thing: {e:?}"),
             }
         }
     }
@@ -1685,7 +1901,7 @@ async fn actor_main<A: Actor>(
     trace!("Before leave");
     let exit_reason = actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!(?exit_reason, "Died");
+    debug!(error = exit_reason.is_err(), "Died");
 
     ctl.exit_send
         .take()
@@ -1829,6 +2045,7 @@ impl Default for Stage {
 mod tests {
     use super::*;
 
+    // TODO: is this actually stage tests?
     mod simple {
         use super::*;
 
@@ -1856,12 +2073,36 @@ mod tests {
             drop(adr);
             assert_future_ready!(fut);
         }
+
+        #[test]
+        fn the_exit_value_is_available_when_cloning_a_dead_address() {
+            let stage = Stage::new();
+            let (fut, adr) = stage.actor_builder().no_spawn(DummyActor);
+            let mut fut = pin!(fut);
+
+            let weak = adr.downgrade();
+            drop(adr);
+
+            assert_future_ready!(fut);
+            assert!(weak.is_dead());
+
+            let weak2 = weak.clone();
+            assert_future_ready!(pin weak.wait(), x => matches!(x, Ok(())));
+            assert_future_ready!(pin weak2.wait(), x => matches!(x, Ok(())));
+        }
     }
 
     mod multi_thread {
         use super::*;
-        use crate::{deferred_span, utils::thread_info_span};
+        use crate::utils::thread_info_span;
         use tracing::info;
+
+        #[derive(Debug, Snafu, Clone, Default)]
+        #[snafu(display("I am not sendable between threads"))]
+        struct NotSend {
+            inner: Rc<()>,
+        }
+        assert_not_impl_any!(NotSend: Send);
 
         #[test]
         fn basic_send() {
@@ -1869,9 +2110,7 @@ mod tests {
             impl Actor for Alice {
                 type Error = Infallible;
 
-                fn span(&self) -> DeferredSpan<'_> {
-                    deferred_span!(Level::INFO, "alice")
-                }
+                default_span!("alice");
             }
             impl Receive<i32> for Alice {
                 type Retval = i32;
@@ -1894,9 +2133,7 @@ mod tests {
                     assert_eq!(reply, 25);
                 }
 
-                fn span(&self) -> DeferredSpan<'_> {
-                    deferred_span!(Level::INFO, "bob")
-                }
+                default_span!("bob");
             }
 
             let _span = thread_info_span().entered();
@@ -1921,26 +2158,17 @@ mod tests {
 
         #[test]
         fn sendness_should_not_matter_when_not_used() {
-            #[derive(Debug, Snafu, Clone)]
-            #[snafu(display("I am not sendable between threads"))]
-            struct NotSend {
-                inner: Rc<()>,
-            }
-            assert_not_impl_any!(NotSend: Send);
-
             struct LocalAlice;
             impl Actor for LocalAlice {
                 type Error = NotSend;
 
-                fn span(&self) -> DeferredSpan<'_> {
-                    deferred_span!(Level::INFO, "alice")
-                }
+                default_span!("alice");
             }
             impl Receive<i32> for LocalAlice {
                 type Retval = NotSend;
 
                 async fn receive(&mut self, _msg: i32, _ctl: &mut Control<Self>) -> Self::Retval {
-                    NotSend { inner: Rc::new(()) }
+                    NotSend::default()
                 }
             }
 
@@ -1954,11 +2182,43 @@ mod tests {
             // NOTE: the other whole test is to see if this also compiles, even though error is
             // non-send.
             let _secret_adr = remote_adr.secret();
-            // TODO: create trybuild tests or smth to verify that intended usages work and unintended usages
+            // TODO: create ui_test, not trybuild, tests or smth to verify that intended usages work and unintended usages
             // don't work. There's a lot to keep track of now
             // TODO: more tests to make sure send is not required in cases where it isn't. There are many
             // types that needs to be conditional now, so it's hard to make sure everything is correct. It's
             // difficult though to make negative tests, i.e. cases that should fail to compile.
+            // TODO: check if wait can be called on remote/local depending on if Actor::Error is send or not
+            // TODO: check that secretsend can't be sent to another thread if it's local
+            // TODO: check that a remote address can't send local messages
+            // TODO: check whether retval sendness affects a oneway send
+        }
+
+        #[test]
+        fn sendness_of_the_actor_itself_shouldnt_matter() {
+            struct LocalAlice {
+                _inner: NotSend,
+            }
+            impl Actor for LocalAlice {
+                type Error = NoError;
+
+                default_span!("alice");
+            }
+            assert_not_impl_any!(LocalAlice: Send);
+            assert_impl_all!(RemoteAddress<LocalAlice>: Send);
+            assert_not_impl_any!(Address<LocalAlice>: Send);
+        }
+
+        #[test]
+        fn sendness_of_the_error_should_matter() {
+            struct LocalAlice;
+            impl Actor for LocalAlice {
+                type Error = NotSend;
+
+                default_span!("alice");
+            }
+            assert_impl_all!(LocalAlice: Send);
+            assert_not_impl_any!(RemoteAddress<LocalAlice>: Send);
+            assert_not_impl_any!(Address<LocalAlice>: Send);
         }
     }
 }

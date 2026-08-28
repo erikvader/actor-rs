@@ -2,8 +2,10 @@ use async_channel as channel;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
-#[snafu(display("Runes dropped while panicking"))]
-pub struct PanicError;
+#[snafu(display("{count} runes panicked when they were dropped"))]
+pub struct PanicError {
+    count: u32,
+}
 
 #[derive(Clone)]
 pub struct Rune {
@@ -20,7 +22,6 @@ impl Drop for Rune {
 }
 
 /// insipiration: https://dishonored.fandom.com/wiki/The_Heart
-// TODO: this could also be an IntoFuture, maybe? I think it requires boxing the future though.
 // NOTE: this is not supposed to be Clone, it can't track panics reliably if it did.
 pub struct Heart {
     // RANT: this channel is !Unpin even though it doesn't have to be
@@ -33,13 +34,16 @@ impl Heart {
     }
 
     pub async fn wait(&self) -> Result<(), PanicError> {
-        // TODO: this could clone the receiver and return a future that is static
-        let mut panicked = false;
+        let mut panicked = 0u32;
         while let Ok(()) = self.inner.recv().await {
-            panicked = true;
+            panicked += 1;
         }
 
-        if panicked { PanicSnafu.fail() } else { Ok(()) }
+        if panicked > 0 {
+            PanicSnafu { count: panicked }.fail()
+        } else {
+            Ok(())
+        }
     }
 }
 
