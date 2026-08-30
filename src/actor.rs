@@ -171,7 +171,10 @@ mod id_generator {
 use builder::ActorBuilder;
 pub use builder::{IntoActor, IntoActorExt, WithMailboxSize};
 mod builder {
-    use crate::signals::Interrupt;
+    use crate::{
+        deferred_span::{DeferredDirectSpan, DeferredSpanMethods},
+        signals::Interrupt,
+    };
 
     use super::*;
 
@@ -214,13 +217,15 @@ mod builder {
             oneshot_broadcast::create()
         }
 
-        fn create_root_span(id: Id, parent: &Span) -> Span {
-            span!(
-                parent: parent,
-                Level::DEBUG,
-                "actor",
-                id,
-            )
+        fn create_root_span(id: Id) -> DeferredDirectSpan<impl FnOnce(&Span) -> Span> {
+            DeferredDirectSpan::new(move |parent| {
+                span!(
+                    parent: parent,
+                    Level::DEBUG,
+                    "actor",
+                    id,
+                )
+            })
         }
 
         fn raw(
@@ -241,15 +246,9 @@ mod builder {
             let sig_guard = into_actor.install_signals(&home);
 
             let actor = into_actor.into_actor();
-            let span = {
-                let span = Self::create_root_span(id, &self.thread_root_span);
-                let span = if span.is_disabled() {
-                    self.thread_root_span.clone()
-                } else {
-                    span
-                };
-                actor.span().create_or_parent(span)
-            };
+            let span = actor
+                .span()
+                .create_or(Self::create_root_span(id).create_or(self.thread_root_span.clone()));
 
             let ctl = Control::new(
                 Rc::downgrade(&self.ex),
@@ -800,6 +799,8 @@ mod adr_core {
     // TODO: make these send errors return the value that was attempted to be sent? It's difficult to
     // get them back since they are erased in a Box, but it should be possible to downcast them back i
     // think.
+    // TODO: It would be cool if it was possible to match every send with a receive to make sure
+    // there is zero data loss by dropping a queue with data in it.
     pub struct SendError;
 
     impl<T> From<channel::SendError<T>> for SendError {
@@ -1249,6 +1250,8 @@ impl<A: Actor> Deliverable<A> for () {
 pub mod bg_job {
     use blocking::Unblock;
 
+    use crate::deferred_span::DeferredSpanMethods;
+
     use super::*;
 
     pub struct Skip {
@@ -1322,7 +1325,7 @@ pub mod bg_job {
             A: Actor,
             O: 'static,
         {
-            let span = self.span.create_or_parent(ctl.actor_span.clone());
+            let span = self.span.create_or(ctl.actor_span.clone());
             let fut = {
                 let span = span.clone();
                 async move {
@@ -1353,7 +1356,7 @@ pub mod bg_job {
             F: Future<Output = ()> + 'static,
             A: Actor,
         {
-            let span = self.span.create_or_parent(ctl.actor_span.clone());
+            let span = self.span.create_or(ctl.actor_span.clone());
             let fut = async {
                 let output: () = self.future.await;
                 // NOTE: () is a zero-sized type, so the box is not actually allocating anything
@@ -1399,10 +1402,7 @@ pub mod bg_job {
 
     #[cfg(test)]
     mod tests {
-        use crate::{
-            deferred_span,
-            test_utils::{assert_parent_span, assert_span},
-        };
+        use crate::test_utils::{assert_parent_span, assert_span};
 
         use super::*;
 
@@ -1413,10 +1413,7 @@ pub mod bg_job {
             }
             impl Actor for Alice {
                 type Error = Infallible;
-
-                fn span(&self) -> DeferredSpan<'_> {
-                    deferred_span!(Level::INFO, "alice")
-                }
+                default_span!("alice");
 
                 async fn enter(&mut self, ctl: &mut Control<Self>) {
                     Job::new(async {
@@ -1769,10 +1766,7 @@ mod secret_adr {
             }
             impl Actor for Bob {
                 type Error = Counter;
-
-                fn span(&self) -> DeferredSpan<'_> {
-                    deferred_span!(Level::INFO, "bob")
-                }
+                default_span!("bob");
 
                 async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
                     Err(Counter {

@@ -54,6 +54,10 @@ impl Bomb {
         self.switch.clone()
     }
 
+    pub fn detonate(&self) {
+        self.switch.detonate();
+    }
+
     pub async fn attach_future<T>(&self, fut: impl Future<Output = T>) -> Tick<T> {
         // HACK: this select will always prioritize the left future
         match futures_util::future::select(pin!(self.wait()), pin!(fut)).await {
@@ -68,6 +72,12 @@ impl Bomb {
             wait: self.inner.clone(),
             done: false,
         }
+    }
+}
+
+impl Default for Bomb {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

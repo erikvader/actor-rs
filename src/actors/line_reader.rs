@@ -8,7 +8,7 @@ use crate::{
     actor::{Actor, Control, Receive, SecretAddress, bg_job::Job},
     deferred_info_span,
     deferred_span::DeferredSpan,
-    kill_switch::{Bomb, Switch, Tick},
+    kill_switch::{Bomb, Tick},
     signals::Interrupt,
 };
 
@@ -35,7 +35,7 @@ struct ThreadData<R, C> {
 
 pub struct LineReader<R, C = ()> {
     thread_data: Option<ThreadData<R, C>>,
-    task_killer: Option<Switch>,
+    bomb: Bomb,
     error: Result<(), Error>,
 }
 
@@ -60,7 +60,7 @@ where
                 read_from,
                 cleaner,
             }),
-            task_killer: None,
+            bomb: Bomb::new(),
             error: Ok(()),
         }
     }
@@ -124,47 +124,47 @@ where
             cleaner,
         } = self.thread_data.take().expect("will exist on start");
 
-        let bomb = Bomb::new();
-        self.task_killer = Some(bomb.get_switch());
-
-        Job::new(async move {
-            let mut res = Ok(());
-            let mut lines = pin!(bomb.attach_stream(read_from.lines()));
-            while let Some(watch) = lines.next().await {
-                match watch {
-                    Tick::Tock(Ok(line)) => {
-                        if send_to.send(Line(line)).await.is_err() {
-                            tracing::debug!("Receiver closed");
-                            res = ClosedSnafu.fail();
+        Job::new({
+            let bomb = self.bomb.clone();
+            async move {
+                let mut res = Ok(());
+                let mut lines = pin!(bomb.attach_stream(read_from.lines()));
+                while let Some(watch) = lines.next().await {
+                    match watch {
+                        Tick::Tock(Ok(line)) => {
+                            if send_to.send(Line(line)).await.is_err() {
+                                tracing::debug!("Receiver closed");
+                                res = ClosedSnafu.fail();
+                                break;
+                            }
+                        }
+                        Tick::Tock(Err(error)) => {
+                            // NOTE: there are a lot of different recovery strategies, like continuing
+                            // with the next line if an utf-8 error occurred, sending a lossy converted
+                            // string or the raw bytes, etc. But the simplest and safest option that
+                            // never causes silent data loss is to return early on any kind of error.
+                            // What to do on certain errors depends on the context and what the Reader
+                            // actually is, so i leave that for the future.
+                            tracing::debug!(?error, "Reader errored");
+                            res = Err(error).context(ReaderSnafu);
+                            break;
+                        }
+                        Tick::Boom => {
+                            tracing::debug!("Interrupted early");
                             break;
                         }
                     }
-                    Tick::Tock(Err(error)) => {
-                        // NOTE: there are a lot of different recovery strategies, like continuing
-                        // with the next line if an utf-8 error occurred, sending a lossy converted
-                        // string or the raw bytes, etc. But the simplest and safest option that
-                        // never causes silent data loss is to return early on any kind of error.
-                        // What to do on certain errors depends on the context and what the Reader
-                        // actually is, so i leave that for the future.
-                        tracing::debug!(?error, "Reader errored");
-                        res = Err(error).context(ReaderSnafu);
-                        break;
-                    }
-                    Tick::Boom => {
-                        tracing::debug!("Interrupted early");
-                        break;
-                    }
                 }
+
+                // TODO: collect an error from this as well? I added the cleanup as a "I think this
+                // could be useful", but I haven't actually used it yet, so fix this when i actually
+                // need it.
+                tracing::trace!("Cleaning up");
+                cleaner.cleanup().await;
+
+                tracing::debug!("Exited");
+                res
             }
-
-            // TODO: collect an error from this as well? I added the cleanup as a "I think this
-            // could be useful", but I haven't actually used it yet, so fix this when i actually
-            // need it.
-            tracing::trace!("Cleaning up");
-            cleaner.cleanup().await;
-
-            tracing::debug!("Exited");
-            res
         })
         .then(async |actor: &mut Self, ctl, res| {
             ctl.close_mailbox();
@@ -188,9 +188,7 @@ where
     async fn receive(&mut self, _msg: Interrupt, ctl: &mut Control<Self>) -> Self::Retval {
         tracing::debug!("Interrupt message received");
         ctl.close_mailbox();
-        if let Some(switch) = self.task_killer.as_mut() {
-            switch.detonate();
-        }
+        self.bomb.detonate();
     }
 }
 

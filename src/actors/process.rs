@@ -1,31 +1,49 @@
-use std::{io, marker::PhantomData, pin::pin, process::Stdio};
+use std::{io, marker::PhantomData, pin::pin, process::Stdio, sync::Arc};
 
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader};
+use futures_util::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader,
+};
+use snafu::{ResultExt, Snafu};
 
 use crate::{
-    actor::{Actor, Control, Receive, SecretAddress},
-    deferred_info_span,
+    actor::{Actor, Control, Receive, SecretAddress, bg_job::Job},
+    deferred_info_span, deferred_span,
     deferred_span::DeferredSpan,
+    kill_switch::Bomb,
 };
 
+#[derive(Debug, Clone, Snafu)]
+pub enum Error {
+    #[snafu(display("Process failed to start"))]
+    Start {
+        #[snafu(source(from(std::io::Error, Arc::new)))]
+        source: Arc<std::io::Error>,
+    },
+}
+
 // TODO: add ways to modify the environment?
-// TODO: i should probably take another type argument for stderr
 // TODO: when and how to kill the process? Start with sigterm and escalate?
-pub struct Process<I, O> {
+pub struct Process<I, O, E> {
     exe: String,
     args: Vec<String>,
     input: I,
     output: Option<O>,
+    errput: Option<E>,
+    result: Result<(), Error>,
+    bomb: Bomb,
 }
 
-impl Process<DevNull, LogLineUtf8> {
+impl Process<DevNull, LogLineUtf8, LogLineUtf8> {
     pub fn new(exe: impl Into<String>) -> Self {
         Self {
             exe: exe.into(),
             args: vec![],
             input: DevNull,
             output: Some(LogLineUtf8),
+            errput: Some(LogLineUtf8),
+            result: Ok(()),
+            bomb: Bomb::new(),
         }
     }
 }
@@ -86,6 +104,7 @@ impl Output for DevNull {
     }
 }
 
+// TODO: add the concrete child handle as type parameter here and only have one process
 trait Output {
     fn configure(&self) -> Stdio;
     async fn process_stdout(&self, sink: Option<ChildStdout>);
@@ -128,8 +147,8 @@ impl Output for AllBytes {
 
 pub struct LogLineUtf8;
 impl LogLineUtf8 {
-    async fn print<R: AsyncRead>(&self, name: &'static str, read: R) {
-        let read = BufReader::new(read).lines();
+    async fn print<R: AsyncBufRead>(&self, name: &'static str, read: R) {
+        let read = read.lines();
         read.for_each(async |line| match line {
             Ok(line) => tracing::info!("{name}: {line}"),
             Err(err) => tracing::error!(error = &err as &dyn std::error::Error, "{name}"),
@@ -144,11 +163,13 @@ impl Output for LogLineUtf8 {
     }
 
     async fn process_stdout(&self, sink: Option<ChildStdout>) {
-        self.print("stderr", sink.expect("should be set")).await
+        self.print("stderr", sink.map(BufReader::new).expect("should be set"))
+            .await
     }
 
     async fn process_stderr(&self, sink: Option<ChildStderr>) {
-        self.print("stderr", sink.expect("should be set")).await
+        self.print("stderr", sink.map(BufReader::new).expect("should be set"))
+            .await
     }
 }
 
@@ -177,57 +198,62 @@ pub struct InputBytes {
 
 // TODO: interrupt should send sigterm
 // TODO: kill on drop?
-impl<I, O> Actor for Process<I, O>
+impl<I, O, E> Actor for Process<I, O, E>
 where
     I: Input + 'static,
     O: Output + 'static,
+    E: Output + 'static,
 {
-    // TODO: set to something sensible
-    type Error = std::convert::Infallible;
+    type Error = Error;
 
     fn span(&self) -> DeferredSpan<'_> {
-        deferred_info_span!("process", exe = self.exe)
+        crate::deferred_span_or!(
+            crate::deferred_direct_span!(tracing::Level::DEBUG, "process", exe = self.exe, args = ?self.args);
+            crate::deferred_direct_span!(tracing::Level::INFO, "process", exe = self.exe);
+        )
     }
 
     // TODO: should this actor run the async_process::driver? The stage?
     async fn enter(&mut self, ctl: &mut Control<Self>) {
         let output = self.output.take().expect("will be here");
+        let errput = self.errput.take().expect("will be here");
 
         let mut cmd = Command::new(&self.exe);
         cmd.args(&self.args);
         cmd.stdin(self.input.configure());
         cmd.stdout(output.configure());
-        cmd.stderr(output.configure());
+        cmd.stderr(errput.configure());
 
+        // TODO: log this
         let mut child = match cmd.spawn() {
             Ok(child) => {
                 tracing::debug!(pid = child.id(), "Spawned process");
                 child
             }
             Err(err) => {
-                tracing::error!("Failed to spawn process"); // TODO: add context?
-                // ctl.hard_exit();
+                self.result = Err(err).context(StartSnafu);
+                ctl.close_and_clear_mailbox();
                 return;
             }
         };
 
         self.input.register(&mut child.stdin);
 
-        // ctl.start_job(
-        //     {
-        //         let stdout = child.stdout.take();
-        //         let stderr = child.stderr.take();
-        //         async move |bomb| {
-        //             let out = output.process_stdout(stdout);
-        //             let err = output.process_stderr(stderr);
-        //             let res = bomb
-        //                 .attach_future(futures_util::future::join(out, err))
-        //                 .await;
-        //             tracing::debug!(?res);
-        //         }
-        //     },
-        //     |parent| tracing::info_span!(parent: parent, "output_job"),
-        // );
+        Job::new({
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let bomb = self.bomb.clone();
+            async move {
+                let out = output.process_stdout(stdout);
+                let err = errput.process_stderr(stderr);
+                let res = bomb
+                    .attach_future(futures_util::future::join(out, err))
+                    .await;
+                tracing::debug!(?res);
+            }
+        })
+        .instrument(deferred_info_span!("outputs"))
+        .start(ctl);
 
         // ctl.start_job(
         //     async move |bomb| {
@@ -240,11 +266,16 @@ where
         //     |parent| tracing::info_span!(parent: parent, "wait_job"),
         // );
     }
+
+    async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+        self.result
+    }
 }
 
-impl<O> Receive<InputLine> for Process<Piped, O>
+impl<O, E> Receive<InputLine> for Process<Piped, O, E>
 where
     O: Output + 'static,
+    E: Output + 'static,
 {
     type Retval = ();
 
