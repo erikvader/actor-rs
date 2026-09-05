@@ -33,6 +33,12 @@ struct ThreadData<R, C> {
     cleaner: C,
 }
 
+// NOTE: This was originally meant as something that would read lines from stdin, but then I thought
+// "lets make it more general", and now I have something that only works for stdin, and maybe named
+// pipes. It's primarily how to handle different errors that are difficult to handle generally,
+// because some uses are okay with logging them, and some would want to crash as soon as possible. I
+// don't plan on using this in a real application, so i will leave it as is, i.e. something general
+// that only makes sense for a couple of use cases.
 pub struct LineReader<R, C = ()> {
     thread_data: Option<ThreadData<R, C>>,
     bomb: Bomb,

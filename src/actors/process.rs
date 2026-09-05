@@ -90,40 +90,30 @@ impl Input for DevNull {
         panic!("I should not be able to be called");
     }
 }
-impl Output for DevNull {
+impl<S> Output<S> for DevNull {
     fn configure(&self) -> Stdio {
         Stdio::null()
     }
 
-    async fn process_stdout(&self, sink: Option<ChildStdout>) {
-        assert!(sink.is_none());
-    }
-
-    async fn process_stderr(&self, sink: Option<ChildStderr>) {
+    async fn process(&self, sink: Option<S>) {
         assert!(sink.is_none());
     }
 }
 
-// TODO: add the concrete child handle as type parameter here and only have one process
-trait Output {
+trait Output<S> {
     fn configure(&self) -> Stdio;
-    async fn process_stdout(&self, sink: Option<ChildStdout>);
-    async fn process_stderr(&self, sink: Option<ChildStderr>);
+    async fn process(&self, sink: Option<S>);
 }
 
 pub struct LineUtf8 {
     adr: SecretAddress<OutputLine>,
 }
-impl Output for LineUtf8 {
+impl<S> Output<S> for LineUtf8 {
     fn configure(&self) -> Stdio {
         Stdio::piped()
     }
 
-    async fn process_stdout(&self, sink: Option<ChildStdout>) {
-        todo!()
-    }
-
-    async fn process_stderr(&self, sink: Option<ChildStderr>) {
+    async fn process(&self, sink: Option<S>) {
         todo!()
     }
 }
@@ -131,24 +121,23 @@ impl Output for LineUtf8 {
 pub struct AllBytes {
     adr: SecretAddress<OutputBytes>,
 }
-impl Output for AllBytes {
+impl<S> Output<S> for AllBytes {
     fn configure(&self) -> Stdio {
         Stdio::piped()
     }
 
-    async fn process_stdout(&self, sink: Option<ChildStdout>) {
-        todo!()
-    }
-
-    async fn process_stderr(&self, sink: Option<ChildStderr>) {
+    async fn process(&self, sink: Option<S>) {
         todo!()
     }
 }
 
 pub struct LogLineUtf8;
 impl LogLineUtf8 {
-    async fn print<R: AsyncBufRead>(&self, name: &'static str, read: R) {
-        let read = read.lines();
+    async fn print<R: AsyncRead>(&self, name: &'static str, read: R) {
+        // NOTE: I know it's an anti-pattern to wrap a generic AsyncRead in a buffer, but in this
+        // case, the readable will only be either child stdout or stderr, and this function takes
+        // ownership of them, so it's okay in this case.
+        let read = BufReader::new(read).lines();
         read.for_each(async |line| match line {
             Ok(line) => tracing::info!("{name}: {line}"),
             Err(err) => tracing::error!(error = &err as &dyn std::error::Error, "{name}"),
@@ -157,19 +146,14 @@ impl LogLineUtf8 {
     }
 }
 
-impl Output for LogLineUtf8 {
+impl<S: AsyncRead> Output<S> for LogLineUtf8 {
     fn configure(&self) -> Stdio {
         Stdio::piped()
     }
 
-    async fn process_stdout(&self, sink: Option<ChildStdout>) {
-        self.print("stderr", sink.map(BufReader::new).expect("should be set"))
-            .await
-    }
-
-    async fn process_stderr(&self, sink: Option<ChildStderr>) {
-        self.print("stderr", sink.map(BufReader::new).expect("should be set"))
-            .await
+    async fn process(&self, sink: Option<S>) {
+        // TODO: what should the first argument be set to?
+        self.print("stderr", sink.expect("should be set")).await
     }
 }
 
@@ -201,8 +185,8 @@ pub struct InputBytes {
 impl<I, O, E> Actor for Process<I, O, E>
 where
     I: Input + 'static,
-    O: Output + 'static,
-    E: Output + 'static,
+    O: Output<ChildStdout> + 'static,
+    E: Output<ChildStderr> + 'static,
 {
     type Error = Error;
 
@@ -218,19 +202,25 @@ where
         let output = self.output.take().expect("will be here");
         let errput = self.errput.take().expect("will be here");
 
+        tracing::debug!("Spawning process");
         let mut cmd = Command::new(&self.exe);
         cmd.args(&self.args);
         cmd.stdin(self.input.configure());
         cmd.stdout(output.configure());
         cmd.stderr(errput.configure());
 
-        // TODO: log this
         let mut child = match cmd.spawn() {
             Ok(child) => {
                 tracing::debug!(pid = child.id(), "Spawned process");
                 child
             }
             Err(err) => {
+                // TODO: I'm not sure if this is a classic log and error anti-pattern, maybe change
+                // the level to DEBUG?
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "Could not spawn process"
+                );
                 self.result = Err(err).context(StartSnafu);
                 ctl.close_and_clear_mailbox();
                 return;
@@ -244,8 +234,8 @@ where
             let stderr = child.stderr.take();
             let bomb = self.bomb.clone();
             async move {
-                let out = output.process_stdout(stdout);
-                let err = errput.process_stderr(stderr);
+                let out = output.process(stdout);
+                let err = errput.process(stderr);
                 let res = bomb
                     .attach_future(futures_util::future::join(out, err))
                     .await;
@@ -274,8 +264,8 @@ where
 
 impl<O, E> Receive<InputLine> for Process<Piped, O, E>
 where
-    O: Output + 'static,
-    E: Output + 'static,
+    O: Output<ChildStdout> + 'static,
+    E: Output<ChildStderr> + 'static,
 {
     type Retval = ();
 

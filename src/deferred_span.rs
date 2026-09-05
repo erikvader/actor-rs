@@ -47,6 +47,12 @@ pub mod __private {
             Some(span)
         }
 
+        // RANT: this is annoying to chain, but I can't come up with a much nicer solution. Operator
+        // overloading doesn't really help since all of them are left-associative, and i can't make
+        // them private. Creating a method that /can/ be chained requires wrapping and unwrapping
+        // span. A macro for this feels too overkill, and it has its own drawbacks. This method /is/
+        // private, so it doesn't have to be completely ergonomic, and there is currently only one
+        // place that has a chain of more than two spans.
         fn create_or(self, parent: Span) -> Span {
             self.create(&parent).unwrap_or(parent)
         }
@@ -114,7 +120,7 @@ macro_rules! deferred_info_span {
 }
 
 // NOTE: this became a macro instead of a function or operator overload to drastically reduce the
-// number of heap allocations, at least if used with direct spans.
+// number of heap allocations
 #[macro_export]
 macro_rules! deferred_span_or {
     (@internal $parent:ident; $last:expr $(;)?) => {
