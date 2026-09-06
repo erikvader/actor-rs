@@ -17,6 +17,7 @@ use crate::{
 pub enum Error {
     #[snafu(display("Process failed to start"))]
     Start {
+        // TODO: is it better to wrap the whole error in an arc instead of only the source?
         #[snafu(source(from(std::io::Error, Arc::new)))]
         source: Arc<std::io::Error>,
     },
@@ -198,7 +199,7 @@ where
     }
 
     // TODO: should this actor run the async_process::driver? The stage?
-    async fn enter(&mut self, ctl: &mut Control<Self>) {
+    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
         let output = self.output.take().expect("will be here");
         let errput = self.errput.take().expect("will be here");
 
@@ -215,15 +216,13 @@ where
                 child
             }
             Err(err) => {
-                // TODO: I'm not sure if this is a classic log and error anti-pattern, maybe change
-                // the level to DEBUG?
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
                     "Could not spawn process"
                 );
                 self.result = Err(err).context(StartSnafu);
                 ctl.close_and_clear_mailbox();
-                return;
+                return Ok(());
             }
         };
 
@@ -255,6 +254,8 @@ where
         //     },
         //     |parent| tracing::info_span!(parent: parent, "wait_job"),
         // );
+
+        Ok(())
     }
 
     async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {

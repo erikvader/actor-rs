@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-executor = "1.14.0"
 #NOTE: this has a tracing feature, which i assume just adds logs, which i don't want
 async-io = { version = "2.6.0", default-features = false }
 async-process = "2.5.0"
+async-watch = "0.3.1"
 #NOTE: this has a tracing feature, which i assume just adds logs, which i don't want
 blocking = { version = "1.6.2", default-features = false }
 futures-core = "0.3.32"

@@ -123,7 +123,7 @@ where
 
     crate::default_span!("line_reader");
 
-    async fn enter(&mut self, ctl: &mut Control<Self>) {
+    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
         let ThreadData {
             send_to,
             read_from,
@@ -178,6 +178,9 @@ where
         })
         .instrument(deferred_info_span!("bg_job"))
         .start(ctl);
+
+        // TODO: this return value got added, can this actor use it?
+        Ok(())
     }
 
     async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {

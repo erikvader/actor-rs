@@ -36,7 +36,7 @@ use tracing::{Instrument, Level, Span, debug, debug_span, span, trace, trace_spa
 // events of levels debug or higher (verbosity).
 // TODO: it would be cool if there was some nice way to shorten those type names
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxSize {
     Unbounded,
     Bounded(NonZeroUsize),
@@ -82,7 +82,9 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn enter(&mut self, ctl: &mut Control<Self>) {}
+    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     #[expect(
         async_fn_in_trait,
@@ -138,7 +140,7 @@ pub struct Control<A: Actor> {
     // and could cause problems, potentially. The real solution is maybe to create a shared future
     // that doesn't require send/sync, or to take the Watch type from tokio or something.
     actor_rune: Rune,
-    exit_send: Option<ExitSend<A::Error>>,
+    exit_send: ExitSend<A::Error>,
 }
 
 mod id_generator {
@@ -214,7 +216,7 @@ mod builder {
         }
 
         fn create_exit_channel() -> (ExitSend<A::Error>, ExitRecv<A::Error>) {
-            oneshot_broadcast::create()
+            async_watch::channel(State::default())
         }
 
         fn create_root_span(id: Id) -> DeferredDirectSpan<impl FnOnce(&Span) -> Span> {
@@ -265,7 +267,7 @@ mod builder {
             // cuz it gets entered twice, but i don't feel like that special case is worth worrying
             // about. This is of course only the case if the future is spawned as a task on an executor
             // that is blocked on its event loop where thread_root_span is active.
-            let fut = actor_main(ctl, actor, rcv, home.clone(), self.yield_policy).instrument(span);
+            let fut = actor_main(rcv, ctl, actor, home.clone(), self.yield_policy).instrument(span);
             (fut, home)
         }
 
@@ -430,7 +432,7 @@ impl<A: Actor> Control<A> {
             idgen,
             thread_root_span,
             actor_span,
-            exit_send: Some(exit_send),
+            exit_send,
             _signal_guard: signal_guard,
         }
     }
@@ -486,89 +488,17 @@ pub enum TryWaitError<T: std::error::Error + 'static> {
     Exited { source: T },
 }
 
-type ExitRecv<E> = ob::MultiReceiver<Result<(), E>>;
-type ExitSend<E> = ob::UniqueSender<Result<(), E>>;
-
-use oneshot_broadcast as ob;
-mod oneshot_broadcast {
-    use async_broadcast as bhannel;
-    use static_assertions::{assert_impl_all, assert_not_impl_any};
-
-    pub(super) struct UniqueSender<T> {
-        inner: bhannel::Sender<T>,
-    }
-    assert_not_impl_any!(UniqueSender<()>: Clone);
-
-    impl<T: Clone> UniqueSender<T> {
-        fn new(sender: bhannel::Sender<T>) -> Option<Self> {
-            if sender.sender_count() != 1 {
-                return None;
-            }
-            Some(Self { inner: sender })
-        }
-
-        pub fn broadcast(self, msg: T) {
-            use bhannel::TrySendError;
-            match self.inner.try_broadcast(msg) {
-                Ok(None) | Err(TrySendError::Closed(_)) => (),
-                Ok(Some(_)) | Err(TrySendError::Full(_)) | Err(TrySendError::Inactive(_)) => {
-                    panic!("should not happen")
-                }
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    pub(super) struct MultiReceiver<T> {
-        inner: bhannel::Receiver<T>,
-    }
-    assert_impl_all!(MultiReceiver<()>: Clone);
-
-    impl<T: Clone> MultiReceiver<T> {
-        fn new(receiver: bhannel::Receiver<T>) -> Self {
-            Self { inner: receiver }
-        }
-
-        pub async fn recv(&mut self) -> Option<T> {
-            debug_assert!(self.inner.sender_count() <= 1);
-            match self.inner.recv_direct().await {
-                Ok(x) => Some(x),
-                Err(async_broadcast::RecvError::Closed) => None,
-                Err(async_broadcast::RecvError::Overflowed(_)) => panic!("this can't overflow"),
-            }
-        }
-
-        pub fn try_recv(&mut self) -> Result<T, TryError> {
-            debug_assert!(self.inner.sender_count() <= 1);
-            match self.inner.try_recv() {
-                Ok(x) => Ok(x),
-                Err(async_broadcast::TryRecvError::Overflowed(_)) => panic!("this can't overflow"),
-                Err(async_broadcast::TryRecvError::Empty) => Err(TryError::Empty),
-                Err(async_broadcast::TryRecvError::Closed) => Err(TryError::Closed),
-            }
-        }
-
-        pub fn is_sender_dropped(&self) -> bool {
-            debug_assert!(self.inner.sender_count() <= 1);
-            self.inner.is_closed()
-        }
-    }
-
-    pub(super) enum TryError {
-        Closed,
-        Empty,
-    }
-
-    pub(super) fn create<T: Clone>() -> (UniqueSender<T>, MultiReceiver<T>) {
-        // NOTE: up to one message will be sent on this, so the overflow flag doesn't matter.
-        // NOTE: the receiver will never be inactive, so the await_active flag doesn't matter
-        let (snd, rcv) = bhannel::broadcast(1);
-        (
-            UniqueSender::new(snd).expect("there is only one of them"),
-            MultiReceiver::new(rcv),
-        )
-    }
+#[derive(Default, Debug)]
+pub(crate) enum State<E> {
+    #[default]
+    Initializing,
+    Running,
+    Failed(E),
+    Exited,
 }
+
+type ExitRecv<E> = async_watch::Receiver<State<E>>;
+type ExitSend<E> = async_watch::Sender<State<E>>;
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
 #[diagnostic::on_unimplemented(
@@ -625,8 +555,8 @@ use adr_core::{AdrCore, AdrRcv, ErasedAdr, WeakAdrCore};
 pub use adr_core::{Reply, ReplyError, SendError, TrySendError};
 mod adr_core {
     use super::{
-        Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, OneWayTicket, Package,
-        Receive,
+        Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, MailboxSize,
+        OneWayTicket, Package, Receive,
     };
     use async_channel as channel;
     use pin_project::pin_project;
@@ -669,9 +599,23 @@ mod adr_core {
             self.sender.is_closed()
         }
 
+        pub fn is_dead(&self) -> bool {
+            self.sender.receiver_count() == 0
+        }
+
         #[expect(dead_code, reason = "unused for now")]
         pub fn close(&self) {
             self.sender.close();
+        }
+
+        pub fn mailbox_size(&self) -> MailboxSize {
+            self.sender.capacity().map_or(MailboxSize::Unbounded, |u| {
+                MailboxSize::Bounded(std::num::NonZeroUsize::new(u).expect("capacity is non-zero"))
+            })
+        }
+
+        pub fn num_queued(&self) -> usize {
+            self.sender.len()
         }
 
         pub fn erased(&self) -> ErasedAdr
@@ -764,6 +708,9 @@ mod adr_core {
     }
 
     pub(super) struct WeakAdrCore<A: Actor> {
+        // RANT: it's not possible to create an is_dead method on this since there is no getter for
+        // the receiver count, and upgrade also fails if the channel is closed, not only if there
+        // are no receivers.
         sender: channel::WeakSender<ErasedDeliverable<A>>,
     }
     assert_impl_all!(WeakAdrCore<DummyActor>: Send);
@@ -905,7 +852,13 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         }
     }
 
-    // TODO: getters for retrieving the channel capacity and size, useful for a multiplexing actor
+    pub fn mailbox_size(&self) -> MailboxSize {
+        self.core.mailbox_size()
+    }
+
+    pub fn num_queued(&self) -> usize {
+        self.core.num_queued()
+    }
 
     pub fn downgrade(&self) -> GenericWeakAddress<A, S> {
         let c = self.core.downgrade();
@@ -921,20 +874,40 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 
     /// The actor is dead
     pub fn is_dead(&self) -> bool {
-        self.status.is_sender_dropped()
+        self.core.is_dead()
     }
 
     /// Wait for the actor to die.
-    pub async fn wait(self) -> Result<(), WaitError<A::Error>> {
-        let weak = self.downgrade();
+    pub async fn join(self) -> Result<(), WaitError<A::Error>> {
+        let mut weak = self.downgrade();
         drop(self);
-        weak.wait().await
+        weak.join().await
     }
 
-    pub fn try_wait(self) -> Result<(), TryWaitError<A::Error>> {
-        let weak = self.downgrade();
-        drop(self);
-        weak.try_wait()
+    pub fn try_join(&self) -> Result<(), TryWaitError<A::Error>> {
+        let dead = self.core.is_dead();
+        match &*self.status.borrow() {
+            // NOTE: this panic detection is not perfect, see the note on the normal join
+            State::Initializing | State::Running if dead => try_wait_error::Panicked.fail(),
+            State::Initializing | State::Running => try_wait_error::StillAlive.fail(),
+            State::Failed(e) => Err(e.clone()).context(try_wait_error::Exited),
+            State::Exited => Ok(()),
+        }
+    }
+
+    pub async fn up_and_running(&mut self) -> bool {
+        loop {
+            match *self.status.borrow() {
+                State::Initializing => (),
+                State::Running => return true,
+                State::Failed(_) | State::Exited => return false,
+            }
+
+            if self.status.changed().await.is_err() {
+                debug_assert!(self.is_dead(), "this must have dropped as well");
+                return false;
+            }
+        }
     }
 }
 
@@ -963,28 +936,37 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
         self.core.close()
     }
 
-    /// The actor is dead
-    pub fn is_dead(&self) -> bool {
-        self.status.is_sender_dropped()
-    }
+    // TODO: It is possible to create an is_dead here, by doing a now_or_never on status.changed()
+    // twice, once to make it clear its own read status, and a second time to make it check whether
+    // it is closed or not. But this feels so hacky, so i don't want to add this unless i need to.
+    // The best solution would be for a weak async channel to expose how many strong receivers it
+    // has... I guess i could add a third thing that get closed on drop, but that feels
+    // ridiculous... This would also allow functions like try_join to be implemented on weak
+    // addresses.
 
     /// Wait for the actor to die.
-    pub async fn wait(mut self) -> Result<(), WaitError<A::Error>> {
-        self.status
-            .recv()
-            .await
-            .map(|ok| ok.context(wait_error::Exited))
-            .unwrap_or_else(|| wait_error::Panicked.fail())
+    pub async fn join(&mut self) -> Result<(), WaitError<A::Error>> {
+        let mut dead = false;
+        loop {
+            match &*self.status.borrow() {
+                // NOTE: this panic detection is not perfect, since the actor could panic in other
+                // states than these. But this is the best that can be done by only looking at the
+                // watch. I don't feel like it is worth it to include a Heart/rune or something to
+                // detect whether any drop or watch::send panicked.
+                State::Initializing | State::Running if dead => return wait_error::Panicked.fail(),
+                State::Initializing | State::Running => (),
+                State::Failed(e) => return Err(e.clone()).context(wait_error::Exited),
+                State::Exited => return Ok(()),
+            }
+            dead = self.status.changed().await.is_err();
+        }
     }
 
-    pub fn try_wait(mut self) -> Result<(), TryWaitError<A::Error>> {
-        self.status
-            .try_recv()
-            .map(|ok| ok.context(try_wait_error::Exited))
-            .unwrap_or_else(|err| match err {
-                ob::TryError::Empty => try_wait_error::StillAlive.fail(),
-                ob::TryError::Closed => try_wait_error::Panicked.fail(),
-            })
+    pub fn get_error(&self) -> Option<A::Error> {
+        match &*self.status.borrow() {
+            State::Initializing | State::Running | State::Exited => None,
+            State::Failed(e) => Some(e.clone()),
+        }
     }
 }
 
@@ -1415,7 +1397,7 @@ pub mod bg_job {
                 type Error = Infallible;
                 default_span!("alice");
 
-                async fn enter(&mut self, ctl: &mut Control<Self>) {
+                async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
                     Job::new(async {
                         assert_span("double");
                         assert_parent_span("alice");
@@ -1452,6 +1434,8 @@ pub mod bg_job {
                         }
                     })
                     .start(ctl);
+
+                    Ok(())
                 }
             }
 
@@ -1751,7 +1735,6 @@ mod secret_adr {
     #[cfg(test)]
     mod tests {
         use super::super::*;
-        use crate::deferred_span;
 
         #[test]
         fn multi_send_can_send_both_halves() {
@@ -1792,7 +1775,7 @@ mod secret_adr {
             }
 
             let main_stage = Stage::new();
-            let weak_adr = {
+            let mut weak_adr = {
                 let bob_adr = main_stage.summon(Bob { counter: 0 });
                 let multi_adr = bob_adr.secret_multi::<bool, i32>();
 
@@ -1813,7 +1796,7 @@ mod secret_adr {
 
             main_stage.assert_plays_within(10);
             let res = weak_adr
-                .wait()
+                .join()
                 .now_or_never()
                 .expect("this should resolve immediately");
 
@@ -1832,32 +1815,83 @@ mod secret_adr {
 // way. Could be nice to see where the slow path is, or which actors are slow. Could also be used to
 // more easily tweak mail box sizes.
 async fn actor_main<A: Actor>(
-    // NOTE: control is the first argument so it is dropped last
-    mut ctl: Control<A>,
-    mut actor: A,
     rcv: channel::Receiver<ErasedDeliverable<A>>,
+    ctl: Control<A>,
+    actor: A,
     home_adr: Address<A>,
     yield_policy: YieldPolicy,
 ) {
-    debug!("Enter");
-    actor.enter(&mut ctl).instrument(debug_span!("enter")).await;
-    drop(home_adr); // NOTE: to make sure the address is alive during enter
+    // XXX: make sure these are dropped in this specific reverse order. This way, if a thread
+    // observes that the watch in the control has dropped, then it's guaranteed that it sees the
+    // receiver also has dropped, for example. Also, the control needs to be dropped last to make
+    // sure the rune that marks this actor as alive to the stage is dropped as late as possible.
+    let mut ctl = ctl;
+    let mut rcv = pin!(rcv);
+    let mut actor = actor;
 
+    if !try_enter(&mut ctl, &mut actor, home_adr).await {
+        return;
+    }
+
+    main_loop(&mut ctl, rcv.as_mut(), &mut actor, yield_policy).await;
+
+    leave(&mut ctl, actor).await;
+
+    // NOTE: make sure these haven't accidentaly moved. The actor has moved above and will thus get
+    // dropped first, as designed.
+    let _ = (&rcv, &ctl);
+}
+
+async fn try_enter<A: Actor>(
+    ctl: &mut Control<A>,
+    actor: &mut A,
+    // NOTE: to make sure the address is alive during enter
+    _home_adr: Address<A>,
+) -> bool {
+    trace!("Before enter");
+    let enter_res = actor.enter(ctl).instrument(debug_span!("enter")).await;
+    let ok = enter_res.is_ok();
+    debug!(did_error = !ok, "Entered");
+
+    let _: Result<_, _> = ctl
+        .exit_send
+        .send(enter_res.map_or_else(State::Failed, |()| State::Running));
+
+    ok
+}
+
+async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
+    trace!("Before leave");
+    let exit_reason = actor.leave(ctl).instrument(debug_span!("leave")).await;
+    // NOTE: this is logged before all runes and stuff have dropped, but whatever
+    debug!(did_error = exit_reason.is_err(), "Died");
+
+    let _: Result<_, _> = ctl
+        .exit_send
+        .send(exit_reason.map_or_else(State::Failed, |()| State::Exited));
+}
+
+async fn main_loop<A: Actor>(
+    ctl: &mut Control<A>,
+    mut rcv: std::pin::Pin<&mut channel::Receiver<ErasedDeliverable<A>>>,
+    actor: &mut A,
+    yield_policy: YieldPolicy,
+) {
     enum Event<A: Actor> {
         Delivery(ErasedDeliverable<A>),
         LocalDelivery(ErasedLocalDeliverable<A>),
         Eof,
     }
-    let mut mailbox = pin!(
-        rcv.map(Event::Delivery)
-            .chain(stream::once(async { Event::Eof }))
-    );
+    let mut mailbox = rcv
+        .as_mut()
+        .map(Event::Delivery)
+        .chain(stream::once(std::future::ready(Event::Eof)));
     let mut poll_next = stream::PollNext::default();
 
     yield_guard(yield_policy, async |guard| {
         loop {
             let mut events = stream::select_with_strategy(
-                mailbox.as_mut(),
+                &mut mailbox,
                 (&mut ctl.bg_jobs).map(Event::LocalDelivery),
                 |()| poll_next.toggle(),
             );
@@ -1867,10 +1901,7 @@ async fn actor_main<A: Actor>(
                     break;
                 }
                 Some(Event::Eof) => {
-                    actor
-                        .mailbox_eof(&mut ctl)
-                        .instrument(debug_span!("eof"))
-                        .await;
+                    actor.mailbox_eof(ctl).instrument(debug_span!("eof")).await;
                 }
                 Some(Event::Delivery(_) | Event::LocalDelivery(_)) if ctl.drain_mailbox => {
                     trace!("Dropping a delivery");
@@ -1878,12 +1909,12 @@ async fn actor_main<A: Actor>(
                 Some(Event::Delivery(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
-                    delivery.deliver(&mut actor, &mut ctl).await
+                    delivery.deliver(actor, ctl).await
                 }
                 Some(Event::LocalDelivery(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
-                    delivery.deliver(&mut actor, &mut ctl).await
+                    delivery.deliver(actor, ctl).await
                 }
             }
 
@@ -1891,16 +1922,6 @@ async fn actor_main<A: Actor>(
         }
     })
     .await;
-
-    trace!("Before leave");
-    let exit_reason = actor.leave(&mut ctl).instrument(debug_span!("leave")).await;
-    // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!(error = exit_reason.is_err(), "Died");
-
-    ctl.exit_send
-        .take()
-        .expect("is only sent here")
-        .broadcast(exit_reason);
 }
 
 #[derive(Debug, Snafu)]
@@ -2074,15 +2095,14 @@ mod tests {
             let (fut, adr) = stage.actor_builder().no_spawn(DummyActor);
             let mut fut = pin!(fut);
 
-            let weak = adr.downgrade();
+            let mut weak = adr.downgrade();
             drop(adr);
 
             assert_future_ready!(fut);
-            assert!(weak.is_dead());
 
-            let weak2 = weak.clone();
-            assert_future_ready!(pin weak.wait(), x => matches!(x, Ok(())));
-            assert_future_ready!(pin weak2.wait(), x => matches!(x, Ok(())));
+            let mut weak2 = weak.clone();
+            assert_future_ready!(pin weak.join(), x => matches!(x, Ok(())));
+            assert_future_ready!(pin weak2.join(), x => matches!(x, Ok(())));
         }
     }
 
@@ -2120,11 +2140,12 @@ mod tests {
             impl Actor for Bob {
                 type Error = Infallible;
 
-                async fn enter(&mut self, _ctl: &mut Control<Self>) {
+                async fn enter(&mut self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
                     info!("sending to alice");
                     let reply = self.alice.send_receive(5).await.unwrap();
                     let reply = reply.await.unwrap();
                     assert_eq!(reply, 25);
+                    Ok(())
                 }
 
                 default_span!("bob");
