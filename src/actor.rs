@@ -306,6 +306,9 @@ mod builder {
     where
         Self: Sized,
     {
+        // TODO: these things have global defaults, and these overrides when spawning, but should
+        // each actor also be able to set their own defaults? The values given here should override
+        // those of course
         fn mailbox_size(self, mailbox_size: MailboxSize) -> WithMailboxSize<Self> {
             WithMailboxSize {
                 wrapped: self,
@@ -566,6 +569,12 @@ mod adr_core {
 
     pub(super) type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
 
+    // TODO: Do I need to send messages with different priorities? The least destructive way is
+    // probably to create a second channel for high priority messages. Then it could be a good idea
+    // to create a marker trait that messages implement to allow them to be sent on the high
+    // priority channel, this is to prevent that import channel to be accidentaly flooded by low
+    // priority messages. I dont see the harm in sending high prio messages on the low prio
+    // messages, except for that it was probably a mistake?
     pub(super) struct AdrCore<A: Actor> {
         sender: channel::Sender<ErasedDeliverable<A>>,
     }
@@ -899,7 +908,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         loop {
             match *self.status.borrow() {
                 State::Initializing => (),
-                State::Running => return true,
+                State::Running => return !self.is_dead(),
                 State::Failed(_) | State::Exited => return false,
             }
 
