@@ -1,14 +1,14 @@
 use crate::{
     actor::{Actor, NoError, Receive},
-    deferred_span::DeferredSpan,
+    self_hatched,
 };
 
 pub struct Logger;
 
 impl Actor for Logger {
     type Error = NoError;
-    crate::default_span!("logger");
 }
+self_hatched!(Logger, "logger");
 
 impl<T: std::fmt::Debug> Receive<T> for Logger {
     type Retval = ();

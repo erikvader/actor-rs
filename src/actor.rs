@@ -27,7 +27,7 @@ use std::{
     pin::pin,
     rc::{Rc, Weak},
 };
-use tracing::{Instrument, Level, Span, debug, debug_span, span, trace, trace_span};
+use tracing::{Instrument, Level, Span, debug, debug_span, instrument, span, trace, trace_span};
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
@@ -58,7 +58,7 @@ pub type NoError = Infallible;
 #[macro_export]
 macro_rules! default_span {
     ($name:expr) => {
-        fn span(&self) -> DeferredSpan<'_> {
+        fn span(&self) -> $crate::deferred_span::DeferredSpan<'_> {
             $crate::deferred_info_span!($name)
         }
     };
@@ -75,8 +75,6 @@ pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values
     type Error: std::error::Error + Clone; // = NoError
 
-    fn span(&self) -> DeferredSpan<'_>;
-
     #[expect(
         async_fn_in_trait,
         reason = "i don't really understand what this is complaining about"
@@ -92,7 +90,7 @@ pub trait Actor: Sized + 'static {
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
     async fn leave(self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
-        Ok(())
+        ctl.take_result()
     }
 
     #[expect(
@@ -100,17 +98,63 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn mailbox_eof(&mut self, ctl: &mut Control<Self>) {}
+    async fn mailbox_eof(&mut self, ctl: &mut Control<Self>) {
+        trace!("Mailbox EOF");
+    }
+}
+
+// NOTE: same reasoning for inheriting these traits here as in Actor
+pub trait Hatchable: Sized + 'static {
+    type Actor: Actor;
+
+    fn span(&self) -> DeferredSpan<'_>;
+
+    fn yield_policy(&self) -> YieldPolicy {
+        YieldPolicy::default()
+    }
+
+    fn mailbox_size(&self) -> MailboxSize {
+        MailboxSize::default()
+    }
+
+    #[expect(
+        async_fn_in_trait,
+        reason = "i don't really understand what this is complaining about"
+    )]
+    async fn hatch(
+        self,
+        ctl: &mut Control<Self::Actor>,
+    ) -> Result<Self::Actor, <Self::Actor as Actor>::Error>;
+}
+
+#[macro_export]
+macro_rules! self_hatched {
+    // TODO: figure out how to create a lowercase string from the type. Maybe use const-str crate?
+    ($actor:ty, $name:expr) => {
+        impl $crate::actor::Hatchable for $actor {
+            type Actor = Self;
+
+            $crate::default_span!($name);
+
+            async fn hatch(
+                self,
+                _ctl: &mut $crate::actor::Control<Self::Actor>,
+            ) -> std::result::Result<Self::Actor, <Self::Actor as Actor>::Error> {
+                Ok(self)
+            }
+        }
+    };
 }
 
 // NOTE: for static assertions
 struct DummyActor;
 impl Actor for DummyActor {
     type Error = NoError;
-    default_span!("dummy");
 }
+self_hatched!(DummyActor, "dummy");
 
 pub struct Control<A: Actor> {
+    result: Result<(), A::Error>,
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
     // pretty much mean all actors can borrow stack data from the main function.
     // NOTE: weak so the executor can drop itself even if there are actors still alive
@@ -140,6 +184,7 @@ pub struct Control<A: Actor> {
     // and could cause problems, potentially. The real solution is maybe to create a shared future
     // that doesn't require send/sync, or to take the Watch type from tokio or something.
     actor_rune: Rune,
+    // TODO: should be renamed to status send?
     exit_send: ExitSend<A::Error>,
 }
 
@@ -171,7 +216,7 @@ mod id_generator {
 }
 
 use builder::ActorBuilder;
-pub use builder::{IntoActor, IntoActorExt, WithMailboxSize};
+pub use builder::{Spawnable, SpawnableExt, WithMailboxSize};
 mod builder {
     use crate::{
         deferred_span::{DeferredDirectSpan, DeferredSpanMethods},
@@ -180,8 +225,8 @@ mod builder {
 
     use super::*;
 
-    pub(super) struct ActorBuilder<A: Actor> {
-        actor: PhantomData<A>,
+    pub(super) struct ActorBuilder<P: Hatchable> {
+        actor: PhantomData<P>,
         ex: Rc<LocalExecutor<'static>>,
         rune: Rune,
         idgen: IdGenerator,
@@ -190,7 +235,7 @@ mod builder {
         yield_policy: YieldPolicy,
     }
 
-    impl<A: Actor> ActorBuilder<A> {
+    impl<P: Hatchable> ActorBuilder<P> {
         pub fn new(
             ex: Rc<LocalExecutor<'static>>,
             rune: Rune,
@@ -208,14 +253,18 @@ mod builder {
             }
         }
 
-        fn create_channel(&self) -> (AdrCore<A>, AdrRcv<A>) {
+        fn create_channel(&self) -> (AdrCore<P::Actor>, AdrRcv<P::Actor>) {
             match self.mailbox_size {
                 MailboxSize::Unbounded => AdrCore::unbounded(),
                 MailboxSize::Bounded(size) => AdrCore::bounded(size.get()),
             }
         }
 
-        fn create_exit_channel() -> (ExitSend<A::Error>, ExitRecv<A::Error>) {
+        #[expect(clippy::type_complexity, reason = "whatever")]
+        fn create_exit_channel() -> (
+            ExitSend<<P::Actor as Actor>::Error>,
+            ExitRecv<<P::Actor as Actor>::Error>,
+        ) {
             async_watch::channel(State::default())
         }
 
@@ -232,23 +281,23 @@ mod builder {
 
         fn raw(
             mut self,
-            mut into_actor: impl IntoActor<A>,
-        ) -> (impl Future<Output = ()> + 'static, Address<A>) {
-            into_actor.adjust_builder(&mut self);
+            mut spawnable: impl Spawnable<P>,
+        ) -> (impl Future<Output = ()> + 'static, Address<P::Actor>) {
+            spawnable.adjust_builder(&mut self);
 
             let (snd, rcv) = self.create_channel();
             let (exit_snd, exit_rcv) = Self::create_exit_channel();
             let id = self.idgen.generate();
-            debug!(id, "type" = type_name::<A>(), "Spawn new actor");
+            debug!(id, "type" = type_name::<P::Actor>(), "Spawn new actor");
 
             // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
             // sender from another address.
             let home = unsafe { Address::new(snd, exit_rcv) };
 
-            let sig_guard = into_actor.install_signals(&home);
+            let sig_guard = spawnable.install_signals(&home);
 
-            let actor = into_actor.into_actor();
-            let span = actor
+            let egg = spawnable.into_hatchable();
+            let span = egg
                 .span()
                 .create_or(Self::create_root_span(id).create_or(self.thread_root_span.clone()));
 
@@ -267,16 +316,19 @@ mod builder {
             // cuz it gets entered twice, but i don't feel like that special case is worth worrying
             // about. This is of course only the case if the future is spawned as a task on an executor
             // that is blocked on its event loop where thread_root_span is active.
-            let fut = actor_main(rcv, ctl, actor, home.clone(), self.yield_policy).instrument(span);
+            let fut = actor_main(rcv, ctl, egg, home.clone(), self.yield_policy).instrument(span);
             (fut, home)
         }
 
         #[cfg(test)]
-        pub fn no_spawn(self, actor: impl IntoActor<A>) -> (impl Future<Output = ()>, Address<A>) {
+        pub fn no_spawn(
+            self,
+            actor: impl Spawnable<P>,
+        ) -> (impl Future<Output = ()>, Address<P::Actor>) {
             self.raw(actor)
         }
 
-        pub fn spawn(self, actor: impl IntoActor<A>) -> Address<A> {
+        pub fn spawn(self, actor: impl Spawnable<P>) -> Address<P::Actor> {
             let ex = Rc::clone(&self.ex);
             let (fut, adr) = self.raw(actor);
             ex.spawn(fut).detach();
@@ -285,30 +337,43 @@ mod builder {
     }
 
     #[expect(private_bounds, reason = "The builder should be private")]
-    pub trait IntoActor<A: Actor>: IntoActorPriv<A> {}
-    impl<A: Actor, I: IntoActorPriv<A>> IntoActor<A> for I {}
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` is not spawnable",
+        label = "this guy right here",
+        note = "either, create a dedicated `Hatchable` type and spawn that instead, or use the `self_hatched!` macro"
+    )]
+    pub trait Spawnable<P: Hatchable>: SpawnablePriv<P> {}
+    #[diagnostic::do_not_recommend]
+    impl<P: Hatchable, I: SpawnablePriv<P>> Spawnable<P> for I {}
 
-    trait IntoActorPriv<A: Actor> {
-        fn adjust_builder(&mut self, _builder: &mut ActorBuilder<A>) {}
-        fn install_signals(&mut self, _adr: &Address<A>) -> Option<ActorGuard> {
-            None
-        }
-        fn into_actor(self) -> A;
+    trait SpawnablePriv<P: Hatchable> {
+        fn adjust_builder(&mut self, _builder: &mut ActorBuilder<P>);
+        fn install_signals(&mut self, _adr: &Address<P::Actor>) -> Option<ActorGuard>;
+        fn into_hatchable(self) -> P;
     }
 
-    impl<A: Actor> IntoActorPriv<A> for A {
-        fn into_actor(self) -> A {
+    impl<P: Hatchable> SpawnablePriv<P> for P {
+        fn into_hatchable(self) -> P {
             self
         }
+
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
+            builder.mailbox_size = Hatchable::mailbox_size(self);
+            builder.yield_policy = Hatchable::yield_policy(self);
+        }
+
+        fn install_signals(
+            &mut self,
+            _adr: &Address<<P as Hatchable>::Actor>,
+        ) -> Option<ActorGuard> {
+            None
+        }
     }
 
-    pub trait IntoActorExt<A: Actor>: IntoActor<A>
+    pub trait SpawnableExt<P: Hatchable>: Spawnable<P>
     where
         Self: Sized,
     {
-        // TODO: these things have global defaults, and these overrides when spawning, but should
-        // each actor also be able to set their own defaults? The values given here should override
-        // those of course
         fn mailbox_size(self, mailbox_size: MailboxSize) -> WithMailboxSize<Self> {
             WithMailboxSize {
                 wrapped: self,
@@ -330,20 +395,26 @@ mod builder {
             }
         }
     }
-    impl<A: Actor, I: IntoActorPriv<A>> IntoActorExt<A> for I {}
+    #[diagnostic::do_not_recommend]
+    impl<P: Hatchable, I: SpawnablePriv<P>> SpawnableExt<P> for I {}
 
     pub struct WithMailboxSize<W> {
         wrapped: W,
         mailbox_size: MailboxSize,
     }
 
-    impl<A: Actor, W: IntoActorPriv<A>> IntoActorPriv<A> for WithMailboxSize<W> {
-        fn into_actor(self) -> A {
-            self.wrapped.into_actor()
+    impl<P: Hatchable, W: SpawnablePriv<P>> SpawnablePriv<P> for WithMailboxSize<W> {
+        fn into_hatchable(self) -> P {
+            self.wrapped.into_hatchable()
         }
 
-        fn adjust_builder(&mut self, builder: &mut ActorBuilder<A>) {
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
+            self.wrapped.adjust_builder(builder);
             builder.mailbox_size = self.mailbox_size;
+        }
+
+        fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
+            self.wrapped.install_signals(adr)
         }
     }
 
@@ -352,13 +423,18 @@ mod builder {
         policy: YieldPolicy,
     }
 
-    impl<A: Actor, W: IntoActorPriv<A>> IntoActorPriv<A> for WithYieldPolicy<W> {
-        fn into_actor(self) -> A {
-            self.wrapped.into_actor()
+    impl<P: Hatchable, W: SpawnablePriv<P>> SpawnablePriv<P> for WithYieldPolicy<W> {
+        fn into_hatchable(self) -> P {
+            self.wrapped.into_hatchable()
         }
 
-        fn adjust_builder(&mut self, builder: &mut ActorBuilder<A>) {
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
+            self.wrapped.adjust_builder(builder);
             builder.yield_policy = self.policy;
+        }
+
+        fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
+            self.wrapped.install_signals(adr)
         }
     }
 
@@ -367,17 +443,22 @@ mod builder {
         registry: R,
     }
 
-    impl<A, W, R> IntoActorPriv<A> for WithInterruptable<W, R>
+    impl<P, W, R> SpawnablePriv<P> for WithInterruptable<W, R>
     where
-        A: Receive<Interrupt>,
-        W: IntoActorPriv<A>,
+        P: Hatchable,
+        P::Actor: Receive<Interrupt>,
+        W: SpawnablePriv<P>,
         R: AsRef<SigRegistry>,
     {
-        fn into_actor(self) -> A {
-            self.wrapped.into_actor()
+        fn into_hatchable(self) -> P {
+            self.wrapped.into_hatchable()
         }
 
-        fn install_signals(&mut self, adr: &Address<A>) -> Option<ActorGuard> {
+        fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
+            assert!(
+                self.wrapped.install_signals(adr).is_none(),
+                "Trying to install two interrupt handlers on the same actor, must be a mistake?"
+            );
             let secret = adr.secret::<Interrupt>();
             let guard = self.registry.as_ref().register_actor(secret);
             if guard.is_interrupted {
@@ -390,13 +471,17 @@ mod builder {
             }
             Some(guard)
         }
+
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
+            self.wrapped.adjust_builder(builder);
+        }
     }
 }
 
 impl<A: Actor> Control<A> {
-    pub fn summon<A2>(&self, actor: impl IntoActor<A2>) -> Address<A2>
+    pub fn summon<P2>(&self, actor: impl Spawnable<P2>) -> Address<P2::Actor>
     where
-        A2: Actor,
+        P2: Hatchable,
     {
         let ex = self
             .ex
@@ -437,6 +522,7 @@ impl<A: Actor> Control<A> {
             actor_span,
             exit_send,
             _signal_guard: signal_guard,
+            result: Ok(()),
         }
     }
 
@@ -464,6 +550,18 @@ impl<A: Actor> Control<A> {
 
     fn add_bg_job(&mut self, job: LocalBoxFuture<'static, ErasedLocalDeliverable<A>>) {
         self.bg_jobs.push(job);
+    }
+
+    pub fn take_result(&mut self) -> Result<(), A::Error> {
+        std::mem::replace(&mut self.result, Ok(()))
+    }
+
+    pub fn set_result(&mut self, result: Result<(), A::Error>) -> Option<A::Error> {
+        std::mem::replace(&mut self.result, result).err()
+    }
+
+    pub fn set_error(&mut self, error: A::Error) -> Option<A::Error> {
+        self.set_result(Err(error))
     }
 }
 
@@ -1259,6 +1357,9 @@ pub mod bg_job {
         }
     }
 
+    // TODO: it's very annoying/difficult to pass a job around in different function calls and such.
+    // Rust doesn't have auto for return values, so an impl Trait is the closest alternative. Create
+    // something like that?
     #[must_use = "the job must be started to do anything"]
     pub struct Job<'a, F, S = Skip> {
         future: F,
@@ -1402,9 +1503,9 @@ pub mod bg_job {
             struct Alice {
                 snd: SecretAddress<i32>,
             }
+            self_hatched!(Alice, "alice");
             impl Actor for Alice {
                 type Error = Infallible;
-                default_span!("alice");
 
                 async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
                     Job::new(async {
@@ -1756,9 +1857,9 @@ mod secret_adr {
             struct Bob {
                 counter: i32,
             }
+            self_hatched!(Bob, "bob");
             impl Actor for Bob {
                 type Error = Counter;
-                default_span!("bob");
 
                 async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
                     Err(Counter {
@@ -1823,11 +1924,11 @@ mod secret_adr {
 // TODO: use tracing and/or metrics crate to collect how full all mailboxes are and present in some
 // way. Could be nice to see where the slow path is, or which actors are slow. Could also be used to
 // more easily tweak mail box sizes.
-async fn actor_main<A: Actor>(
-    rcv: channel::Receiver<ErasedDeliverable<A>>,
-    ctl: Control<A>,
-    actor: A,
-    home_adr: Address<A>,
+async fn actor_main<P: Hatchable>(
+    rcv: channel::Receiver<ErasedDeliverable<P::Actor>>,
+    ctl: Control<P::Actor>,
+    egg: P,
+    home_adr: Address<P::Actor>,
     yield_policy: YieldPolicy,
 ) {
     // XXX: make sure these are dropped in this specific reverse order. This way, if a thread
@@ -1836,7 +1937,10 @@ async fn actor_main<A: Actor>(
     // sure the rune that marks this actor as alive to the stage is dropped as late as possible.
     let mut ctl = ctl;
     let mut rcv = pin!(rcv);
-    let mut actor = actor;
+
+    let Some(mut actor) = try_hatch(&mut ctl, egg, &home_adr).await else {
+        return;
+    };
 
     if !try_enter(&mut ctl, &mut actor, home_adr).await {
         return;
@@ -1851,16 +1955,37 @@ async fn actor_main<A: Actor>(
     let _ = (&rcv, &ctl);
 }
 
+#[instrument(skip_all, name = "hatch")]
+async fn try_hatch<P: Hatchable>(
+    ctl: &mut Control<P::Actor>,
+    egg: P,
+    // NOTE: to make sure the address is alive during hatch
+    _home_adr: &Address<P::Actor>,
+) -> Option<P::Actor> {
+    trace!("Before");
+    let hatch_res = egg.hatch(ctl).await;
+    debug!(error = hatch_res.is_err(), "After");
+
+    match hatch_res {
+        Ok(actor) => Some(actor),
+        Err(err) => {
+            let _: Result<_, _> = ctl.exit_send.send(State::Failed(err));
+            None
+        }
+    }
+}
+
+#[instrument(skip_all, name = "enter")]
 async fn try_enter<A: Actor>(
     ctl: &mut Control<A>,
     actor: &mut A,
     // NOTE: to make sure the address is alive during enter
     _home_adr: Address<A>,
 ) -> bool {
-    trace!("Before enter");
-    let enter_res = actor.enter(ctl).instrument(debug_span!("enter")).await;
+    trace!("Before");
+    let enter_res = actor.enter(ctl).await;
     let ok = enter_res.is_ok();
-    debug!(did_error = !ok, "Entered");
+    debug!(error = !ok, "After");
 
     let _: Result<_, _> = ctl
         .exit_send
@@ -1869,11 +1994,12 @@ async fn try_enter<A: Actor>(
     ok
 }
 
+#[instrument(skip_all, name = "leave")]
 async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
-    trace!("Before leave");
-    let exit_reason = actor.leave(ctl).instrument(debug_span!("leave")).await;
+    trace!("Before");
+    let exit_reason = actor.leave(ctl).await;
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!(did_error = exit_reason.is_err(), "Died");
+    debug!(error = exit_reason.is_err(), "After");
 
     let _: Result<_, _> = ctl
         .exit_send
@@ -1887,13 +2013,13 @@ async fn main_loop<A: Actor>(
     yield_policy: YieldPolicy,
 ) {
     enum Event<A: Actor> {
-        Delivery(ErasedDeliverable<A>),
-        LocalDelivery(ErasedLocalDeliverable<A>),
+        Msg(ErasedDeliverable<A>),
+        BgJob(ErasedLocalDeliverable<A>),
         Eof,
     }
     let mut mailbox = rcv
         .as_mut()
-        .map(Event::Delivery)
+        .map(Event::Msg)
         .chain(stream::once(std::future::ready(Event::Eof)));
     let mut poll_next = stream::PollNext::default();
 
@@ -1901,7 +2027,7 @@ async fn main_loop<A: Actor>(
         loop {
             let mut events = stream::select_with_strategy(
                 &mut mailbox,
-                (&mut ctl.bg_jobs).map(Event::LocalDelivery),
+                (&mut ctl.bg_jobs).map(Event::BgJob),
                 |()| poll_next.toggle(),
             );
             match events.next().await {
@@ -1912,15 +2038,16 @@ async fn main_loop<A: Actor>(
                 Some(Event::Eof) => {
                     actor.mailbox_eof(ctl).instrument(debug_span!("eof")).await;
                 }
-                Some(Event::Delivery(_) | Event::LocalDelivery(_)) if ctl.drain_mailbox => {
-                    trace!("Dropping a delivery");
+                Some(Event::Msg(_)) if ctl.drain_mailbox => {
+                    // TODO: print the type of the message in trace level
+                    trace!("Dropping a message");
                 }
-                Some(Event::Delivery(delivery)) => {
+                Some(Event::Msg(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
                     delivery.deliver(actor, ctl).await
                 }
-                Some(Event::LocalDelivery(delivery)) => {
+                Some(Event::BgJob(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
                     delivery.deliver(actor, ctl).await
@@ -1990,7 +2117,7 @@ impl Stage {
         }
     }
 
-    fn actor_builder<A: Actor>(&self) -> ActorBuilder<A> {
+    fn actor_builder<P: Hatchable>(&self) -> ActorBuilder<P> {
         ActorBuilder::new(
             Rc::clone(&self.ex),
             self.actor_rune.clone(),
@@ -1999,7 +2126,7 @@ impl Stage {
         )
     }
 
-    pub fn summon<A: Actor>(&self, actor: impl IntoActor<A>) -> Address<A> {
+    pub fn summon<P: Hatchable>(&self, actor: impl Spawnable<P>) -> Address<P::Actor> {
         self.actor_builder().spawn(actor)
     }
 
@@ -2130,10 +2257,9 @@ mod tests {
         #[test]
         fn basic_send() {
             struct Alice;
+            self_hatched!(Alice, "alice");
             impl Actor for Alice {
                 type Error = Infallible;
-
-                default_span!("alice");
             }
             impl Receive<i32> for Alice {
                 type Retval = i32;
@@ -2146,6 +2272,7 @@ mod tests {
             struct Bob {
                 alice: RemoteAddress<Alice>,
             }
+            self_hatched!(Bob, "bob");
             impl Actor for Bob {
                 type Error = Infallible;
 
@@ -2156,8 +2283,6 @@ mod tests {
                     assert_eq!(reply, 25);
                     Ok(())
                 }
-
-                default_span!("bob");
             }
 
             let _span = thread_info_span().entered();
@@ -2183,10 +2308,9 @@ mod tests {
         #[test]
         fn sendness_should_not_matter_when_not_used() {
             struct LocalAlice;
+            self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Error = NotSend;
-
-                default_span!("alice");
             }
             impl Receive<i32> for LocalAlice {
                 type Retval = NotSend;
@@ -2222,10 +2346,9 @@ mod tests {
             struct LocalAlice {
                 _inner: NotSend,
             }
+            self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Error = NoError;
-
-                default_span!("alice");
             }
             assert_not_impl_any!(LocalAlice: Send);
             assert_impl_all!(RemoteAddress<LocalAlice>: Send);
@@ -2235,10 +2358,9 @@ mod tests {
         #[test]
         fn sendness_of_the_error_should_matter() {
             struct LocalAlice;
+            self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Error = NotSend;
-
-                default_span!("alice");
             }
             assert_impl_all!(LocalAlice: Send);
             assert_not_impl_any!(RemoteAddress<LocalAlice>: Send);

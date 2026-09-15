@@ -156,7 +156,7 @@ impl Signals {
             move || {
                 debug!("Started");
 
-                let mut largest: Option<Signal> = None;
+                let mut meanest: Option<Signal> = None;
 
                 for raw_signal in signals.forever() {
                     let signal = Signal::try_from(raw_signal)
@@ -164,7 +164,7 @@ impl Signals {
 
                     let _inner_span = info_span!("handling", ?signal).entered();
 
-                    largest = std::cmp::max(largest, Some(signal));
+                    meanest = std::cmp::max(meanest, Some(signal));
 
                     warn!("Received {signal:?}"); // TODO: impl display for the signal type
 
@@ -183,14 +183,14 @@ impl Signals {
                             }
                         }
                         State::InterruptedMore => {
-                            let signal = largest.expect("this will be set at this point");
+                            let signal = meanest.expect("this will be set at this point");
                             signal.execute_default_action();
                         }
                     }
                 }
 
-                debug!(?largest, "Exited");
-                largest
+                debug!(?meanest, "Exited");
+                meanest
             }
         });
 

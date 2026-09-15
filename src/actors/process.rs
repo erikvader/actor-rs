@@ -191,12 +191,13 @@ where
 {
     type Error = Error;
 
-    fn span(&self) -> DeferredSpan<'_> {
-        crate::deferred_span_or!(
-            crate::deferred_direct_span!(tracing::Level::DEBUG, "process", exe = self.exe, args = ?self.args);
-            crate::deferred_direct_span!(tracing::Level::INFO, "process", exe = self.exe);
-        )
-    }
+    // TODO: move to the correct place
+    // fn span(&self) -> DeferredSpan<'_> {
+    //     crate::deferred_span_or!(
+    //         crate::deferred_direct_span!(tracing::Level::DEBUG, "process", exe = self.exe, args = ?self.args);
+    //         crate::deferred_direct_span!(tracing::Level::INFO, "process", exe = self.exe);
+    //     )
+    // }
 
     // TODO: should this actor run the async_process::driver? The stage?
     async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {

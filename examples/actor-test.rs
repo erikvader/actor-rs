@@ -1,5 +1,5 @@
 use actor_rs::{
-    actor::{IntoActorExt, Stage},
+    actor::{SpawnableExt, Stage},
     actors,
     signals::Signals,
     whatever::*,
@@ -60,7 +60,7 @@ fn inner_main(signals: &Signals) -> Result<(), Whatever> {
     let stdin_adr = {
         let printer_adr = stage.summon(actors::logger::Logger);
         stage
-            .summon(actors::line_reader::stdin(printer_adr.secret()).interruptable(signals))
+            .summon(actors::stdin::Egg::new(printer_adr.secret()).interruptable(signals))
             .downgrade()
     };
 

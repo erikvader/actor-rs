@@ -1,6 +1,6 @@
-pub mod line_reader;
 pub mod logger;
 pub mod process;
+pub mod stdin;
 
 // TODO: create an actor that multiplexes, or load balances. It should take another actor that is
 // cloneable and spawn it a couple of times. It should then keep track of all of their addresses and
