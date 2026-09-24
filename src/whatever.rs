@@ -108,3 +108,59 @@ impl Termination for Report {
         }
     }
 }
+
+// TODO: this should have a prettier printing that can print source groups in a non-ambigous way.
+// Maybe delimit with tags or something? I most likely need to skip using the provided snafu report
+// formatting and use my own. This should also work in conjunction with Whatever.
+#[derive(Debug, Clone)]
+pub struct Group<E> {
+    group: Vec<E>,
+}
+
+impl<E> Group<E> {
+    pub fn new(errors: Vec<E>) -> Option<Self> {
+        if errors.is_empty() {
+            return None;
+        }
+        Some(Self { group: errors })
+    }
+}
+
+impl<E> From<E> for Group<E> {
+    fn from(value: E) -> Self {
+        Self::new(vec![value]).expect("it is non-empty")
+    }
+}
+
+impl<E> fmt::Display for Group<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_assert!(!self.group.is_empty());
+        if self.group.len() == 1 {
+            writeln!(f, "{}", self.group.first().unwrap())?;
+        } else {
+            let mut iter = self.group.iter();
+            write!(f, "Group: '{}'", iter.next().unwrap())?;
+            for i in iter {
+                write!(f, ", '{}'", i)?;
+            }
+            writeln!(f)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<E> Error for Group<E>
+where
+    E: Error,
+{
+    // NOTE: provided as a backup, better than nothing. Should use a custom printer to print all
+    // sources.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        debug_assert!(!self.group.is_empty());
+        self.group.first().expect("the group is non-empty").source()
+    }
+}
