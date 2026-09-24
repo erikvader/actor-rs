@@ -6,7 +6,7 @@ use crate::{
 pub struct Logger;
 
 impl Actor for Logger {
-    type Error = NoError;
+    type Corpse = NoError;
 }
 self_hatched!(Logger, "logger");
 

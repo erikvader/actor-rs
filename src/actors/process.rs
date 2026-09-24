@@ -1,15 +1,12 @@
-use std::{io, marker::PhantomData, pin::pin, process::Stdio, sync::Arc};
+use std::{io, process::Stdio, sync::Arc};
 
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use futures_util::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader,
-};
+use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader};
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    actor::{Actor, Control, Receive, SecretAddress, bg_job::Job},
-    deferred_info_span, deferred_span,
-    deferred_span::DeferredSpan,
+    actor::{Actor, Control, OneError, Receive, SecretAddress, bg_job::Job},
+    actor_error, deferred_info_span,
     kill_switch::Bomb,
 };
 
@@ -189,7 +186,7 @@ where
     O: Output<ChildStdout> + 'static,
     E: Output<ChildStderr> + 'static,
 {
-    type Error = Error;
+    type Corpse = OneError<Error>;
 
     // TODO: move to the correct place
     // fn span(&self) -> DeferredSpan<'_> {
@@ -200,7 +197,7 @@ where
     // }
 
     // TODO: should this actor run the async_process::driver? The stage?
-    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
         let output = self.output.take().expect("will be here");
         let errput = self.errput.take().expect("will be here");
 
@@ -259,9 +256,10 @@ where
         Ok(())
     }
 
-    async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
-        self.result
-    }
+    // TODO:
+    // async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
+    //     self.result
+    // }
 }
 
 impl<O, E> Receive<InputLine> for Process<Piped, O, E>

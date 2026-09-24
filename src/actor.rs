@@ -21,7 +21,6 @@ use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
     any::type_name,
-    convert::Infallible,
     marker::PhantomData,
     num::NonZeroUsize,
     pin::pin,
@@ -53,14 +52,19 @@ impl MailboxSize {
     }
 }
 
-pub type NoError = Infallible;
-
 #[macro_export]
 macro_rules! default_span {
     ($name:expr) => {
         fn span(&self) -> $crate::deferred_span::DeferredSpan<'_> {
             $crate::deferred_info_span!($name)
         }
+    };
+}
+
+#[macro_export]
+macro_rules! actor_error {
+    ($corp:ty) => {
+        <<$corp as $crate::actor::Actor>::Corpse as $crate::actor::Corpse>::Error
     };
 }
 
@@ -73,14 +77,14 @@ macro_rules! default_span {
 )]
 pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values
-    type Error: std::error::Error + Clone; // = NoError
+    type Corpse: Corpse<Error: std::error::Error + Clone> + Default;
 
     #[expect(
         async_fn_in_trait,
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
         Ok(())
     }
 
@@ -89,9 +93,7 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn leave(self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
-        ctl.take_result()
-    }
+    async fn leave(self, ctl: &mut Control<Self>) {}
 
     #[expect(
         async_fn_in_trait,
@@ -124,7 +126,7 @@ pub trait Hatchable: Sized + 'static {
     async fn hatch(
         self,
         ctl: &mut Control<Self::Actor>,
-    ) -> Result<Self::Actor, <Self::Actor as Actor>::Error>;
+    ) -> Result<Self::Actor, actor_error!(Self::Actor)>;
 }
 
 #[macro_export]
@@ -139,7 +141,7 @@ macro_rules! self_hatched {
             async fn hatch(
                 self,
                 _ctl: &mut $crate::actor::Control<Self::Actor>,
-            ) -> std::result::Result<Self::Actor, <Self::Actor as Actor>::Error> {
+            ) -> std::result::Result<Self::Actor, $crate::actor_error!(Self::Actor)> {
                 Ok(self)
             }
         }
@@ -149,12 +151,12 @@ macro_rules! self_hatched {
 // NOTE: for static assertions
 struct DummyActor;
 impl Actor for DummyActor {
-    type Error = NoError;
+    type Corpse = NoError;
 }
 self_hatched!(DummyActor, "dummy");
 
 pub struct Control<A: Actor> {
-    result: Result<(), A::Error>,
+    corpse: A::Corpse,
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
     // pretty much mean all actors can borrow stack data from the main function.
     // NOTE: weak so the executor can drop itself even if there are actors still alive
@@ -185,7 +187,7 @@ pub struct Control<A: Actor> {
     // that doesn't require send/sync, or to take the Watch type from tokio or something.
     actor_rune: Rune,
     // TODO: should be renamed to status send?
-    exit_send: ExitSend<A::Error>,
+    exit_send: ExitSend<actor_error!(A)>,
 }
 
 mod id_generator {
@@ -262,8 +264,8 @@ mod builder {
 
         #[expect(clippy::type_complexity, reason = "whatever")]
         fn create_exit_channel() -> (
-            ExitSend<<P::Actor as Actor>::Error>,
-            ExitRecv<<P::Actor as Actor>::Error>,
+            ExitSend<actor_error!(P::Actor)>,
+            ExitRecv<actor_error!(P::Actor)>,
         ) {
             async_watch::channel(State::default())
         }
@@ -508,7 +510,7 @@ impl<A: Actor> Control<A> {
         idgen: IdGenerator,
         thread_root_span: Span,
         actor_span: Span,
-        exit_send: ExitSend<A::Error>,
+        exit_send: ExitSend<actor_error!(A)>,
         signal_guard: Option<ActorGuard>,
     ) -> Self {
         Self {
@@ -522,7 +524,7 @@ impl<A: Actor> Control<A> {
             actor_span,
             exit_send,
             _signal_guard: signal_guard,
-            result: Ok(()),
+            corpse: Default::default(),
         }
     }
 
@@ -552,16 +554,130 @@ impl<A: Actor> Control<A> {
         self.bg_jobs.push(job);
     }
 
-    pub fn take_result(&mut self) -> Result<(), A::Error> {
-        std::mem::replace(&mut self.result, Ok(()))
+    pub fn corpse_mut(&mut self) -> &mut A::Corpse {
+        &mut self.corpse
     }
 
-    pub fn set_result(&mut self, result: Result<(), A::Error>) -> Option<A::Error> {
-        std::mem::replace(&mut self.result, result).err()
+    fn take_corpse(&mut self) -> A::Corpse {
+        std::mem::take(&mut self.corpse)
+    }
+}
+
+pub use corpse::{Corpse, MultiError, NoError, OneArcError, OneError};
+mod corpse {
+    use std::{convert::Infallible, sync::Arc};
+
+    use crate::whatever::Group;
+
+    pub trait Corpse {
+        type Error;
+        fn to_error(self) -> Option<Self::Error>;
     }
 
-    pub fn set_error(&mut self, error: A::Error) -> Option<A::Error> {
-        self.set_result(Err(error))
+    pub struct OneError<E> {
+        inner: Option<E>,
+    }
+
+    impl<E> Default for OneError<E> {
+        fn default() -> Self {
+            Self { inner: None }
+        }
+    }
+
+    impl<E> Corpse for OneError<E> {
+        type Error = E;
+
+        fn to_error(self) -> Option<Self::Error> {
+            self.inner
+        }
+    }
+
+    impl<E> OneError<E> {
+        pub fn replace(&mut self, error: E) -> Option<E> {
+            self.inner.replace(error)
+        }
+
+        pub fn replace_result(&mut self, result: Result<(), E>) -> Option<E> {
+            match result {
+                Ok(()) => None,
+                Err(e) => self.replace(e),
+            }
+        }
+    }
+
+    pub struct OneArcError<E> {
+        inner: Option<Arc<E>>,
+    }
+
+    impl<E> Default for OneArcError<E> {
+        fn default() -> Self {
+            Self { inner: None }
+        }
+    }
+
+    impl<E> Corpse for OneArcError<E> {
+        type Error = Arc<E>;
+
+        fn to_error(self) -> Option<Self::Error> {
+            self.inner
+        }
+    }
+
+    impl<E> OneArcError<E> {
+        pub fn replace(&mut self, error: E) -> Option<E> {
+            if let Some(prev) = self
+                .inner
+                .as_mut()
+                .map(|x| Arc::get_mut(x).expect("is only one"))
+            {
+                Some(std::mem::replace(prev, error))
+            } else {
+                self.inner = Some(Arc::new(error));
+                None
+            }
+        }
+
+        pub fn replace_result(&mut self, result: Result<(), E>) -> Option<E> {
+            match result {
+                Ok(()) => None,
+                Err(e) => self.replace(e),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub struct NoError;
+
+    impl Corpse for NoError {
+        type Error = Infallible;
+
+        fn to_error(self) -> Option<Self::Error> {
+            None
+        }
+    }
+
+    pub struct MultiError<E> {
+        errors: Vec<E>,
+    }
+
+    impl<E> Default for MultiError<E> {
+        fn default() -> Self {
+            Self { errors: Vec::new() }
+        }
+    }
+
+    impl<E> Corpse for MultiError<E> {
+        type Error = Group<E>;
+
+        fn to_error(self) -> Option<Self::Error> {
+            Group::new(self.errors)
+        }
+    }
+
+    impl<E> MultiError<E> {
+        pub fn push(&mut self, error: E) {
+            self.errors.push(error);
+        }
     }
 }
 
@@ -908,7 +1024,7 @@ mod adr_core {
 
 pub struct GenericAddress<A: Actor, S: Scope> {
     core: AdrCore<A>,
-    status: ExitRecv<A::Error>,
+    status: ExitRecv<actor_error!(A)>,
     _scope: PhantomData<S>,
 }
 
@@ -920,7 +1036,7 @@ assert_impl_all!(RemoteAddress<DummyActor>: Send, Sync);
 
 pub struct GenericWeakAddress<A: Actor, S: Scope> {
     core: WeakAdrCore<A>,
-    status: ExitRecv<A::Error>,
+    status: ExitRecv<actor_error!(A)>,
     _scope: PhantomData<S>,
 }
 
@@ -951,7 +1067,7 @@ impl<A: Actor, S: Scope> Clone for GenericWeakAddress<A, S> {
 impl<A: Actor, S: Scope> GenericAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(core: AdrCore<A>, status: ExitRecv<A::Error>) -> Self {
+    unsafe fn new(core: AdrCore<A>, status: ExitRecv<actor_error!(A)>) -> Self {
         Self {
             core,
             status,
@@ -985,13 +1101,13 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 
     /// Wait for the actor to die.
-    pub async fn join(self) -> Result<(), WaitError<A::Error>> {
+    pub async fn join(self) -> Result<(), WaitError<actor_error!(A)>> {
         let mut weak = self.downgrade();
         drop(self);
         weak.join().await
     }
 
-    pub fn try_join(&self) -> Result<(), TryWaitError<A::Error>> {
+    pub fn try_join(&self) -> Result<(), TryWaitError<actor_error!(A)>> {
         let dead = self.core.is_dead();
         match &*self.status.borrow() {
             // NOTE: this panic detection is not perfect, see the note on the normal join
@@ -1021,7 +1137,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
 impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // SAFETY: this is unsafe because it's not safe to create a local address from a remote one,
     // which would enable !Send data change threads.
-    unsafe fn new(core: WeakAdrCore<A>, status: ExitRecv<A::Error>) -> Self {
+    unsafe fn new(core: WeakAdrCore<A>, status: ExitRecv<actor_error!(A)>) -> Self {
         Self {
             core,
             status,
@@ -1052,7 +1168,7 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // addresses.
 
     /// Wait for the actor to die.
-    pub async fn join(&mut self) -> Result<(), WaitError<A::Error>> {
+    pub async fn join(&mut self) -> Result<(), WaitError<actor_error!(A)>> {
         let mut dead = false;
         loop {
             match &*self.status.borrow() {
@@ -1069,7 +1185,7 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
         }
     }
 
-    pub fn get_error(&self) -> Option<A::Error> {
+    pub fn get_error(&self) -> Option<actor_error!(A)> {
         match &*self.status.borrow() {
             State::Initializing | State::Running | State::Exited => None,
             State::Failed(e) => Some(e.clone()),
@@ -1505,9 +1621,12 @@ pub mod bg_job {
             }
             self_hatched!(Alice, "alice");
             impl Actor for Alice {
-                type Error = Infallible;
+                type Corpse = NoError;
 
-                async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+                async fn enter(
+                    &mut self,
+                    ctl: &mut Control<Self>,
+                ) -> Result<(), actor_error!(Self)> {
                     Job::new(async {
                         assert_span("double");
                         assert_parent_span("alice");
@@ -1859,12 +1978,12 @@ mod secret_adr {
             }
             self_hatched!(Bob, "bob");
             impl Actor for Bob {
-                type Error = Counter;
+                type Corpse = OneError<Counter>;
 
-                async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
-                    Err(Counter {
+                async fn leave(self, ctl: &mut Control<Self>) {
+                    ctl.corpse_mut().replace(Counter {
                         count: self.counter,
-                    })
+                    });
                 }
             }
 
@@ -1934,9 +2053,12 @@ async fn actor_main<P: Hatchable>(
     // XXX: make sure these are dropped in this specific reverse order. This way, if a thread
     // observes that the watch in the control has dropped, then it's guaranteed that it sees the
     // receiver also has dropped, for example. Also, the control needs to be dropped last to make
-    // sure the rune that marks this actor as alive to the stage is dropped as late as possible.
+    // sure the rune that marks this actor as alive to the stage is dropped as late as possible. The
+    // actor/egg should be dropped first of these so the actor drop itself is visible to other
+    // thread when they see that it is dead.
     let mut ctl = ctl;
     let mut rcv = pin!(rcv);
+    let egg = egg;
 
     let Some(mut actor) = try_hatch(&mut ctl, egg, &home_adr).await else {
         return;
@@ -1950,8 +2072,12 @@ async fn actor_main<P: Hatchable>(
 
     leave(&mut ctl, actor).await;
 
-    // NOTE: make sure these haven't accidentaly moved. The actor has moved above and will thus get
-    // dropped first, as designed.
+    // XXX: make sure these haven't accidentaly moved. The actor has moved above and will thus get
+    // dropped first, as designed. These two also must always be dropped *after* the last state
+    // publish, since the Addresses assume that a panic has occurred if it sees these as dropped
+    // while the state says the actor is running. It also shouldn't matter if a thread observes
+    // these in the middle of them being dropped, i have tried to make the addresses resilient to
+    // that, but it doesn't hurt that these are dropped as close together as possible.
     let _ = (&rcv, &ctl);
 }
 
@@ -1997,13 +2123,16 @@ async fn try_enter<A: Actor>(
 #[instrument(skip_all, name = "leave")]
 async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
     trace!("Before");
-    let exit_reason = actor.leave(ctl).await;
-    // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!(error = exit_reason.is_err(), "After");
+    actor.leave(ctl).await;
+    let exit_reason = ctl.take_corpse().to_error();
 
-    let _: Result<_, _> = ctl
-        .exit_send
-        .send(exit_reason.map_or_else(State::Failed, |()| State::Exited));
+    // NOTE: this is logged before all runes and stuff have dropped, but whatever
+    debug!(error = exit_reason.is_some(), "After");
+
+    let _: Result<_, _> = ctl.exit_send.send(match exit_reason {
+        Some(err) => State::Failed(err),
+        None => State::Exited,
+    });
 }
 
 async fn main_loop<A: Actor>(
@@ -2259,7 +2388,7 @@ mod tests {
             struct Alice;
             self_hatched!(Alice, "alice");
             impl Actor for Alice {
-                type Error = Infallible;
+                type Corpse = NoError;
             }
             impl Receive<i32> for Alice {
                 type Retval = i32;
@@ -2274,9 +2403,12 @@ mod tests {
             }
             self_hatched!(Bob, "bob");
             impl Actor for Bob {
-                type Error = Infallible;
+                type Corpse = NoError;
 
-                async fn enter(&mut self, _ctl: &mut Control<Self>) -> Result<(), Self::Error> {
+                async fn enter(
+                    &mut self,
+                    _ctl: &mut Control<Self>,
+                ) -> Result<(), actor_error!(Self)> {
                     info!("sending to alice");
                     let reply = self.alice.send_receive(5).await.unwrap();
                     let reply = reply.await.unwrap();
@@ -2310,7 +2442,7 @@ mod tests {
             struct LocalAlice;
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
-                type Error = NotSend;
+                type Corpse = OneError<NotSend>;
             }
             impl Receive<i32> for LocalAlice {
                 type Retval = NotSend;
@@ -2348,7 +2480,7 @@ mod tests {
             }
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
-                type Error = NoError;
+                type Corpse = NoError;
             }
             assert_not_impl_any!(LocalAlice: Send);
             assert_impl_all!(RemoteAddress<LocalAlice>: Send);
@@ -2360,7 +2492,7 @@ mod tests {
             struct LocalAlice;
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
-                type Error = NotSend;
+                type Corpse = OneError<NotSend>;
             }
             assert_impl_all!(LocalAlice: Send);
             assert_not_impl_any!(RemoteAddress<LocalAlice>: Send);

@@ -5,8 +5,8 @@ use futures_util::{AsyncBufRead, AsyncBufReadExt, StreamExt, io::BufReader};
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    actor::{Actor, Control, Hatchable, Receive, SecretAddress, bg_job::Job},
-    deferred_info_span,
+    actor::{Actor, Control, Hatchable, OneError, Receive, SecretAddress, bg_job::Job},
+    actor_error, deferred_info_span,
     kill_switch::{Bomb, Tick},
     signals::Interrupt,
 };
@@ -55,7 +55,7 @@ impl Hatchable for Egg {
     async fn hatch(
         self,
         ctl: &mut Control<Self::Actor>,
-    ) -> Result<Self::Actor, <Self::Actor as Actor>::Error> {
+    ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
         // NOTE: this can't be sent to another thread, it's unblock that will send it to
         // a worker thread. It would be really nice if this could lock stdin for performance
         // reasons.
@@ -124,9 +124,9 @@ impl Stdin {
                 res
             }
         })
-        .then(async |_, ctl, res| {
+        .then(async |_: &mut Self, ctl: &mut _, res: Result<(), _>| {
             ctl.close_mailbox();
-            let prev = ctl.set_result(res);
+            let prev = ctl.corpse_mut().replace_result(res);
             assert!(prev.is_none());
         })
         .instrument(deferred_info_span!("bg_job"))
@@ -137,7 +137,7 @@ impl Stdin {
 }
 
 impl Actor for Stdin {
-    type Error = Error;
+    type Corpse = OneError<Error>;
 }
 
 impl Receive<Interrupt> for Stdin {
@@ -169,7 +169,7 @@ mod tests {
         async fn hatch(
             self,
             ctl: &mut Control<Self::Actor>,
-        ) -> Result<Self::Actor, <Self::Actor as Actor>::Error> {
+        ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
             let input = BufReader::new(self.data);
             Ok(Stdin::new(ctl, self.send_to, input))
         }
