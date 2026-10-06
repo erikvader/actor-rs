@@ -338,6 +338,84 @@ mod builder {
             ex.spawn(fut).detach();
             adr
         }
+
+        pub fn spawn_attachment<C: Actor>(
+            self,
+            ctl: &mut Control<C>,
+            actor: impl Spawnable<P>,
+        ) -> Attachment<'_, C, P::Actor> {
+            let adr = self.spawn(actor);
+            Attachment::new(adr, ctl)
+        }
+    }
+
+    #[must_use = "must specify how this is to be attached to the current actor"]
+    pub struct Attachment<'a, A: Actor, C: Actor> {
+        adr: Address<C>,
+        ctl: &'a mut Control<A>,
+    }
+
+    impl<'a, A: Actor, C: Actor> Attachment<'a, A, C> {
+        fn new(adr: Address<C>, ctl: &'a mut Control<A>) -> Self {
+            Self { adr, ctl }
+        }
+
+        pub fn detach(self) -> Address<C> {
+            self.adr
+        }
+
+        pub fn log(self, msg: impl Into<String>) -> Address<C> {
+            bg_job::Job::new({
+                let msg = msg.into();
+                let mut weak = self.adr.downgrade();
+                async move {
+                    // TODO: this actually only needs to inspect the error, but that was very
+                    // difficult to achieve with a mutex inside an async watch.
+                    match weak.join_steal().await {
+                        Ok(()) => tracing::debug!("Exited without errors: {}", msg),
+                        Err(e) => tracing::error!(
+                            error = &e as &dyn std::error::Error,
+                            "Exited with errors: {}",
+                            msg
+                        ),
+                    }
+                }
+            })
+            .instrument({
+                let id = self.adr.id();
+                crate::deferred_span!(Level::ERROR, "log", wait.type = type_name::<C>(), wait.id = id)
+            })
+            .start(self.ctl);
+
+            self.adr
+        }
+
+        pub fn aggregate<W>(self, msg: impl Into<String>) -> Address<C>
+        where
+            A: Actor<Corpse = MultiError<W>>,
+            W: snafu::FromString + std::fmt::Debug + 'static,
+            WaitError<actor_error!(C)>: Into<W::Source>,
+        {
+            bg_job::Job::new({
+                let mut weak = self.adr.downgrade();
+                let msg = msg.into();
+                async move { snafu::ResultExt::whatever_context(weak.join_steal().await, msg) }
+            })
+            .then(async |_, ctl, res: Result<(), W>| {
+                tracing::debug!(?res, "Joined");
+                if let Err(e) = res {
+                    let corpse: &mut MultiError<W> = ctl.corpse_mut();
+                    corpse.push(e);
+                }
+            })
+            .instrument({
+                let id = self.adr.id();
+                crate::deferred_span!(Level::ERROR, "aggregate", wait.type = type_name::<C>(), wait.id = id)
+            })
+            .start(self.ctl);
+
+            self.adr
+        }
     }
 
     #[expect(private_bounds, reason = "The builder should be private")]
@@ -483,7 +561,7 @@ mod builder {
 }
 
 impl<A: Actor> Control<A> {
-    pub fn summon<P2>(&self, actor: impl Spawnable<P2>) -> Address<P2::Actor>
+    pub fn summon<P2>(&mut self, actor: impl Spawnable<P2>) -> Attachment<'_, A, P2::Actor>
     where
         P2: Hatchable,
     {
@@ -498,7 +576,7 @@ impl<A: Actor> Control<A> {
             self.idgen.clone(),
             self.thread_root_span.clone(),
         )
-        .spawn(actor)
+        .spawn_attachment(self, actor)
     }
 
     #[expect(
