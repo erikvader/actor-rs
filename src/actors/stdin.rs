@@ -37,6 +37,8 @@ impl Line {
     }
 }
 
+// TODO: what should the naming convention be? Should these simply be called Egg? What if there are
+// more representing different ways to create the actor?
 pub struct Egg {
     send_to: SecretAddress<Line>,
 }

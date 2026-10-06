@@ -8,6 +8,7 @@ use crate::{
     kill_switch::{self, Bomb},
     signals::{ActorGuard, SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
+    utils::type_name,
 };
 use async_channel as channel;
 use async_executor::LocalExecutor;
@@ -20,7 +21,6 @@ use futures_util::{
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
-    any::type_name,
     marker::PhantomData,
     num::NonZeroUsize,
     pin::pin,
@@ -30,10 +30,6 @@ use tracing::{Instrument, Level, Span, debug, debug_span, instrument, span, trac
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
-
-// NOTE: Since the output of `type_name` usually is long, i only use it on spans of level trace and
-// events of levels debug or higher (verbosity).
-// TODO: it would be cool if there was some nice way to shorten those type names
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxSize {
@@ -223,6 +219,7 @@ mod builder {
     use crate::{
         deferred_span::{DeferredDirectSpan, DeferredSpanMethods},
         signals::Interrupt,
+        utils::type_name,
     };
 
     use super::*;
@@ -771,6 +768,8 @@ mod scope {
 use adr_core::{AdrCore, AdrRcv, ErasedAdr, WeakAdrCore};
 pub use adr_core::{Reply, ReplyError, SendError, TrySendError};
 mod adr_core {
+    use crate::utils::type_name;
+
     use super::{
         Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, MailboxSize,
         OneWayTicket, Package, Receive,
@@ -856,8 +855,9 @@ mod adr_core {
             S: CanSendTicket<A, T>,
         {
             tracing::trace!(
-                "to" = type_name::<A>(),
-                "msg" = type_name::<T>(),
+                to.type = type_name::<A>(),
+                to.id = self.id,
+                msg = type_name::<T>(),
                 "Send message"
             );
             let ticket = OneWayTicket {
@@ -875,9 +875,10 @@ mod adr_core {
             S: CanSendPackage<A, T>,
         {
             tracing::trace!(
-                "to" = type_name::<A>(),
-                "msg" = type_name::<T>(),
-                "return" = type_name::<A::Retval>(),
+                to.type = type_name::<A>(),
+                to.id = self.id,
+                msg = type_name::<T>(),
+                return = type_name::<A::Retval>(),
                 "Send and receive"
             );
             let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
@@ -897,8 +898,9 @@ mod adr_core {
             S: CanSendTicket<A, T>,
         {
             tracing::trace!(
-                "to" = type_name::<A>(),
-                "msg" = type_name::<T>(),
+                to.type = type_name::<A>(),
+                to.id = self.id,
+                msg = type_name::<T>(),
                 "Try send message"
             );
             let ticket = OneWayTicket {
@@ -916,8 +918,9 @@ mod adr_core {
             S: CanSendTicket<A, T>,
         {
             tracing::trace!(
-                "to" = type_name::<A>(),
-                "msg" = type_name::<T>(),
+                to.type = type_name::<A>(),
+                to.id = self.id,
+                msg = type_name::<T>(),
                 "Send blocking message"
             );
             let ticket = OneWayTicket {

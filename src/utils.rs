@@ -1,4 +1,3 @@
-// TODO: rename this file to thread_utils or smth?
 use tracing::{Span, debug_span, info_span};
 
 // TODO: fallback or support for other platforms
@@ -36,4 +35,13 @@ where
             fun()
         })
         .expect("failed to spawn thread")
+}
+
+pub fn type_name<T: ?Sized>() -> Option<&'static str> {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        // NOTE: it would be nice if this could be shortened, but it's output is not stable and can
+        // change in future rust versions, so it's probably best to leave this untouched
+        return Some(std::any::type_name::<T>());
+    }
+    None
 }

@@ -59,6 +59,9 @@ pub mod __private {
     }
 }
 
+// TODO: it wasn't a smart idea to name this exported macro the same thing as the module, imports
+// are confusing. Rename one of them. They live on the same level, i.e. crate::deferred_span, so the
+// LSP server doesn't really know which one it should import.
 #[macro_export]
 macro_rules! deferred_span {
     (target: $target:expr, $($tokens:tt)*) => {

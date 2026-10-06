@@ -188,6 +188,7 @@ where
 {
     type Corpse = OneError<Error>;
 
+    // TODO: use Option instead of deferred_span_or for optional fields? Create a nice helper?
     // TODO: move to the correct place
     // fn span(&self) -> DeferredSpan<'_> {
     //     crate::deferred_span_or!(
