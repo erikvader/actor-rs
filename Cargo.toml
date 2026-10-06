@@ -37,3 +37,19 @@ tracing-subscriber = "0.3.23"
 #though i like the simplified API over futures, i will not use it since its so buggy. For
 #example, the StreamExt::race never terminates.
 # futures-lite = {path="../futures-lite"}
+
+[lints.rust]
+#NOTE: this is nice because it removes ambiguity whether something that is pub is public
+#api of the crate as a whole or just pub of the current module. This adds a lot of extra
+#text to write, but it's probably worth it in this case to make sure nothing is exposed
+#accidentally.
+#TODO: enable this as fix everywhere
+# unreachable_pub = "warn"
+#NOTE: this is important for a library, it's annoying to interact with a type that can't
+#be named
+unnameable_types = "warn"
+#TODO: should i also use the missing_debug_implementations?
+
+[lints.clippy]
+#NOTE: I want all of them documented, all usages of unsafe must explain themselves
+undocumented_unsafe_blocks = "warn"
