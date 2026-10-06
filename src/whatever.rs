@@ -2,18 +2,19 @@ use std::{
     error::Error,
     fmt,
     process::{ExitCode, Termination},
+    sync::Arc,
 };
 
 pub use snafu::prelude::*;
 
 /// The same as the standard Whatever type from SNAFU, except that other location info other than
 /// the backtrace is captured.
-#[derive(Debug, Snafu)]
+#[derive(Debug, Snafu, Clone)]
 #[snafu(whatever)]
 #[snafu(display("{message}"))]
 pub struct Whatever {
-    #[snafu(source(from(Box<dyn Error + Send + Sync>, Some)))]
-    source: Option<Box<dyn Error + Send + Sync>>,
+    #[snafu(source(from(Box<dyn Error + Send + Sync>, |e| Some(Arc::from(e)))))]
+    source: Option<Arc<dyn Error + Send + Sync>>,
     message: String,
     // RANT: This whole type, and snafu in general, whould be so much more usable if the error
     // provide API was stable... https://github.com/rust-lang/rust/issues/99301. Then the printing
@@ -30,7 +31,7 @@ pub struct Whatever {
     // TODO: add normal backtrace as well? I rarely inspect it anyways.
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SpanTrace(tracing_error::SpanTrace);
 
 impl std::fmt::Display for SpanTrace {
