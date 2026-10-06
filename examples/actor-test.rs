@@ -66,7 +66,7 @@ fn inner_main(signals: &Signals) -> Result<(), Whatever> {
 
     stage.play().whatever_context("Stage failed")?;
     stdin_adr
-        .get_error()
+        .take_error()
         .map_or(Ok(()), Err)
         .whatever_context("The stdin reader did not exit cleanly")
 }

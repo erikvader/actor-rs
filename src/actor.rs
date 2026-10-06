@@ -25,6 +25,7 @@ use std::{
     num::NonZeroUsize,
     pin::pin,
     rc::{Rc, Weak},
+    sync::Mutex,
 };
 use tracing::{Instrument, Level, Span, debug, debug_span, instrument, span, trace, trace_span};
 
@@ -73,7 +74,7 @@ macro_rules! actor_error {
 )]
 pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values
-    type Corpse: Corpse<Error: std::error::Error + Clone> + Default;
+    type Corpse: Corpse<Error: std::error::Error> + Default;
 
     #[expect(
         async_fn_in_trait,
@@ -602,46 +603,6 @@ mod corpse {
         }
     }
 
-    pub struct OneArcError<E> {
-        inner: Option<Arc<E>>,
-    }
-
-    impl<E> Default for OneArcError<E> {
-        fn default() -> Self {
-            Self { inner: None }
-        }
-    }
-
-    impl<E> Corpse for OneArcError<E> {
-        type Error = Arc<E>;
-
-        fn to_error(self) -> Option<Self::Error> {
-            self.inner
-        }
-    }
-
-    impl<E> OneArcError<E> {
-        pub fn replace(&mut self, error: E) -> Option<E> {
-            if let Some(prev) = self
-                .inner
-                .as_mut()
-                .map(|x| Arc::get_mut(x).expect("is only one"))
-            {
-                Some(std::mem::replace(prev, error))
-            } else {
-                self.inner = Some(Arc::new(error));
-                None
-            }
-        }
-
-        pub fn replace_result(&mut self, result: Result<(), E>) -> Option<E> {
-            match result {
-                Ok(()) => None,
-                Err(e) => self.replace(e),
-            }
-        }
-    }
-
     #[derive(Default)]
     pub struct NoError;
 
@@ -689,6 +650,8 @@ pub enum WaitError<T: std::error::Error + 'static> {
     Panicked,
     #[snafu(display("Actor exited with an error"))]
     Exited { source: T },
+    #[snafu(display("Actor exited with an error, but someone else stole it"))]
+    Stolen,
 }
 
 #[derive(Debug, Snafu)]
@@ -700,6 +663,8 @@ pub enum TryWaitError<T: std::error::Error + 'static> {
     StillAlive,
     #[snafu(display("Actor exited with an error"))]
     Exited { source: T },
+    #[snafu(display("Actor exited with an error, but someone else stole it"))]
+    Stolen,
 }
 
 #[derive(Default, Debug)]
@@ -707,7 +672,10 @@ pub(crate) enum State<E> {
     #[default]
     Initializing,
     Running,
-    Failed(E),
+    // NOTE: a normal std mutex is fine, and recommended, to use here as long as it is not held
+    // across await points. Standard mutexes have less overhead than async mutexes.
+    // https://docs.rs/async-lock/latest/async_lock/index.html#relationship-with-stdsync
+    Failed(Mutex<Option<E>>),
     Exited,
 }
 
@@ -1104,19 +1072,56 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 
     /// Wait for the actor to die.
-    pub async fn join(self) -> Result<(), WaitError<actor_error!(A)>> {
+    pub async fn join(self) -> Result<(), WaitError<actor_error!(A)>>
+    where
+        actor_error!(A): Clone,
+    {
         let mut weak = self.downgrade();
         drop(self);
         weak.join().await
     }
 
-    pub fn try_join(&self) -> Result<(), TryWaitError<actor_error!(A)>> {
+    /// Wait for the actor to die.
+    pub async fn join_steal(self) -> Result<(), WaitError<actor_error!(A)>> {
+        let mut weak = self.downgrade();
+        drop(self);
+        weak.join_steal().await
+    }
+
+    pub fn try_join(&mut self) -> Result<(), TryWaitError<actor_error!(A)>>
+    where
+        actor_error!(A): Clone,
+    {
+        self.try_join_with_strategy(|opt| opt.as_mut().cloned())
+    }
+
+    pub fn try_join_steal(&mut self) -> Result<(), TryWaitError<actor_error!(A)>> {
+        self.try_join_with_strategy(Option::take)
+    }
+
+    #[expect(clippy::type_complexity, reason = "you can be complex!")]
+    fn try_join_with_strategy(
+        &mut self,
+        strategy: fn(&mut Option<actor_error!(A)>) -> Option<actor_error!(A)>,
+    ) -> Result<(), TryWaitError<actor_error!(A)>> {
         let dead = self.core.is_dead();
         match &*self.status.borrow() {
-            // NOTE: this panic detection is not perfect, see the note on the normal join
+            // NOTE: this panic detection is not perfect, since the actor could panic in other
+            // states than these. But this is the best that can be done by only looking at the
+            // watch. I don't feel like it is worth it to include a Heart/rune or something to
+            // detect whether any drop or watch::send panicked.
             State::Initializing | State::Running if dead => try_wait_error::Panicked.fail(),
             State::Initializing | State::Running => try_wait_error::StillAlive.fail(),
-            State::Failed(e) => Err(e.clone()).context(try_wait_error::Exited),
+            State::Failed(e) => {
+                let mut guard = e.lock().unwrap();
+                let err = strategy(&mut guard);
+
+                if let Some(err) = err {
+                    Err(err).context(try_wait_error::Exited)
+                } else {
+                    try_wait_error::Stolen.fail()
+                }
+            }
             State::Exited => Ok(()),
         }
     }
@@ -1171,7 +1176,22 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // addresses.
 
     /// Wait for the actor to die.
-    pub async fn join(&mut self) -> Result<(), WaitError<actor_error!(A)>> {
+    pub async fn join(&mut self) -> Result<(), WaitError<actor_error!(A)>>
+    where
+        actor_error!(A): Clone,
+    {
+        self.join_with_strategy(|opt| opt.as_mut().cloned()).await
+    }
+
+    pub async fn join_steal(&mut self) -> Result<(), WaitError<actor_error!(A)>> {
+        self.join_with_strategy(Option::take).await
+    }
+
+    #[expect(clippy::type_complexity, reason = "you can be complex!")]
+    async fn join_with_strategy(
+        &mut self,
+        strategy: fn(&mut Option<actor_error!(A)>) -> Option<actor_error!(A)>,
+    ) -> Result<(), WaitError<actor_error!(A)>> {
         let mut dead = false;
         loop {
             match &*self.status.borrow() {
@@ -1181,37 +1201,46 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
                 // detect whether any drop or watch::send panicked.
                 State::Initializing | State::Running if dead => return wait_error::Panicked.fail(),
                 State::Initializing | State::Running => (),
-                State::Failed(e) => return Err(e.clone()).context(wait_error::Exited),
+                State::Failed(e) => {
+                    let mut guard = e.lock().unwrap();
+                    let err = strategy(&mut guard);
+
+                    return if let Some(err) = err {
+                        Err(err).context(wait_error::Exited)
+                    } else {
+                        wait_error::Stolen.fail()
+                    };
+                }
                 State::Exited => return Ok(()),
             }
             dead = self.status.changed().await.is_err();
         }
     }
 
-    pub fn get_error(&self) -> Option<actor_error!(A)> {
+    pub fn take_error(&self) -> Option<actor_error!(A)> {
         match &*self.status.borrow() {
             State::Initializing | State::Running | State::Exited => None,
-            State::Failed(e) => Some(e.clone()),
+            State::Failed(e) => e.lock().unwrap().take(),
         }
     }
 }
 
 impl<A: Actor> Address<A> {
     pub fn remote(&self) -> RemoteAddress<A> {
-        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
-        // around, since a remote address can only send data that is Send.
         let c = self.core.clone();
         let b = self.status.clone();
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
+        // around, since a remote address can only send data that is Send.
         unsafe { RemoteAddress::new(c, b) }
     }
 }
 
 impl<A: Actor> WeakAddress<A> {
     pub fn remote(&self) -> RemoteWeakAddress<A> {
-        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
-        // around, since a remote address can only send data that is Send.
         let c = self.core.clone();
         let b = self.status.clone();
+        // SAFETY: It's safe to go from a local address to a remote one, but not the other way
+        // around, since a remote address can only send data that is Send.
         unsafe { RemoteWeakAddress::new(c, b) }
     }
 }
@@ -2098,7 +2127,7 @@ async fn try_hatch<P: Hatchable>(
     match hatch_res {
         Ok(actor) => Some(actor),
         Err(err) => {
-            let _: Result<_, _> = ctl.exit_send.send(State::Failed(err));
+            let _: Result<_, _> = ctl.exit_send.send(State::Failed(Mutex::new(Some(err))));
             None
         }
     }
@@ -2118,7 +2147,7 @@ async fn try_enter<A: Actor>(
 
     let _: Result<_, _> = ctl
         .exit_send
-        .send(enter_res.map_or_else(State::Failed, |()| State::Running));
+        .send(enter_res.map_or_else(|e| State::Failed(Mutex::new(Some(e))), |()| State::Running));
 
     ok
 }
@@ -2133,7 +2162,7 @@ async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
     debug!(error = exit_reason.is_some(), "After");
 
     let _: Result<_, _> = ctl.exit_send.send(match exit_reason {
-        Some(err) => State::Failed(err),
+        Some(err) => State::Failed(Mutex::new(Some(err))),
         None => State::Exited,
     });
 }
