@@ -215,7 +215,9 @@ mod id_generator {
 }
 
 use builder::ActorBuilder;
-pub use builder::{Spawnable, SpawnableExt, WithMailboxSize};
+pub use builder::{
+    Attachment, Spawnable, SpawnableExt, WithInterruptable, WithMailboxSize, WithYieldPolicy,
+};
 mod builder {
     use crate::{
         deferred_span::{DeferredDirectSpan, DeferredSpanMethods},
@@ -248,15 +250,17 @@ mod builder {
                 rune,
                 idgen,
                 thread_root_span,
+                // NOTE: these are always overriden by Hatchable, also to the default values, but
+                // they need to be set some *something* here
                 mailbox_size: MailboxSize::default(),
                 yield_policy: YieldPolicy::default(),
             }
         }
 
-        fn create_channel(&self) -> (AdrCore<P::Actor>, AdrRcv<P::Actor>) {
+        fn create_channel(&self, id: Id) -> (AdrCore<P::Actor>, AdrRcv<P::Actor>) {
             match self.mailbox_size {
-                MailboxSize::Unbounded => AdrCore::unbounded(),
-                MailboxSize::Bounded(size) => AdrCore::bounded(size.get()),
+                MailboxSize::Unbounded => AdrCore::unbounded(id),
+                MailboxSize::Bounded(size) => AdrCore::bounded(id, size.get()),
             }
         }
 
@@ -285,9 +289,9 @@ mod builder {
         ) -> (impl Future<Output = ()> + 'static, Address<P::Actor>) {
             spawnable.adjust_builder(&mut self);
 
-            let (snd, rcv) = self.create_channel();
-            let (exit_snd, exit_rcv) = Self::create_exit_channel();
             let id = self.idgen.generate();
+            let (snd, rcv) = self.create_channel(id);
+            let (exit_snd, exit_rcv) = Self::create_exit_channel();
             debug!(id, "type" = type_name::<P::Actor>(), "Spawn new actor");
 
             // SAFETY: it's always safe to create from a brand new sender, the problem is if it is a
@@ -704,13 +708,17 @@ pub trait Receive<T>: Actor {
 type ErasedDeliverable<A> = Box<dyn Deliverable<A> + Send>;
 type ErasedLocalDeliverable<A> = Box<dyn Deliverable<A>>;
 
-use scope::{Local, Remote, Scope};
+pub use scope::{Local, Remote, Scope};
 mod scope {
     use std::{marker::PhantomData, rc::Rc};
 
     use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
 
     mod private {
+        #[allow(
+            unnameable_types,
+            reason = "this is on purpose, this is how sealed traits are done"
+        )]
         pub trait Sealed {}
     }
 
@@ -739,14 +747,14 @@ mod adr_core {
     use crate::utils::type_name;
 
     use super::{
-        Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, MailboxSize,
+        Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, Id, MailboxSize,
         OneWayTicket, Package, Receive,
     };
     use async_channel as channel;
     use pin_project::pin_project;
     use snafu::{OptionExt, Snafu};
     use static_assertions::assert_impl_all;
-    use std::any::{Any, type_name};
+    use std::any::Any;
 
     pub(super) type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
 
@@ -758,6 +766,7 @@ mod adr_core {
     // messages, except for that it was probably a mistake?
     pub(super) struct AdrCore<A: Actor> {
         sender: channel::Sender<ErasedDeliverable<A>>,
+        id: Id,
     }
     assert_impl_all!(AdrCore<DummyActor>: Send);
 
@@ -765,24 +774,32 @@ mod adr_core {
         fn clone(&self) -> Self {
             Self {
                 sender: self.sender.clone(),
+                id: self.id,
             }
         }
     }
 
     impl<A: Actor> AdrCore<A> {
-        pub fn unbounded() -> (Self, AdrRcv<A>) {
+        pub fn unbounded(id: Id) -> (Self, AdrRcv<A>) {
             let (snd, rcv) = channel::unbounded();
-            (Self { sender: snd }, rcv)
+            (Self { sender: snd, id }, rcv)
         }
 
-        pub fn bounded(capacity: usize) -> (Self, AdrRcv<A>) {
+        pub fn bounded(id: Id, capacity: usize) -> (Self, AdrRcv<A>) {
             let (snd, rcv) = channel::bounded(capacity);
-            (Self { sender: snd }, rcv)
+            (Self { sender: snd, id }, rcv)
+        }
+
+        pub fn id(&self) -> Id {
+            self.id
         }
 
         pub fn downgrade(&self) -> WeakAdrCore<A> {
             let weak = self.sender.downgrade();
-            WeakAdrCore { sender: weak }
+            WeakAdrCore {
+                sender: weak,
+                id: self.id,
+            }
         }
 
         pub fn is_closed(&self) -> bool {
@@ -906,6 +923,7 @@ mod adr_core {
         // the receiver count, and upgrade also fails if the channel is closed, not only if there
         // are no receivers.
         sender: channel::WeakSender<ErasedDeliverable<A>>,
+        id: Id,
     }
     assert_impl_all!(WeakAdrCore<DummyActor>: Send);
 
@@ -913,13 +931,21 @@ mod adr_core {
         fn clone(&self) -> Self {
             Self {
                 sender: self.sender.clone(),
+                id: self.id,
             }
         }
     }
 
     impl<A: Actor> WeakAdrCore<A> {
         pub fn upgrade(&self) -> Option<AdrCore<A>> {
-            self.sender.upgrade().map(|snd| AdrCore { sender: snd })
+            self.sender.upgrade().map(|snd| AdrCore {
+                sender: snd,
+                id: self.id,
+            })
+        }
+
+        pub fn id(&self) -> Id {
+            self.id
         }
 
         pub fn close(&self) -> bool {
@@ -1046,6 +1072,10 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
         }
     }
 
+    pub fn id(&self) -> Id {
+        self.core.id()
+    }
+
     pub fn mailbox_size(&self) -> MailboxSize {
         self.core.mailbox_size()
     }
@@ -1153,14 +1183,16 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
         }
     }
 
+    pub fn id(&self) -> Id {
+        self.core.id()
+    }
+
     pub fn upgrade(&self) -> Option<GenericAddress<A, S>> {
-        self.core
-            .upgrade()
+        self.core.upgrade().map(|sender| {
+            let b = self.status.clone();
             // SAFETY: this gets the same scope as the original
-            .map(|sender| {
-                let b = self.status.clone();
-                unsafe { GenericAddress::new(sender, b) }
-            })
+            unsafe { GenericAddress::new(sender, b) }
+        })
     }
 
     pub fn close(&self) -> bool {
@@ -1750,7 +1782,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 }
 
-pub use secret_adr::SecretAddress;
+pub use secret_adr::{Multi, SecretAddress};
 mod secret_adr {
     use super::{
         Actor, AdrCore, CanSendTicket, GenericAddress, Receive, Scope, SendError, TrySendError,
@@ -2000,7 +2032,7 @@ mod secret_adr {
         #[test]
         fn multi_send_can_send_both_halves() {
             #[derive(Debug, Snafu, Clone)]
-            #[snafu(display("counted this much {count}"))]
+            #[snafu(display("Counted this much {count}"))]
             struct Counter {
                 count: i32,
             }
