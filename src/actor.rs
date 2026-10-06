@@ -2278,6 +2278,18 @@ impl Stage {
         }
     }
 
+    pub fn fork<F, T>(&self, name: impl Into<String>, func: F) -> std::thread::JoinHandle<T>
+    where
+        F: FnOnce(Stage) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let core = self.core();
+        crate::utils::spawn(name, move || {
+            let stage = Stage::from_core(core);
+            func(stage)
+        })
+    }
+
     fn actor_builder<P: Hatchable>(&self) -> ActorBuilder<P> {
         ActorBuilder::new(
             Rc::clone(&self.ex),
