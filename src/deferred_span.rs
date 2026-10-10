@@ -155,6 +155,11 @@ mod tests {
     use tracing::Level;
 
     #[test]
+    fn none_is_disabled() {
+        assert!(DeferredSpan::none().create(&Span::none()).is_none());
+    }
+
+    #[test]
     fn create() {
         let parent = tracing::info_span!("parent");
         let def_child = deferred_span!(Level::INFO, "child");

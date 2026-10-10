@@ -3,12 +3,14 @@ use crate::{
         id_generator::{Id, IdGenerator},
         unsafe_wrapper::UnsafeSendWrapper,
     },
+    actors::adhoc::AdHoc,
     deferred_span::DeferredSpan,
     heart::{self, Heart, PanicError, Rune},
     kill_switch::{self, Bomb},
     signals::{ActorGuard, SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
     utils::type_name,
+    whatever::Whatever,
 };
 use async_channel as channel;
 use async_executor::LocalExecutor;
@@ -128,9 +130,10 @@ pub trait Hatchable: Sized + 'static {
 
 #[macro_export]
 macro_rules! self_hatched {
-    // TODO: figure out how to create a lowercase string from the type. Maybe use const-str crate?
-    ($actor:ty, $name:expr) => {
-        impl $crate::actor::Hatchable for $actor {
+    // TODO: figure out how to create a lowercase string from the type so an explicit string
+    // argument isn't needed. Maybe use const-str crate?
+    ($actor:ty, $name:expr, impl $($type_params:tt)*) => {
+        impl $($type_params)* $crate::actor::Hatchable for $actor {
             type Actor = Self;
 
             $crate::default_span!($name);
@@ -142,6 +145,9 @@ macro_rules! self_hatched {
                 Ok(self)
             }
         }
+    };
+    ($actor:ty, $name:expr) => {
+        $crate::self_hatched!($actor, $name, impl);
     };
 }
 
@@ -216,7 +222,8 @@ mod id_generator {
 
 use builder::ActorBuilder;
 pub use builder::{
-    Attachment, Spawnable, SpawnableExt, WithInterruptable, WithMailboxSize, WithYieldPolicy,
+    Attachment, Spawnable, SpawnableExt, WithInterruptable, WithMailboxSize, WithUserSpan,
+    WithYieldPolicy,
 };
 mod builder {
     use crate::{
@@ -300,10 +307,8 @@ mod builder {
 
             let sig_guard = spawnable.install_signals(&home);
 
-            let egg = spawnable.into_hatchable();
-            let span = egg
-                .span()
-                .create_or(Self::create_root_span(id).create_or(self.thread_root_span.clone()));
+            let root_span = Self::create_root_span(id).create_or(self.thread_root_span.clone());
+            let span = spawnable.user_span(root_span);
 
             let ctl = Control::new(
                 Rc::downgrade(&self.ex),
@@ -316,6 +321,7 @@ mod builder {
                 sig_guard,
             );
 
+            let egg = spawnable.into_hatchable();
             // NOTE: I am pretty certain that if span is thread_root_span here it's actually redundant
             // cuz it gets entered twice, but i don't feel like that special case is worth worrying
             // about. This is of course only the case if the future is spawned as a task on an executor
@@ -364,19 +370,17 @@ mod builder {
             self.adr
         }
 
-        pub fn log(self, msg: impl Into<String>) -> Address<C> {
+        pub fn log(self) -> Address<C> {
             bg_job::Job::new({
-                let msg = msg.into();
                 let mut weak = self.adr.downgrade();
                 async move {
                     // TODO: this actually only needs to inspect the error, but that was very
                     // difficult to achieve with a mutex inside an async watch.
                     match weak.join_steal().await {
-                        Ok(()) => tracing::debug!("Exited without errors: {}", msg),
+                        Ok(()) => tracing::debug!("Exited without errors"),
                         Err(e) => tracing::error!(
                             error = &e as &dyn std::error::Error,
-                            "Exited with errors: {}",
-                            msg
+                            "Exited with errors",
                         ),
                     }
                 }
@@ -390,7 +394,7 @@ mod builder {
             self.adr
         }
 
-        pub fn aggregate<W>(self, msg: impl Into<String>) -> Address<C>
+        pub fn aggregate<W>(self) -> Address<C>
         where
             A: Actor<Corpse = MultiError<W>>,
             W: snafu::FromString + std::fmt::Debug + 'static,
@@ -398,8 +402,7 @@ mod builder {
         {
             bg_job::Job::new({
                 let mut weak = self.adr.downgrade();
-                let msg = msg.into();
-                async move { snafu::ResultExt::whatever_context(weak.join_steal().await, msg) }
+                async move { snafu::ResultExt::whatever_context(weak.join_steal().await, "Actor exited with an error") }
             })
             .then(async |_, ctl, res: Result<(), W>| {
                 tracing::debug!(?res, "Joined");
@@ -432,6 +435,7 @@ mod builder {
         fn adjust_builder(&mut self, _builder: &mut ActorBuilder<P>);
         fn install_signals(&mut self, _adr: &Address<P::Actor>) -> Option<ActorGuard>;
         fn into_hatchable(self) -> P;
+        fn user_span(&mut self, parent: Span) -> Span;
     }
 
     impl<P: Hatchable> SpawnablePriv<P> for P {
@@ -449,6 +453,10 @@ mod builder {
             _adr: &Address<<P as Hatchable>::Actor>,
         ) -> Option<ActorGuard> {
             None
+        }
+
+        fn user_span(&mut self, parent: Span) -> Span {
+            Hatchable::span(self).create_or(parent)
         }
     }
 
@@ -476,6 +484,13 @@ mod builder {
                 registry,
             }
         }
+
+        fn span(self, user_span: DeferredSpan<'_>) -> WithUserSpan<'_, Self> {
+            WithUserSpan {
+                wrapped: self,
+                user_span: Some(user_span),
+            }
+        }
     }
     #[diagnostic::do_not_recommend]
     impl<P: Hatchable, I: SpawnablePriv<P>> SpawnableExt<P> for I {}
@@ -498,6 +513,10 @@ mod builder {
         fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
             self.wrapped.install_signals(adr)
         }
+
+        fn user_span(&mut self, parent: Span) -> Span {
+            self.wrapped.user_span(parent)
+        }
     }
 
     pub struct WithYieldPolicy<W> {
@@ -517,6 +536,10 @@ mod builder {
 
         fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
             self.wrapped.install_signals(adr)
+        }
+
+        fn user_span(&mut self, parent: Span) -> Span {
+            self.wrapped.user_span(parent)
         }
     }
 
@@ -556,6 +579,39 @@ mod builder {
 
         fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
             self.wrapped.adjust_builder(builder);
+        }
+
+        fn user_span(&mut self, parent: Span) -> Span {
+            self.wrapped.user_span(parent)
+        }
+    }
+
+    pub struct WithUserSpan<'a, W> {
+        wrapped: W,
+        user_span: Option<DeferredSpan<'a>>,
+    }
+
+    impl<'a, P: Hatchable, W: SpawnablePriv<P>> SpawnablePriv<P> for WithUserSpan<'a, W> {
+        fn into_hatchable(self) -> P {
+            self.wrapped.into_hatchable()
+        }
+
+        fn adjust_builder(&mut self, builder: &mut ActorBuilder<P>) {
+            self.wrapped.adjust_builder(builder);
+        }
+
+        fn install_signals(&mut self, adr: &Address<P::Actor>) -> Option<ActorGuard> {
+            self.wrapped.install_signals(adr)
+        }
+
+        fn user_span(&mut self, parent: Span) -> Span {
+            let me = self
+                .user_span
+                .take()
+                .expect("is only allowed to be called once");
+
+            let wrapped = self.wrapped.user_span(parent);
+            me.create_or(wrapped)
         }
     }
 }
@@ -643,9 +699,9 @@ impl<A: Actor> Control<A> {
     }
 }
 
-pub use corpse::{Corpse, MultiError, NoError, OneArcError, OneError};
+pub use corpse::{Corpse, MultiError, NoError, OneError};
 mod corpse {
-    use std::{convert::Infallible, sync::Arc};
+    use std::convert::Infallible;
 
     use crate::whatever::Group;
 
@@ -2232,12 +2288,19 @@ async fn try_hatch<P: Hatchable>(
 ) -> Option<P::Actor> {
     trace!("Before");
     let hatch_res = egg.hatch(ctl).await;
-    debug!(error = hatch_res.is_err(), "After");
+    trace!("After");
 
     match hatch_res {
         Ok(actor) => Some(actor),
         Err(err) => {
-            let _: Result<_, _> = ctl.exit_send.send(State::Failed(Mutex::new(Some(err))));
+            debug!(error = &err as &dyn std::error::Error);
+            if ctl
+                .exit_send
+                .send(State::Failed(Mutex::new(Some(err))))
+                .is_err()
+            {
+                debug!("Failed to send failure, no receivers");
+            }
             None
         }
     }
@@ -2253,11 +2316,23 @@ async fn try_enter<A: Actor>(
     trace!("Before");
     let enter_res = actor.enter(ctl).await;
     let ok = enter_res.is_ok();
-    debug!(error = !ok, "After");
+    trace!("After");
 
-    let _: Result<_, _> = ctl
-        .exit_send
-        .send(enter_res.map_or_else(|e| State::Failed(Mutex::new(Some(e))), |()| State::Running));
+    match enter_res {
+        Ok(()) => {
+            let _: Result<_, _> = ctl.exit_send.send(State::Running);
+        }
+        Err(err) => {
+            debug!(error = &err as &dyn std::error::Error);
+            if ctl
+                .exit_send
+                .send(State::Failed(Mutex::new(Some(err))))
+                .is_err()
+            {
+                debug!("Failed to send failure, no receivers");
+            }
+        }
+    }
 
     ok
 }
@@ -2267,14 +2342,24 @@ async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
     trace!("Before");
     actor.leave(ctl).await;
     let exit_reason = ctl.take_corpse().to_error();
-
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!(error = exit_reason.is_some(), "After");
+    debug!("After");
 
-    let _: Result<_, _> = ctl.exit_send.send(match exit_reason {
-        Some(err) => State::Failed(Mutex::new(Some(err))),
-        None => State::Exited,
-    });
+    match exit_reason {
+        Some(err) => {
+            debug!(error = &err as &dyn std::error::Error);
+            if ctl
+                .exit_send
+                .send(State::Failed(Mutex::new(Some(err))))
+                .is_err()
+            {
+                debug!("Failed to send failure, no receivers");
+            }
+        }
+        None => {
+            let _: Result<_, _> = ctl.exit_send.send(State::Exited);
+        }
+    }
 }
 
 async fn main_loop<A: Actor>(
@@ -2422,6 +2507,17 @@ impl Stage {
                 }
             }))
         })
+    }
+
+    pub fn play_adhoc<F>(self, func: F) -> Result<(), Whatever>
+    where
+        F: AsyncFnOnce(&mut Control<AdHoc>) -> Result<(), Whatever> + 'static,
+    {
+        let adr = self.summon(AdHoc::egg(func)).downgrade();
+        self.play().whatever_context("Stage failed")?;
+        adr.take_error()
+            .map_or(Ok(()), Err)
+            .whatever_context("The adhoc actor failed")
     }
 
     #[cfg(test)]

@@ -47,6 +47,9 @@ impl snafu::GenerateImplicitData for SpanTrace {
 }
 
 impl Whatever {
+    // TODO: print all the span traces instead? There can be a lot of information lost at, for
+    // example, address join boundaries, i.e. what span the failed actor had and what span the actor
+    // catching the error has. If printing all, then remove duplicates.
     fn most_specific_span_trace(&self) -> &tracing_error::SpanTrace {
         use tracing_error::ExtractSpanTrace;
 

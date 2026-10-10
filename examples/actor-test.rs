@@ -56,17 +56,17 @@ fn main() -> actor_rs::signals::SigTerminate<actor_rs::whatever::Report> {
 fn inner_main(signals: &Signals) -> Result<(), Whatever> {
     let mut stage = Stage::new();
     stage.register_signals(signals);
+    stage.play_adhoc({
+        let signals = signals.registry();
+        async |ctl| {
+            let printer_adr = ctl
+                .summon(actors::logger::Logger.span(actor_rs::deferred_info_span!("logger2")))
+                .aggregate();
 
-    let stdin_adr = {
-        let printer_adr = stage.summon(actors::logger::Logger);
-        stage
-            .summon(actors::stdin::Egg::new(printer_adr.secret()).interruptable(signals))
-            .downgrade()
-    };
+            ctl.summon(actors::stdin::Stdin::egg(printer_adr.secret()).interruptable(signals))
+                .aggregate();
 
-    stage.play().whatever_context("Stage failed")?;
-    stdin_adr
-        .take_error()
-        .map_or(Ok(()), Err)
-        .whatever_context("The stdin reader did not exit cleanly")
+            Ok(())
+        }
+    })
 }

@@ -1,3 +1,4 @@
+pub mod adhoc;
 pub mod logger;
 pub mod process;
 pub mod stdin;
@@ -11,3 +12,7 @@ pub mod stdin;
 // another span when summoning an actor? Should the multiplexer even be the one to summon the
 // actors? It's maybe better to just give it a vec of addresses, cuz then the caller can create them
 // with arbitrary complexity that a simple clone can't.
+// What type should the address have? Should it be to the multiplexer that can handle everything
+// that the multiplexed actor can handle? Or should it be directly to the multiplexed actor, but it
+// is magically forwarded by the multiplexer?
+// TODO: create a meta actor that restarts a wrapped actor whenever it crashes?

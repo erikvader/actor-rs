@@ -37,16 +37,8 @@ impl Line {
     }
 }
 
-// TODO: what should the naming convention be? Should these simply be called Egg? What if there are
-// more representing different ways to create the actor?
 pub struct Egg {
     send_to: SecretAddress<Line>,
-}
-
-impl Egg {
-    pub fn new(send_to: SecretAddress<Line>) -> Self {
-        Self { send_to }
-    }
 }
 
 impl Hatchable for Egg {
@@ -83,6 +75,10 @@ pub struct Stdin {
 }
 
 impl Stdin {
+    pub fn egg(send_to: SecretAddress<Line>) -> Egg {
+        Egg { send_to }
+    }
+
     fn new(
         ctl: &mut Control<Stdin>,
         send_to: SecretAddress<Line>,

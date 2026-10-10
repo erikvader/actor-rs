@@ -8,6 +8,7 @@ unsafe extern "C" {
 
 #[must_use = "This span must be used to do anything, consider entering it"]
 pub fn thread_info_span() -> Span {
+    // SAFETY: i don't think this function can fail
     let os_id = unsafe { gettid() };
     let current = std::thread::current();
     let rust_id = current.id();
