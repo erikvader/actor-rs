@@ -60,11 +60,13 @@ fn inner_main(signals: &Signals) -> Result<(), Whatever> {
         let signals = signals.registry();
         async |ctl| {
             let printer_adr = ctl
-                .summon(actors::logger::Logger.span(actor_rs::deferred_info_span!("logger2")))
+                .pre_summon(actors::logger::Logger.span(actor_rs::deferred_info_span!("logger2")))
                 .aggregate();
 
-            ctl.summon(actors::stdin::Stdin::egg(printer_adr.secret()).interruptable(signals))
-                .aggregate();
+            ctl.pre_summon(
+                actors::stdin::StdinEgg::new(printer_adr.secret()).interruptable(signals),
+            )
+            .aggregate();
 
             Ok(())
         }

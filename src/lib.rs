@@ -14,3 +14,12 @@ pub mod signals;
 mod stream_utils;
 
 pub mod whatever; // TODO: should this really be here?
+
+#[doc(hidden)]
+mod private {
+    #[allow(
+        unnameable_types,
+        reason = "this is on purpose, this is how sealed traits are done"
+    )]
+    pub trait Sealed {}
+}

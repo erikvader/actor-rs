@@ -3,7 +3,7 @@ use crate::{
         id_generator::{Id, IdGenerator},
         unsafe_wrapper::UnsafeSendWrapper,
     },
-    actors::adhoc::AdHoc,
+    actors::adhoc::{AdHoc, AdHocEgg},
     deferred_span::DeferredSpan,
     heart::{self, Heart, PanicError, Rune},
     kill_switch::{self, Bomb},
@@ -83,9 +83,7 @@ pub trait Actor: Sized + 'static {
         reason = "i don't really understand what this is complaining about"
     )]
     #[expect(unused_variables, reason = "the default is a noop")]
-    async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
-        Ok(())
-    }
+    async fn enter(&mut self, ctl: &mut Control<Self>) {}
 
     #[expect(
         async_fn_in_trait,
@@ -124,7 +122,7 @@ pub trait Hatchable: Sized + 'static {
     )]
     async fn hatch(
         self,
-        ctl: &mut Control<Self::Actor>,
+        ctl: &mut PreControl<'_, Self::Actor>,
     ) -> Result<Self::Actor, actor_error!(Self::Actor)>;
 }
 
@@ -140,7 +138,7 @@ macro_rules! self_hatched {
 
             async fn hatch(
                 self,
-                _ctl: &mut $crate::actor::Control<Self::Actor>,
+                _ctl: &mut $crate::actor::PreControl<'_, Self::Actor>,
             ) -> std::result::Result<Self::Actor, $crate::actor_error!(Self::Actor)> {
                 Ok(self)
             }
@@ -158,6 +156,66 @@ impl Actor for DummyActor {
 }
 self_hatched!(DummyActor, "dummy");
 
+trait Controllable<A: Actor> {
+    fn add_bg_job(&mut self, job: BoxedJob<A>);
+    fn actor_span(&self) -> Span;
+}
+
+/// A way for a soon-to-be-spawned actor to add jobs and stuff that will start when eventually
+/// spawned.
+pub struct PreControl<'a, A: Actor> {
+    ctl: &'a mut Control<A>,
+    pre_summons: Vec<LocalBoxFuture<'static, ()>>,
+}
+
+impl<'a, A: Actor> Controllable<A> for PreControl<'a, A> {
+    fn add_bg_job(&mut self, job: BoxedJob<A>) {
+        self.ctl.add_bg_job(job);
+    }
+
+    fn actor_span(&self) -> Span {
+        self.ctl.actor_span.clone()
+    }
+}
+
+impl<'a, A: Actor> PreControl<'a, A> {
+    fn new(ctl: &'a mut Control<A>) -> Self {
+        Self {
+            ctl,
+            pre_summons: Vec::new(),
+        }
+    }
+
+    fn finish(mut self) {
+        trace!("Starting {} pre summons", self.pre_summons.len());
+        let ex = self.ctl.ex();
+        for fut in self.pre_summons.drain(..) {
+            ex.spawn(fut).detach();
+        }
+    }
+
+    pub fn pre_summon<P2>(&mut self, actor: impl Spawnable<P2>) -> Attachment<'_, A, P2::Actor>
+    where
+        P2: Hatchable,
+    {
+        let (fut, adr) = self.ctl.actor_builder().no_spawn(actor);
+        self.pre_summons.push(fut.boxed_local());
+        Attachment::new(adr, self)
+    }
+}
+
+impl<'a, A: Actor> Drop for PreControl<'a, A> {
+    fn drop(&mut self) {
+        if !self.pre_summons.is_empty() {
+            debug!(
+                amount = self.pre_summons.len(),
+                "Dropped some summons without starting them"
+            );
+        }
+    }
+}
+
+/// A way for a live actor to communicate with its event loop.
 pub struct Control<A: Actor> {
     corpse: A::Corpse,
     // NOTE: this could probably be a 'a, but I don't think i want that anyways. I think it would
@@ -173,7 +231,7 @@ pub struct Control<A: Actor> {
     // function instead of returning a boxed future, but that is a lot more complicated since
     // the state machine has to be written from scratch. It also doesn't help in this case
     // unfortunately, because async fns it awaits has to be boxed anyways...
-    bg_jobs: FuturesUnordered<LocalBoxFuture<'static, ErasedLocalDeliverable<A>>>,
+    bg_jobs: FuturesUnordered<BoxedJob<A>>,
     idgen: IdGenerator,
     thread_root_span: Span,
     actor_span: Span,
@@ -191,6 +249,16 @@ pub struct Control<A: Actor> {
     actor_rune: Rune,
     // TODO: should be renamed to status send?
     exit_send: ExitSend<actor_error!(A)>,
+}
+
+impl<A: Actor> Controllable<A> for Control<A> {
+    fn add_bg_job(&mut self, job: BoxedJob<A>) {
+        self.bg_jobs.push(job);
+    }
+
+    fn actor_span(&self) -> Span {
+        self.actor_span.clone()
+    }
 }
 
 mod id_generator {
@@ -307,6 +375,9 @@ mod builder {
 
             let sig_guard = spawnable.install_signals(&home);
 
+            // TODO: i guess it would be cool to save the span that comes from the trait in the
+            // control, because then it would be possible to record values on it later on, in for
+            // example hatch.
             let root_span = Self::create_root_span(id).create_or(self.thread_root_span.clone());
             let span = spawnable.user_span(root_span);
 
@@ -330,39 +401,31 @@ mod builder {
             (fut, home)
         }
 
-        #[cfg(test)]
-        pub fn no_spawn(
+        pub(super) fn no_spawn(
             self,
             actor: impl Spawnable<P>,
-        ) -> (impl Future<Output = ()>, Address<P::Actor>) {
+        ) -> (impl Future<Output = ()> + 'static, Address<P::Actor>) {
             self.raw(actor)
         }
 
-        pub fn spawn(self, actor: impl Spawnable<P>) -> Address<P::Actor> {
+        pub(super) fn spawn(self, actor: impl Spawnable<P>) -> Address<P::Actor> {
             let ex = Rc::clone(&self.ex);
             let (fut, adr) = self.raw(actor);
             ex.spawn(fut).detach();
             adr
         }
-
-        pub fn spawn_attachment<C: Actor>(
-            self,
-            ctl: &mut Control<C>,
-            actor: impl Spawnable<P>,
-        ) -> Attachment<'_, C, P::Actor> {
-            let adr = self.spawn(actor);
-            Attachment::new(adr, ctl)
-        }
     }
 
+    // TODO: i dont know if i like this name, it makes it sound like this struct is the attachment,
+    // but it is more like an attachment chooser.
     #[must_use = "must specify how this is to be attached to the current actor"]
     pub struct Attachment<'a, A: Actor, C: Actor> {
         adr: Address<C>,
-        ctl: &'a mut Control<A>,
+        ctl: &'a mut dyn Controllable<A>,
     }
 
     impl<'a, A: Actor, C: Actor> Attachment<'a, A, C> {
-        fn new(adr: Address<C>, ctl: &'a mut Control<A>) -> Self {
+        pub(super) fn new(adr: Address<C>, ctl: &'a mut dyn Controllable<A>) -> Self {
             Self { adr, ctl }
         }
 
@@ -389,7 +452,7 @@ mod builder {
                 let id = self.adr.id();
                 crate::deferred_span!(Level::ERROR, "log", wait.type = type_name::<C>(), wait.id = id)
             })
-            .start(self.ctl);
+            .start_dyn(self.ctl);
 
             self.adr
         }
@@ -415,7 +478,7 @@ mod builder {
                 let id = self.adr.id();
                 crate::deferred_span!(Level::ERROR, "aggregate", wait.type = type_name::<C>(), wait.id = id)
             })
-            .start(self.ctl);
+            .start_dyn(self.ctl);
 
             self.adr
         }
@@ -617,22 +680,29 @@ mod builder {
 }
 
 impl<A: Actor> Control<A> {
-    pub fn summon<P2>(&mut self, actor: impl Spawnable<P2>) -> Attachment<'_, A, P2::Actor>
+    fn ex(&self) -> Rc<LocalExecutor<'static>> {
+        self.ex
+            .upgrade()
+            .expect("the executor is always alive here, it's what is running this function")
+    }
+
+    fn actor_builder<P2>(&self) -> ActorBuilder<P2>
     where
         P2: Hatchable,
     {
-        let ex = self
-            .ex
-            .upgrade()
-            .expect("the executor is always alive here, it's what is running this function");
-
         ActorBuilder::new(
-            ex,
+            self.ex(),
             self.actor_rune.clone(),
             self.idgen.clone(),
             self.thread_root_span.clone(),
         )
-        .spawn_attachment(self, actor)
+    }
+    pub fn summon<P2>(&mut self, actor: impl Spawnable<P2>) -> Attachment<'_, A, P2::Actor>
+    where
+        P2: Hatchable,
+    {
+        let adr = self.actor_builder().spawn(actor);
+        Attachment::new(adr, self)
     }
 
     #[expect(
@@ -686,16 +756,16 @@ impl<A: Actor> Control<A> {
         self.home.upgrade().context(AddressClosedSnafu)
     }
 
-    fn add_bg_job(&mut self, job: LocalBoxFuture<'static, ErasedLocalDeliverable<A>>) {
-        self.bg_jobs.push(job);
-    }
-
     pub fn corpse_mut(&mut self) -> &mut A::Corpse {
         &mut self.corpse
     }
 
     fn take_corpse(&mut self) -> A::Corpse {
         std::mem::take(&mut self.corpse)
+    }
+
+    fn as_pre_control(&mut self) -> PreControl<'_, A> {
+        PreControl::new(self)
     }
 }
 
@@ -848,20 +918,12 @@ mod scope {
 
     use static_assertions::{assert_impl_all, assert_not_impl_any, const_assert_eq};
 
-    mod private {
-        #[allow(
-            unnameable_types,
-            reason = "this is on purpose, this is how sealed traits are done"
-        )]
-        pub trait Sealed {}
-    }
-
-    pub trait Scope: private::Sealed + 'static {}
+    pub trait Scope: crate::private::Sealed + 'static {}
 
     pub struct Local {
         _priv: PhantomData<Rc<()>>,
     }
-    impl private::Sealed for Local {}
+    impl crate::private::Sealed for Local {}
     impl Scope for Local {}
     assert_not_impl_any!(Local: Send, Sync);
     const_assert_eq!(std::mem::size_of::<Local>(), 0);
@@ -869,7 +931,7 @@ mod scope {
     pub struct Remote {
         _priv: (),
     }
-    impl private::Sealed for Remote {}
+    impl crate::private::Sealed for Remote {}
     impl Scope for Remote {}
     assert_impl_all!(Remote: Send, Sync);
     const_assert_eq!(std::mem::size_of::<Remote>(), 0);
@@ -1650,12 +1712,13 @@ impl<A: Actor> Deliverable<A> for () {
     }
 }
 
+use bg_job::BoxedJob;
 pub mod bg_job {
+    use super::*;
+    use crate::deferred_span::DeferredSpanMethods;
     use blocking::Unblock;
 
-    use crate::deferred_span::DeferredSpanMethods;
-
-    use super::*;
+    pub(super) type BoxedJob<A> = LocalBoxFuture<'static, ErasedLocalDeliverable<A>>;
 
     pub struct Skip {
         _priv: (),
@@ -1673,7 +1736,12 @@ pub mod bg_job {
 
     // TODO: it's very annoying/difficult to pass a job around in different function calls and such.
     // Rust doesn't have auto for return values, so an impl Trait is the closest alternative. Create
-    // something like that?
+    // something like that? It is possible to use impl Train in type parameters, like Job<'_, impl
+    // Future<Output = ()>>, but that is cumbersome to write everywhere, but impl Trait in type
+    // aliases is unstable, which i think would be the perfect solution
+    // https://github.com/rust-lang/rust/issues/63063. It should be possible to provide a method
+    // alongside start that turns the job into a future that can be given to Control, but I don't
+    // think i want to expose those implementation details.
     #[must_use = "the job must be started to do anything"]
     pub struct Job<'a, F, S = Skip> {
         future: F,
@@ -1724,14 +1792,37 @@ pub mod bg_job {
     }
 
     impl<'a, F, S> Job<'a, F, NonSkip<S>> {
+        // NOTE: these are split into both dyn and concrete methods to keep the Controllable trait
+        // completely private.
         pub fn start<A, O>(self, ctl: &mut Control<A>)
+        where
+            // RANT: it's annoying that all these trait bounds have to be copy pasted everywhere :(
+            F: Future<Output = O> + 'static,
+            S: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
+            A: Actor,
+            O: 'static,
+        {
+            self.start_dyn(ctl)
+        }
+
+        pub fn pre_start<A, O>(self, ctl: &mut PreControl<A>)
         where
             F: Future<Output = O> + 'static,
             S: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
             A: Actor,
             O: 'static,
         {
-            let span = self.span.create_or(ctl.actor_span.clone());
+            self.start_dyn(ctl)
+        }
+
+        pub(super) fn start_dyn<A, O>(self, ctl: &mut dyn Controllable<A>)
+        where
+            F: Future<Output = O> + 'static,
+            S: AsyncFnOnce(&mut A, &mut Control<A>, O) + 'static,
+            A: Actor,
+            O: 'static,
+        {
+            let span = self.span.create_or(ctl.actor_span());
             let fut = {
                 let span = span.clone();
                 async move {
@@ -1762,7 +1853,23 @@ pub mod bg_job {
             F: Future<Output = ()> + 'static,
             A: Actor,
         {
-            let span = self.span.create_or(ctl.actor_span.clone());
+            self.start_dyn(ctl)
+        }
+
+        pub fn pre_start<A>(self, ctl: &mut PreControl<'_, A>)
+        where
+            F: Future<Output = ()> + 'static,
+            A: Actor,
+        {
+            self.start_dyn(ctl)
+        }
+
+        pub(super) fn start_dyn<A>(self, ctl: &mut dyn Controllable<A>)
+        where
+            F: Future<Output = ()> + 'static,
+            A: Actor,
+        {
+            let span = self.span.create_or(ctl.actor_span());
             let fut = async {
                 let output: () = self.future.await;
                 // NOTE: () is a zero-sized type, so the box is not actually allocating anything
@@ -1821,10 +1928,7 @@ pub mod bg_job {
             impl Actor for Alice {
                 type Corpse = NoError;
 
-                async fn enter(
-                    &mut self,
-                    ctl: &mut Control<Self>,
-                ) -> Result<(), actor_error!(Self)> {
+                async fn enter(&mut self, ctl: &mut Control<Self>) {
                     Job::new(async {
                         assert_span("double");
                         assert_parent_span("alice");
@@ -1861,8 +1965,6 @@ pub mod bg_job {
                         }
                     })
                     .start(ctl);
-
-                    Ok(())
                 }
             }
 
@@ -2262,12 +2364,8 @@ async fn actor_main<P: Hatchable>(
         return;
     };
 
-    if !try_enter(&mut ctl, &mut actor, home_adr).await {
-        return;
-    }
-
+    enter(&mut ctl, &mut actor, home_adr).await;
     main_loop(&mut ctl, rcv.as_mut(), &mut actor, yield_policy).await;
-
     leave(&mut ctl, actor).await;
 
     // XXX: make sure these haven't accidentaly moved. The actor has moved above and will thus get
@@ -2286,13 +2384,22 @@ async fn try_hatch<P: Hatchable>(
     // NOTE: to make sure the address is alive during hatch
     _home_adr: &Address<P::Actor>,
 ) -> Option<P::Actor> {
+    let mut pre = ctl.as_pre_control();
     trace!("Before");
-    let hatch_res = egg.hatch(ctl).await;
+    let hatch_res = egg.hatch(&mut pre).await;
     trace!("After");
 
     match hatch_res {
-        Ok(actor) => Some(actor),
+        Ok(actor) => {
+            pre.finish();
+            Some(actor)
+        }
         Err(err) => {
+            drop(pre);
+            // TODO: should these be at the error level? The process could malfunction without the
+            // user ever knowing. There should always be a parent actor that catches these kinds of
+            // errors, and it's probably a mistake if it doesn't. It's probably fine to log error or
+            // warning here, probably.
             debug!(error = &err as &dyn std::error::Error);
             if ctl
                 .exit_send
@@ -2307,34 +2414,15 @@ async fn try_hatch<P: Hatchable>(
 }
 
 #[instrument(skip_all, name = "enter")]
-async fn try_enter<A: Actor>(
+async fn enter<A: Actor>(
     ctl: &mut Control<A>,
     actor: &mut A,
     // NOTE: to make sure the address is alive during enter
     _home_adr: Address<A>,
-) -> bool {
+) {
     trace!("Before");
-    let enter_res = actor.enter(ctl).await;
-    let ok = enter_res.is_ok();
+    actor.enter(ctl).await;
     trace!("After");
-
-    match enter_res {
-        Ok(()) => {
-            let _: Result<_, _> = ctl.exit_send.send(State::Running);
-        }
-        Err(err) => {
-            debug!(error = &err as &dyn std::error::Error);
-            if ctl
-                .exit_send
-                .send(State::Failed(Mutex::new(Some(err))))
-                .is_err()
-            {
-                debug!("Failed to send failure, no receivers");
-            }
-        }
-    }
-
-    ok
 }
 
 #[instrument(skip_all, name = "leave")]
@@ -2494,6 +2582,8 @@ impl Stage {
         )
     }
 
+    // TODO: remove this method and only use the adhoc one? There shouldn't be any need for this one
+    // to be public anymore?
     pub fn summon<P: Hatchable>(&self, actor: impl Spawnable<P>) -> Address<P::Actor> {
         self.actor_builder().spawn(actor)
     }
@@ -2511,9 +2601,9 @@ impl Stage {
 
     pub fn play_adhoc<F>(self, func: F) -> Result<(), Whatever>
     where
-        F: AsyncFnOnce(&mut Control<AdHoc>) -> Result<(), Whatever> + 'static,
+        F: AsyncFnOnce(&mut PreControl<AdHoc>) -> Result<(), actor_error!(AdHoc)> + 'static,
     {
-        let adr = self.summon(AdHoc::egg(func)).downgrade();
+        let adr = self.summon(AdHocEgg::new(func)).downgrade();
         self.play().whatever_context("Stage failed")?;
         adr.take_error()
             .map_or(Ok(()), Err)
@@ -2655,15 +2745,11 @@ mod tests {
             impl Actor for Bob {
                 type Corpse = NoError;
 
-                async fn enter(
-                    &mut self,
-                    _ctl: &mut Control<Self>,
-                ) -> Result<(), actor_error!(Self)> {
+                async fn enter(&mut self, _ctl: &mut Control<Self>) {
                     info!("sending to alice");
                     let reply = self.alice.send_receive(5).await.unwrap();
                     let reply = reply.await.unwrap();
                     assert_eq!(reply, 25);
-                    Ok(())
                 }
             }
 

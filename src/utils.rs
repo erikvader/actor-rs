@@ -17,7 +17,11 @@ pub fn thread_info_span() -> Span {
         .map_or_else(|| "unnamed".to_string(), |s| s.to_string());
 
     let dbg = debug_span!("thread", os_id, ?rust_id, name);
-    if !dbg.is_disabled() {
+    // TODO: remove this false, i just don't want all fields when developing. The subscriber should
+    // be set up to disable this target instead.
+    // TODO: should these verbose fields just get logged once at the beginning instead? Best of both
+    // worlds? But that would be weird if there are two threads with the same name
+    if false && !dbg.is_disabled() {
         return dbg;
     }
 

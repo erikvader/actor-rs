@@ -1,15 +1,31 @@
 use crate::{
-    actor::{Actor, Control, Hatchable, MultiError},
-    whatever::Whatever,
+    actor::{Actor, Hatchable, MultiError, PreControl},
+    whatever::{Group, Whatever},
 };
 
-pub struct Egg<F> {
+pub struct AdHoc;
+
+impl Actor for AdHoc {
+    type Corpse = MultiError<Whatever>;
+}
+
+pub struct AdHocEgg<F> {
     func: F,
 }
 
-impl<F> Hatchable for Egg<F>
+impl<F> AdHocEgg<F>
 where
-    F: AsyncFnOnce(&mut Control<AdHoc>) -> Result<(), Whatever> + 'static,
+    // NOTE: this is not strictly necessary, but it helps the compiler give better error messages
+    F: AsyncFnOnce(&mut PreControl<AdHoc>) -> Result<(), crate::actor_error!(AdHoc)> + 'static,
+{
+    pub fn new(func: F) -> Self {
+        Self { func }
+    }
+}
+
+impl<F> Hatchable for AdHocEgg<F>
+where
+    F: AsyncFnOnce(&mut PreControl<AdHoc>) -> Result<(), crate::actor_error!(AdHoc)> + 'static,
 {
     type Actor = AdHoc;
 
@@ -19,26 +35,9 @@ where
 
     async fn hatch(
         self,
-        ctl: &mut Control<Self::Actor>,
+        ctl: &mut crate::actor::PreControl<'_, Self::Actor>,
     ) -> Result<Self::Actor, crate::actor_error!(Self::Actor)> {
         (self.func)(ctl).await?;
         Ok(AdHoc)
     }
-}
-
-pub struct AdHoc;
-
-impl AdHoc {
-    pub fn egg<F>(func: F) -> Egg<F>
-    where
-        // NOTE: this is not strictly needed here, but it greatly helps in giving good compiler
-        // messages
-        F: AsyncFnOnce(&mut Control<AdHoc>) -> Result<(), Whatever> + 'static,
-    {
-        Egg { func }
-    }
-}
-
-impl Actor for AdHoc {
-    type Corpse = MultiError<Whatever>;
 }

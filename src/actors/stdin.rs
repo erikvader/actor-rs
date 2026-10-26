@@ -5,7 +5,7 @@ use futures_util::{AsyncBufRead, AsyncBufReadExt, StreamExt, io::BufReader};
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    actor::{Actor, Control, Hatchable, OneError, Receive, SecretAddress, bg_job::Job},
+    actor::{Actor, Control, Hatchable, OneError, PreControl, Receive, SecretAddress, bg_job::Job},
     actor_error, deferred_info_span,
     kill_switch::{Bomb, Tick},
     signals::Interrupt,
@@ -37,18 +37,24 @@ impl Line {
     }
 }
 
-pub struct Egg {
+pub struct StdinEgg {
     send_to: SecretAddress<Line>,
 }
 
-impl Hatchable for Egg {
+impl StdinEgg {
+    pub fn new(send_to: SecretAddress<Line>) -> Self {
+        Self { send_to }
+    }
+}
+
+impl Hatchable for StdinEgg {
     type Actor = Stdin;
 
     crate::default_span!("stdin");
 
     async fn hatch(
         self,
-        ctl: &mut Control<Self::Actor>,
+        ctl: &mut PreControl<'_, Self::Actor>,
     ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
         // NOTE: this can't be sent to another thread, it's unblock that will send it to
         // a worker thread. It would be really nice if this could lock stdin for performance
@@ -75,12 +81,8 @@ pub struct Stdin {
 }
 
 impl Stdin {
-    pub fn egg(send_to: SecretAddress<Line>) -> Egg {
-        Egg { send_to }
-    }
-
     fn new(
-        ctl: &mut Control<Stdin>,
+        ctl: &mut PreControl<'_, Stdin>,
         send_to: SecretAddress<Line>,
         source: impl AsyncBufRead + 'static,
     ) -> Self {
@@ -128,7 +130,7 @@ impl Stdin {
             assert!(prev.is_none());
         })
         .instrument(deferred_info_span!("bg_job"))
-        .start(ctl);
+        .pre_start(ctl);
 
         Self { bomb }
     }
@@ -166,7 +168,7 @@ mod tests {
 
         async fn hatch(
             self,
-            ctl: &mut Control<Self::Actor>,
+            ctl: &mut PreControl<'_, Self::Actor>,
         ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
             let input = BufReader::new(self.data);
             Ok(Stdin::new(ctl, self.send_to, input))
