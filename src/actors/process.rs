@@ -1,4 +1,9 @@
-use std::{io, marker::PhantomData, process::Stdio, sync::Arc};
+use std::{
+    io,
+    marker::PhantomData,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+};
 
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader};
@@ -7,74 +12,112 @@ use snafu::{ResultExt, Snafu};
 use crate::{
     actor::{Actor, Control, Hatchable, OneError, PreControl, Receive, SecretAddress, bg_job::Job},
     actor_error, deferred_info_span,
-    deferred_span::DeferredSpan,
-    kill_switch::{Bomb, Tick},
 };
 
+type Pid = u32;
+
 #[derive(Debug, Clone, Snafu)]
-pub enum Error {
-    #[snafu(display("Process failed to start"))]
-    Start {
+pub enum ProcessError {
+    #[snafu(display("Process failed to spawn"))]
+    Spawn {
         #[snafu(source(from(std::io::Error, Arc::new)))]
         source: Arc<std::io::Error>,
     },
-    #[snafu(display("The process died with a non-zero exit status"))]
-    ExitError,
+    #[snafu(display("The process died with a non-zero exit status: {status}"))]
+    NonZero { status: ExitStatus },
+    #[snafu(display("Failed to wait for process termination"))]
+    Exit {
+        #[snafu(source(from(std::io::Error, Arc::new)))]
+        source: Arc<std::io::Error>,
+    },
 }
 
-trait ChildStream: AsyncRead {
-    fn kind() -> &'static str;
+#[derive(Clone, Copy, Debug)]
+pub enum Std {
+    Out,
+    Err,
+}
+
+trait ChildStream: AsyncRead + 'static {
+    fn kind() -> Std;
 }
 
 impl ChildStream for ChildStdout {
-    fn kind() -> &'static str {
-        "stdout"
+    fn kind() -> Std {
+        Std::Out
     }
 }
 
 impl ChildStream for ChildStderr {
-    fn kind() -> &'static str {
-        "stderr"
+    fn kind() -> Std {
+        Std::Err
     }
 }
 
 pub enum OutputConfig {
     DevNull,
     Inherit,
+    // TODO: handle non-utf8 strings?
     LogLineUtf8,
-    // TODO: SendLineUtf8(Address)
+    SendLineUtf8(SecretAddress<OutputLine>),
 }
 
 impl OutputConfig {
-    fn start_job<A: Actor, S: ChildStream + 'static>(
-        self,
-        ctl: &mut PreControl<'_, A>,
-        stream: Option<S>,
-        bomb: Bomb,
-    ) {
+    fn start_job<A: Actor, S: ChildStream>(self, ctl: &mut PreControl<'_, A>, stream: Option<S>) {
+        async fn log_the_lines(stream: impl ChildStream) {
+            let read = BufReader::new(stream).lines();
+            read.for_each(async |line| match line {
+                Ok(line) => tracing::info!("{line}"),
+                Err(err) => {
+                    tracing::debug!(error = &err as &dyn std::error::Error);
+                    if err.kind() == io::ErrorKind::InvalidData {
+                        tracing::error!("Read a line that didn't contain valid UTF-8");
+                    }
+                }
+            })
+            .await;
+        }
+
+        async fn send_the_lines(
+            stream: impl ChildStream,
+            adr: SecretAddress<OutputLine>,
+            kind: Std,
+        ) {
+            let read = BufReader::new(stream).lines();
+            read.for_each(async |line| match line {
+                Ok(line) => {
+                    tracing::trace!("Read: '{line}'");
+                    if let Err(err) = adr.send(OutputLine { source: kind, line }).await {
+                        // NOTE: should not exit early here, since the process could be doing
+                        // something, and it should not be killed from a broken pipe.
+                        tracing::debug!(error = &err as &dyn std::error::Error, "Receiver dead?");
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(error = &err as &dyn std::error::Error);
+                    if err.kind() == io::ErrorKind::InvalidData {
+                        tracing::error!("Read a line that didn't contain valid UTF-8");
+                    }
+                }
+            })
+            .await;
+        }
+
         let kind = S::kind();
         match self {
             OutputConfig::DevNull | OutputConfig::Inherit => assert!(stream.is_none()),
             OutputConfig::LogLineUtf8 => {
-                Job::new({
-                    let stream = stream.expect("should be present");
-                    async move {
-                        // TODO: i need to handle these read lines better somehow
-                        let read = BufReader::new(stream).lines();
-                        let read = bomb.attach_stream(read);
-                        read.for_each(async |line| match line {
-                            Tick::Tock(Ok(line)) => tracing::info!("{line}"),
-                            // TODO: do i really want to print every error? Only the utf-8 decode one is relevant
-                            // here?
-                            Tick::Tock(Err(err)) => {
-                                tracing::error!(error = &err as &dyn std::error::Error)
-                            }
-                            Tick::Boom => (),
-                        })
-                        .await;
-                    }
-                })
-                .instrument(deferred_info_span!("stream", kind))
+                Job::new(log_the_lines(stream.expect("should be present")))
+                    .instrument(deferred_info_span!("log", std = ?kind))
+                    .pre_start(ctl);
+            }
+            OutputConfig::SendLineUtf8(adr) => {
+                Job::new(send_the_lines(
+                    stream.expect("should be present"),
+                    adr,
+                    kind,
+                ))
+                .instrument(deferred_info_span!("send", std = ?kind))
                 .pre_start(ctl);
             }
         }
@@ -85,6 +128,7 @@ impl OutputConfig {
             OutputConfig::DevNull => Stdio::null(),
             OutputConfig::LogLineUtf8 => Stdio::piped(),
             OutputConfig::Inherit => Stdio::inherit(),
+            OutputConfig::SendLineUtf8(_) => Stdio::piped(),
         }
     }
 }
@@ -135,6 +179,8 @@ impl InputType for Unpiped {
 }
 
 // TODO: add ways to modify the environment?
+// TODO: add a config to spawn the process in its own group? The kill could be sent to the entire
+// group in that case. Just a thought, not even sure it's a good idea
 pub struct ProcessEgg<I: InputType> {
     exe: String,
     args: Vec<String>,
@@ -145,6 +191,7 @@ pub struct ProcessEgg<I: InputType> {
     input_config: InputConfig,
     output_config: OutputConfig,
     errput_config: OutputConfig,
+    kill_on_drop: bool,
 }
 
 impl ProcessEgg<Unpiped> {
@@ -156,6 +203,7 @@ impl ProcessEgg<Unpiped> {
             output_config: OutputConfig::DevNull,
             errput_config: OutputConfig::DevNull,
             _phantom: PhantomData,
+            kill_on_drop: true,
         }
     }
 
@@ -167,6 +215,7 @@ impl ProcessEgg<Unpiped> {
             output_config,
             errput_config,
             _phantom: _,
+            kill_on_drop,
         } = self;
         debug_assert!(matches!(input_config, InputConfig::DevNull));
 
@@ -177,12 +226,20 @@ impl ProcessEgg<Unpiped> {
             output_config,
             errput_config,
             _phantom: PhantomData,
+            kill_on_drop,
         }
     }
 
     pub fn stdin_inherit(self) -> Self {
         Self {
             input_config: InputConfig::Inherit,
+            ..self
+        }
+    }
+
+    pub fn kill_on_drop(self, doit: bool) -> Self {
+        Self {
+            kill_on_drop: doit,
             ..self
         }
     }
@@ -217,15 +274,7 @@ where
 {
     type Actor = Process<I>;
 
-    fn span(&self) -> DeferredSpan<'_> {
-        // TODO: make args into an option instead? How are those even printed? Do like utils::type_name?
-        // TODO: even have all this info here? Is it too long? Just log once when starting? The exe
-        // can get long if an absolute path is provided.
-        crate::deferred_span_or!(
-            crate::deferred_direct_span!(tracing::Level::DEBUG, "process", exe = self.exe, args = ?self.args);
-            crate::deferred_direct_span!(tracing::Level::INFO, "process", exe = self.exe);
-        )
-    }
+    crate::default_span!("process");
 
     async fn hatch(
         self,
@@ -245,285 +294,190 @@ where
                     error = &err as &dyn std::error::Error,
                     "Could not spawn process"
                 );
-                return Err(err).context(StartSnafu);
+                return Err(err).context(SpawnSnafu);
             }
         };
 
-        let pid = child.id();
+        // TODO: record this on the actor span?
+        let pid: Pid = child.id();
+        assert!(pid > 0, "a valid pid is 1 or greater, at least on linux");
         tracing::debug!(pid, "Spawn success");
+        let kill_guard = {
+            let mut g = SoftKillGuard::new(pid);
+            if !self.kill_on_drop {
+                g.defuse();
+            }
+            g
+        };
+
         let input = I::create(&mut child.stdin);
-        let bomb = Bomb::new();
+        self.output_config.start_job(ctl, child.stdout.take());
+        self.errput_config.start_job(ctl, child.stderr.take());
 
-        self.output_config
-            .start_job(ctl, child.stdout.take(), bomb.clone());
-        self.errput_config
-            .start_job(ctl, child.stderr.take(), bomb.clone());
+        Job::new(async move {
+            debug_assert!(
+                child.stdin.is_none(),
+                "child::status drops stdin, but it should already have been taken at this point"
+            );
+            let status = child.status().await;
+            tracing::trace!(?status, "Process died");
+            status
+        })
+        .then(
+            async |me, ctl: &mut Control<Process<_>>, status: Result<ExitStatus, _>| {
+                me.kill_guard.defuse();
+                match status {
+                    Ok(status) if status.success() => tracing::debug!("{status}"),
+                    Ok(status) => {
+                        tracing::debug!("{status}");
+                        ctl.corpse_mut()
+                            .replace(NonZeroSnafu { status }.build())
+                            .expect("the error is only set here");
+                    }
+                    // RANT: i don't understand why this error case is here... It seems like, on linux
+                    // at least, that rust already handles sporadic wakeups of the syscall, and the
+                    // other error cases are like if the pid is invalid, which i trust the standard
+                    // library to not mess up. So it feels like this is just extra complexity, but im
+                    // handling it just in case.
+                    Err(err) => {
+                        ctl.corpse_mut()
+                            .replace_result(Err(err).context(ExitSnafu))
+                            .expect("the error is only set here");
+                    }
+                }
+            },
+        )
+        .instrument(deferred_info_span!("waiter"))
+        .pre_start(ctl);
 
-        //         // ctl.start_job(
-        //         //     async move |bomb| {
-        //         //         let mut status = pin!(child.status());
-        //         //         // TODO: kill if heart is activated?
-        //         //         let res = bomb.attach_future(&mut status).await;
-        //         //         status.await;
-        //         //         tracing::debug!(?res, "Process died"); // TODO: log with error on error?
-        //         //     },
-        //         //     |parent| tracing::info_span!(parent: parent, "wait_job"),
-        //         // );
-
-        Ok(Process { input, bomb, pid })
+        Ok(Process { input, kill_guard })
     }
 }
 
-// TODO: when and how to kill the process? Start with sigterm and escalate?
+// TODO: should this actor run the async_process::driver? The stage? Let it handle itself? It will
+// spawn its own thread, im pretty sure, unless something is polling the driver. But i feel it's
+// more complicated to handle it myself, and i don't know how well it handles having multiple such
+// futures and them getting dropped etc. It also doesn't feel like it is worth the effort to worry
+// about this.
 pub struct Process<I: InputType> {
     input: I,
-    bomb: Bomb,
-    pid: u32,
+    kill_guard: SoftKillGuard,
 }
 
 impl<I> Actor for Process<I>
 where
     I: InputType,
 {
-    type Corpse = OneError<Error>;
+    type Corpse = OneError<ProcessError>;
+}
+
+pub struct InputLine(pub String);
+pub struct OutputLine {
+    pub source: Std,
+    pub line: String,
 }
 
 impl Receive<InputLine> for Process<Piped> {
     type Retval = ();
 
     async fn receive(&mut self, msg: InputLine, _ctl: &mut Control<Self>) -> Self::Retval {
-        // // TODO: if this hangs it won't be possible to terminate the process? It will most likely be
-        // // fine since since a C-c from a terminal will send sigint to the process as well, but I
-        // // don't like that an actor can deadlock itself.
-        // let msg = msg.line + "\n";
-        // if let Err(err) = self.input.write(msg.as_bytes()).await {
-        //     // TODO: i think this pretty much only can error if the process has died, so close the
-        //     // actor early.
-        //     tracing::error!(
-        //         error = &err as &dyn std::error::Error,
-        //         "Failed to write to process"
-        //     );
-        // }
+        // TODO: if this hangs it won't be possible to terminate the process? It will most likely be
+        // fine since since a C-c from a terminal will send sigint to the process as well, but I
+        // don't like that an actor can deadlock itself. I have written down ideas on possible
+        // solutions in another todo.
+        let InputLine(msg) = msg;
+        let msg = msg + "\n";
+        if let Err(err) = self.input.handle.write(msg.as_bytes()).await {
+            // NOTE: i think this pretty much only can error if the process has died
+            tracing::debug!(
+                error = &err as &dyn std::error::Error,
+                "Failed to write to process"
+            );
+        }
     }
 }
 
-// trait Input {
-//     fn configure(&self) -> Stdio;
-//     fn register(&mut self, stdin: &mut Option<ChildStdin>);
-//     async fn write(&mut self, data: &[u8]) -> io::Result<()>;
-// }
+impl<I: InputType> Receive<crate::signals::Interrupt> for Process<I> {
+    type Retval = ();
 
-// pub struct Piped {
-//     stdin: Option<ChildStdin>,
-// }
-// impl Input for Piped {
-//     fn configure(&self) -> Stdio {
-//         Stdio::piped()
-//     }
-
-//     fn register(&mut self, stdin: &mut Option<ChildStdin>) {
-//         self.stdin = stdin.take();
-//         assert!(self.stdin.is_some());
-//     }
-
-//     async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-//         let stdin = self.stdin.as_mut().unwrap();
-//         stdin.write_all(data).await?;
-//         // NOTE: I don't think this does anything for a stdin handle, at least not in the stdlib,
-//         // but it doesn't hurt to have it here.
-//         stdin.flush().await
-//     }
-// }
-
-// pub struct DevNull;
-// impl Input for DevNull {
-//     fn configure(&self) -> Stdio {
-//         Stdio::null()
-//     }
-
-//     fn register(&mut self, stdin: &mut Option<ChildStdin>) {
-//         assert!(stdin.is_none());
-//     }
-
-//     async fn write(&mut self, _data: &[u8]) -> io::Result<()> {
-//         panic!("I should not be able to be called");
-//     }
-// }
-// impl<S> Output<S> for DevNull {
-//     fn configure(&self) -> Stdio {
-//         Stdio::null()
-//     }
-
-//     async fn process(&self, sink: Option<S>) {
-//         assert!(sink.is_none());
-//     }
-// }
-
-// trait Output<S> {
-//     fn configure(&self) -> Stdio;
-//     async fn process(&self, sink: Option<S>);
-// }
-
-// pub struct LineUtf8 {
-//     adr: SecretAddress<OutputLine>,
-// }
-// impl<S> Output<S> for LineUtf8 {
-//     fn configure(&self) -> Stdio {
-//         Stdio::piped()
-//     }
-
-//     async fn process(&self, sink: Option<S>) {
-//         todo!()
-//     }
-// }
-
-// pub struct AllBytes {
-//     adr: SecretAddress<OutputBytes>,
-// }
-// impl<S> Output<S> for AllBytes {
-//     fn configure(&self) -> Stdio {
-//         Stdio::piped()
-//     }
-
-//     async fn process(&self, sink: Option<S>) {
-//         todo!()
-//     }
-// }
-
-// pub struct LogLineUtf8;
-// impl LogLineUtf8 {
-//     async fn print<R: AsyncRead>(&self, name: &'static str, read: R) {
-//         // NOTE: I know it's an anti-pattern to wrap a generic AsyncRead in a buffer, but in this
-//         // case, the readable will only be either child stdout or stderr, and this function takes
-//         // ownership of them, so it's okay in this case.
-//         // TODO: use a custom private trait that is only implemented on stdout and stderr instead of
-//         // asyncread.
-//         let read = BufReader::new(read).lines();
-//         read.for_each(async |line| match line {
-//             Ok(line) => tracing::info!("{name}: {line}"),
-//             // TODO: do i really want to print every error? Only the utf-8 decode one is relevant
-//             // here?
-//             Err(err) => tracing::error!(error = &err as &dyn std::error::Error, "{name}"),
-//         })
-//         .await;
-//     }
-// }
-
-// impl<S: AsyncRead> Output<S> for LogLineUtf8 {
-//     fn configure(&self) -> Stdio {
-//         Stdio::piped()
-//     }
-
-//     async fn process(&self, sink: Option<S>) {
-//         // TODO: what should the first argument be set to?
-//         self.print("stderr", sink.expect("should be set")).await
-//     }
-// }
-
-// pub enum Std {
-//     Out,
-//     Err,
-// }
-
-// pub struct OutputLine {
-//     source: Std,
-//     line: String,
-// }
-
-// pub struct OutputBytes {
-//     source: Std,
-//     data: Vec<u8>,
-// }
-
-pub struct InputLine {
-    line: String,
+    async fn receive(
+        &mut self,
+        _msg: crate::signals::Interrupt,
+        _ctl: &mut Control<Self>,
+    ) -> Self::Retval {
+        // TODO: don't escale kill signals automatically, instead, make different messages and let
+        // the user decide. Maybe a combined messages can escalates after some timeout. Or maybe
+        // configure this in the egg and only have this interrupt message. This is mostly do deal
+        // with non-cooperative processes.
+        self.kill_guard.detonate();
+    }
 }
 
-// pub struct InputBytes {
-//     data: Vec<u8>,
-// }
+#[cfg(unix)]
+fn soft_kill(pid: Pid) -> io::Result<()> {
+    let pid: libc::pid_t = pid
+        .try_into()
+        .expect("this will never fail on unix, the pid can't be too large");
+    debug_assert!(
+        pid >= 0,
+        "the pid can't be negative cuz it came from an unsigned type"
+    );
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "The pid={pid} must be 1 or greater, \
+                 else it will target process groups instead"
+            ),
+        ));
+    }
 
-// // TODO: interrupt should send sigterm
-// // TODO: kill on drop?
-// impl<I> Actor for Process<I>
-// where
-//     I: Input + 'static,
-//     O: Output<ChildStdout> + 'static,
-//     E: Output<ChildStderr> + 'static,
-// {
-//     type Corpse = OneError<Error>;
+    tracing::debug!("Sending SIGTERM to {pid}");
 
-//     // TODO: use Option instead of deferred_span_or for optional fields? Create a nice helper?
-//     // TODO: move to the correct place
-//     // fn span(&self) -> DeferredSpan<'_> {
-//     //     crate::deferred_span_or!(
-//     //         crate::deferred_direct_span!(tracing::Level::DEBUG, "process", exe = self.exe, args = ?self.args);
-//     //         crate::deferred_direct_span!(tracing::Level::INFO, "process", exe = self.exe);
-//     //     )
-//     // }
+    // SAFETY: this isn't really unsafe, it's only marked cuz it's an external C function
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
 
-//     // TODO: should this actor run the async_process::driver? The stage?
-//     async fn enter(&mut self, ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
-//         let output = self.output.take().expect("will be here");
-//         let errput = self.errput.take().expect("will be here");
+    Ok(())
+}
 
-//         tracing::debug!("Spawning process");
-//         let mut cmd = Command::new(&self.exe);
-//         cmd.args(&self.args);
-//         cmd.stdin(self.input.configure());
-//         cmd.stdout(output.configure());
-//         cmd.stderr(errput.configure());
+#[derive(Debug)]
+struct SoftKillGuard {
+    pid: Pid,
+    defused: bool,
+}
 
-//         let mut child = match cmd.spawn() {
-//             Ok(child) => {
-//                 tracing::debug!(pid = child.id(), "Spawned process");
-//                 child
-//             }
-//             Err(err) => {
-//                 tracing::error!(
-//                     error = &err as &dyn std::error::Error,
-//                     "Could not spawn process"
-//                 );
-//                 self.result = Err(err).context(StartSnafu);
-//                 ctl.close_and_clear_mailbox();
-//                 return Ok(());
-//             }
-//         };
+impl SoftKillGuard {
+    fn new(pid: Pid) -> Self {
+        Self {
+            pid,
+            defused: false,
+        }
+    }
 
-//         self.input.register(&mut child.stdin);
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
 
-//         Job::new({
-//             let stdout = child.stdout.take();
-//             let stderr = child.stderr.take();
-//             let bomb = self.bomb.clone();
-//             async move {
-//                 let out = output.process(stdout);
-//                 let err = errput.process(stderr);
-//                 let res = bomb
-//                     .attach_future(futures_util::future::join(out, err))
-//                     .await;
-//                 tracing::debug!(?res);
-//             }
-//         })
-//         .instrument(deferred_info_span!("outputs"))
-//         .start(ctl);
+    fn detonate(&mut self) {
+        if self.defused {
+            return;
+        }
 
-//         // ctl.start_job(
-//         //     async move |bomb| {
-//         //         let mut status = pin!(child.status());
-//         //         // TODO: kill if heart is activated?
-//         //         let res = bomb.attach_future(&mut status).await;
-//         //         status.await;
-//         //         tracing::debug!(?res, "Process died"); // TODO: log with error on error?
-//         //     },
-//         //     |parent| tracing::info_span!(parent: parent, "wait_job"),
-//         // );
+        self.defuse();
+        if let Err(e) = soft_kill(self.pid) {
+            tracing::debug!(
+                error = &e as &dyn std::error::Error,
+                "Failed to kill process, probably already dead"
+            )
+        }
+    }
+}
 
-//         Ok(())
-//     }
-
-//     // TODO:
-//     // async fn leave(self, _ctl: &mut Control<Self>) -> Result<(), actor_error!(Self)> {
-//     //     self.result
-//     // }
-// }
+impl Drop for SoftKillGuard {
+    #[tracing::instrument]
+    fn drop(&mut self) {
+        self.detonate();
+    }
+}

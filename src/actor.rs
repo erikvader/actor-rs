@@ -9,7 +9,6 @@ use crate::{
     kill_switch::{self, Bomb},
     signals::{ActorGuard, SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
-    utils::type_name,
     whatever::Whatever,
 };
 use async_channel as channel;
@@ -23,13 +22,14 @@ use futures_util::{
 use snafu::prelude::*;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
+    any::type_name,
     marker::PhantomData,
     num::NonZeroUsize,
     pin::pin,
     rc::{Rc, Weak},
     sync::Mutex,
 };
-use tracing::{Instrument, Level, Span, debug, debug_span, instrument, span, trace, trace_span};
+use tracing::{Instrument, Level, Span, debug, debug_span, instrument, span, trace};
 
 // TODO: this module probably needs to be split up into several submodules, but it's super tedious
 // and rust-analyzer isn't that big of a help.
@@ -234,6 +234,9 @@ pub struct Control<A: Actor> {
     bg_jobs: FuturesUnordered<BoxedJob<A>>,
     idgen: IdGenerator,
     thread_root_span: Span,
+    // TODO: create a record method that can record values on the actor span, could be used for
+    // things like adding the process id to its span, for example, but i don't think i want to do
+    // that in that specific case.
     actor_span: Span,
     _signal_guard: Option<ActorGuard>,
     // HACK: these are last so they are dropped last, right before the task terminates. The actor is
@@ -294,10 +297,11 @@ pub use builder::{
     WithYieldPolicy,
 };
 mod builder {
+    use std::any::type_name;
+
     use crate::{
         deferred_span::{DeferredDirectSpan, DeferredSpanMethods},
         signals::Interrupt,
-        utils::type_name,
     };
 
     use super::*;
@@ -375,9 +379,6 @@ mod builder {
 
             let sig_guard = spawnable.install_signals(&home);
 
-            // TODO: i guess it would be cool to save the span that comes from the trait in the
-            // control, because then it would be possible to record values on it later on, in for
-            // example hatch.
             let root_span = Self::create_root_span(id).create_or(self.thread_root_span.clone());
             let span = spawnable.user_span(root_span);
 
@@ -437,6 +438,7 @@ mod builder {
             bg_job::Job::new({
                 let mut weak = self.adr.downgrade();
                 async move {
+                    tracing::debug!(wait.type = type_name::<C>());
                     // TODO: this actually only needs to inspect the error, but that was very
                     // difficult to achieve with a mutex inside an async watch.
                     match weak.join_steal().await {
@@ -450,7 +452,7 @@ mod builder {
             })
             .instrument({
                 let id = self.adr.id();
-                crate::deferred_span!(Level::ERROR, "log", wait.type = type_name::<C>(), wait.id = id)
+                crate::deferred_span!(Level::ERROR, "log", wait.id = id)
             })
             .start_dyn(self.ctl);
 
@@ -465,7 +467,13 @@ mod builder {
         {
             bg_job::Job::new({
                 let mut weak = self.adr.downgrade();
-                async move { snafu::ResultExt::whatever_context(weak.join_steal().await, "Actor exited with an error") }
+                async move {
+                    tracing::debug!(wait.type = type_name::<C>());
+                    snafu::ResultExt::whatever_context(
+                        weak.join_steal().await,
+                        "Actor exited with an error",
+                    )
+                }
             })
             .then(async |_, ctl, res: Result<(), W>| {
                 tracing::debug!(?res, "Joined");
@@ -476,7 +484,7 @@ mod builder {
             })
             .instrument({
                 let id = self.adr.id();
-                crate::deferred_span!(Level::ERROR, "aggregate", wait.type = type_name::<C>(), wait.id = id)
+                crate::deferred_span!(Level::ERROR, "aggregate", wait.id = id)
             })
             .start_dyn(self.ctl);
 
@@ -940,8 +948,6 @@ mod scope {
 use adr_core::{AdrCore, AdrRcv, ErasedAdr, WeakAdrCore};
 pub use adr_core::{Reply, ReplyError, SendError, TrySendError};
 mod adr_core {
-    use crate::utils::type_name;
-
     use super::{
         Actor, CanSendPackage, CanSendTicket, DummyActor, ErasedDeliverable, Id, MailboxSize,
         OneWayTicket, Package, Receive,
@@ -951,6 +957,7 @@ mod adr_core {
     use snafu::{OptionExt, Snafu};
     use static_assertions::assert_impl_all;
     use std::any::Any;
+    use std::any::type_name;
 
     pub(super) type AdrRcv<A> = channel::Receiver<ErasedDeliverable<A>>;
 
@@ -1663,15 +1670,15 @@ where
             // same effect by cloning the address and sending it alongside the message. It's not as
             // efficient, but it achieves the same thing, which is good enough for me.
             let _keep_alive = self.erased;
-            trace!("Received message");
+            trace!(
+                msg = type_name::<T>(),
+                return = type_name::<A::Retval>(),
+                "Received message"
+            );
             let ret = actor.receive(self.msg, ctl).await;
             let _: Result<_, _> = self.returner.send(ret);
         }
-        .instrument(trace_span!(
-            "snd_rcv",
-            msg = type_name::<T>(),
-            return = type_name::<A::Retval>(),
-        ))
+        .instrument(debug_span!("snd_rcv"))
         .boxed_local()
     }
 }
@@ -1693,10 +1700,10 @@ where
     ) -> LocalBoxFuture<'a, ()> {
         async move {
             let _keep_alive = self.erased;
-            trace!("Received message");
+            trace!(msg = type_name::<T>(), "Received message");
             let _ret = actor.receive(self.msg, ctl).await;
         }
-        .instrument(trace_span!("oneway", msg = type_name::<T>(),))
+        .instrument(debug_span!("oneway"))
         .boxed_local()
     }
 }
@@ -2489,6 +2496,13 @@ async fn main_loop<A: Actor>(
                 Some(Event::Msg(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
+                    // TODO: if one of these blocks forever, then the whole actor locks up and there
+                    // is no way to terminate this delivery externally via another message. This is
+                    // a problem in e.g. the process actor. A possible solution is to have a
+                    // separate high-prio channel that will always execute as soon as something from
+                    // the normal queue returns Poll::Pending. Another solution is to maybe have per
+                    // actor anxillary data in each Address and per actor custom methods, so e.g.
+                    // process could save the pid there and a custom method could call kill.
                     delivery.deliver(actor, ctl).await
                 }
                 Some(Event::BgJob(delivery)) => {
@@ -2753,7 +2767,7 @@ mod tests {
                 }
             }
 
-            let _span = thread_info_span().entered();
+            let _span = thread_info_span();
             let main_stage = Stage::new();
             let alice_adr = main_stage.summon(Alice);
 
@@ -2761,7 +2775,7 @@ mod tests {
                 let alice_adr = alice_adr.remote();
                 let core = main_stage.core();
                 || {
-                    let _span = thread_info_span().entered();
+                    let _span = thread_info_span();
                     let stage = Stage::from_core(core);
                     stage.summon(Bob { alice: alice_adr });
                     stage.assert_plays_within(100);

@@ -41,13 +41,19 @@ fn setup_tracing() {
     tracing_subscriber::registry()
         .with(fmt)
         .with(ErrorLayer::default())
+        // NOTE: this is last to filter out spans as early as possible. There is first a filtering
+        // step that goes outside in (each .with wraps what they're are called on), as soon as a
+        // layer says interest::never it short circuits and the span is disabled. Then, the second
+        // step is when events are processed, and that is inside out, because the events needs to be
+        // registered in the registry first. So that needs to be taken into account if layers depend
+        // on each other.
         .with(global_filter)
         .init();
 }
 
 fn main() -> actor_rs::signals::SigTerminate<actor_rs::whatever::Report> {
     setup_tracing();
-    let _span = actor_rs::utils::thread_info_span().entered();
+    let _span = actor_rs::utils::thread_info_span();
     let signals = Signals::new().expect("Couldn't create signal handler");
     let res = inner_main(&signals);
     signals.terminate(res.into())

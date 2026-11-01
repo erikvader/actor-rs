@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[derive(Debug, Snafu, Clone)]
-pub enum Error {
+pub enum StdinError {
     #[snafu(display("Failed while reading the next line"))]
     Reader {
         #[snafu(source(from(std::io::Error, Arc::new)))]
@@ -137,7 +137,7 @@ impl Stdin {
 }
 
 impl Actor for Stdin {
-    type Corpse = OneError<Error>;
+    type Corpse = OneError<StdinError>;
 }
 
 impl Receive<Interrupt> for Stdin {

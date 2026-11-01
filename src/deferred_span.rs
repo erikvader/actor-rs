@@ -1,5 +1,10 @@
 use tracing::Span;
 
+// NOTE: i needed to allow unknown user code to create spans with a library provided parent span,
+// and i didn't like the idea of temporarily entering the parent span just to make sure the user
+// child span would get the correct parent. So this DeferredSpan is a way for a user to define a
+// span where a parent can be given later, and it can't be accidentally (or intentionally) skipped
+// like in the temporary entering method.
 pub struct DeferredDirectSpan<F> {
     creator: F,
 }

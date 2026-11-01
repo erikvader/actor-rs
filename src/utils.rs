@@ -1,4 +1,5 @@
-use tracing::{Span, debug_span, info_span};
+// TODO: rename this module to thread_utils since there is only thread related functions here?
+use tracing::{info_span, span::EnteredSpan};
 
 // TODO: fallback or support for other platforms
 #[cfg(target_os = "linux")]
@@ -6,8 +7,11 @@ unsafe extern "C" {
     fn gettid() -> i32;
 }
 
-#[must_use = "This span must be used to do anything, consider entering it"]
-pub fn thread_info_span() -> Span {
+// NOTE: it feels wrong to return an entered span, but it feels even more wrong to NOT immediately
+// enter the span returned from this. I could probably make this pub(crate), but i want to support
+// users that spawn threads by their own means.
+#[must_use = "This span must be saved to a variable, it will instantly get dropped otherwise"]
+pub fn thread_info_span() -> EnteredSpan {
     // SAFETY: i don't think this function can fail
     let os_id = unsafe { gettid() };
     let current = std::thread::current();
@@ -16,16 +20,15 @@ pub fn thread_info_span() -> Span {
         .name()
         .map_or_else(|| "unnamed".to_string(), |s| s.to_string());
 
-    let dbg = debug_span!("thread", os_id, ?rust_id, name);
-    // TODO: remove this false, i just don't want all fields when developing. The subscriber should
-    // be set up to disable this target instead.
-    // TODO: should these verbose fields just get logged once at the beginning instead? Best of both
-    // worlds? But that would be weird if there are two threads with the same name
-    if false && !dbg.is_disabled() {
-        return dbg;
-    }
+    // TODO: it would be cool if the internal thread id could be appended to the name to make it
+    // 100% unique. The name is nice since it is more describing than just a number.
+    let entered = info_span!("thread", name).entered();
 
-    info_span!("thread", name)
+    // RANT: the rust thread is can't be printed in a compact way as just a number, it has to
+    // include the whole debug output with its type and stuff.
+    tracing::debug!(os_id, ?rust_id, name);
+
+    entered
 }
 
 pub fn spawn<F, T>(name: impl Into<String>, fun: F) -> std::thread::JoinHandle<T>
@@ -36,17 +39,8 @@ where
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let _span = thread_info_span().entered();
+            let _span = thread_info_span();
             fun()
         })
         .expect("failed to spawn thread")
-}
-
-pub fn type_name<T: ?Sized>() -> Option<&'static str> {
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        // NOTE: it would be nice if this could be shortened, but it's output is not stable and can
-        // change in future rust versions, so it's probably best to leave this untouched
-        return Some(std::any::type_name::<T>());
-    }
-    None
 }

@@ -16,6 +16,7 @@ futures-core = "0.3.32"
 #NOTE: this includes so many various things i don't use, so i only include the features i
 #actually use
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
+libc = "0.2.191"
 #NOTE: this one has no default features, so i have to activate these here
 oneshot = { version = "0.2.1", features = ["async", "std"] }
 pin-project = "1.1.13"

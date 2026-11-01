@@ -1,6 +1,6 @@
 use crate::{
     actor::{Actor, Hatchable, MultiError, PreControl},
-    whatever::{Group, Whatever},
+    whatever::Whatever,
 };
 
 pub struct AdHoc;
@@ -29,14 +29,13 @@ where
 {
     type Actor = AdHoc;
 
-    fn span(&self) -> crate::deferred_span::DeferredSpan<'_> {
-        crate::deferred_info_span!("adhoc", func = crate::utils::type_name::<F>())
-    }
+    crate::default_span!("adhoc");
 
     async fn hatch(
         self,
         ctl: &mut crate::actor::PreControl<'_, Self::Actor>,
     ) -> Result<Self::Actor, crate::actor_error!(Self::Actor)> {
+        tracing::debug!(closure.type = std::any::type_name::<F>());
         (self.func)(ctl).await?;
         Ok(AdHoc)
     }
