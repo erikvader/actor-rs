@@ -1,8 +1,9 @@
 use std::{
+    ffi::OsStr,
     io,
     marker::PhantomData,
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
@@ -54,10 +55,13 @@ impl ChildStream for ChildStderr {
     }
 }
 
+// TODO: impl debug but skip the argument in SendLineUtf8? Or make SecretAddress also Debug?
+#[derive(Default)]
 pub enum OutputConfig {
     DevNull,
     Inherit,
-    // TODO: handle non-utf8 strings?
+    #[default]
+    // TODO: handle non-utf8 strings as well?
     LogLineUtf8,
     SendLineUtf8(SecretAddress<OutputLine>),
 }
@@ -179,92 +183,85 @@ impl InputType for Unpiped {
 }
 
 // TODO: add ways to modify the environment?
+// TODO: add ways to change the current dir of the spawned process
 // TODO: add a config to spawn the process in its own group? The kill could be sent to the entire
-// group in that case. Just a thought, not even sure it's a good idea
+// group in that case. Just a thought, not even sure it's a good idea. The stdlib has nightly API
+// for this
+// TODO: close the stdin handle if EOF is reached. Simply drop the ChildStdin.
 pub struct ProcessEgg<I: InputType> {
-    exe: String,
-    args: Vec<String>,
-    // NOTE: this function pointer is used to make sure I isn't affecting any auto traits of this
+    cmd: Command,
+    // NOTE: this function pointer is used to make sure it isn't affecting any auto traits of this
     // struct. The return value variant is used to have the same variance as simply I, but it
     // doesn't matter in this case, i'm pretty sure, since no lifetimes are used.
     _phantom: PhantomData<fn() -> I>,
-    input_config: InputConfig,
-    output_config: OutputConfig,
-    errput_config: OutputConfig,
     kill_on_drop: bool,
+    stdout_config: OutputConfig,
+    stderr_config: OutputConfig,
 }
 
 impl ProcessEgg<Unpiped> {
-    pub fn new(exe: impl Into<String>) -> Self {
+    pub fn new(exe: impl AsRef<OsStr>) -> Self {
+        let mut cmd = Command::new(exe);
+        cmd.stdin(InputConfig::DevNull);
+
+        let stdout_config = OutputConfig::default();
+        let stderr_config = OutputConfig::default();
+        cmd.stdout(stdout_config.to_stdio());
+        cmd.stderr(stderr_config.to_stdio());
+
         Self {
-            exe: exe.into(),
-            args: vec![],
-            input_config: InputConfig::DevNull,
-            output_config: OutputConfig::DevNull,
-            errput_config: OutputConfig::DevNull,
             _phantom: PhantomData,
             kill_on_drop: true,
+            cmd,
+            stdout_config,
+            stderr_config,
         }
     }
 
-    pub fn stdin_piped(self) -> ProcessEgg<Piped> {
-        let Self {
-            exe,
-            args,
-            input_config,
-            output_config,
-            errput_config,
-            _phantom: _,
-            kill_on_drop,
-        } = self;
-        debug_assert!(matches!(input_config, InputConfig::DevNull));
+    pub fn stdin_piped(mut self) -> ProcessEgg<Piped> {
+        self.cmd.stdin(InputConfig::Piped);
 
         ProcessEgg {
-            exe,
-            args,
-            input_config: InputConfig::Piped,
-            output_config,
-            errput_config,
+            cmd: self.cmd,
+            kill_on_drop: self.kill_on_drop,
+            stdout_config: self.stdout_config,
+            stderr_config: self.stderr_config,
             _phantom: PhantomData,
-            kill_on_drop,
         }
     }
 
-    pub fn stdin_inherit(self) -> Self {
-        Self {
-            input_config: InputConfig::Inherit,
-            ..self
-        }
-    }
-
-    pub fn kill_on_drop(self, doit: bool) -> Self {
-        Self {
-            kill_on_drop: doit,
-            ..self
-        }
+    pub fn stdin_inherit(mut self) -> Self {
+        self.cmd.stdin(InputConfig::Inherit);
+        self
     }
 }
 
 impl<I: InputType> ProcessEgg<I> {
-    pub fn args(self, args: impl Into<Vec<String>>) -> Self {
-        Self {
-            args: args.into(),
-            ..self
-        }
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.cmd.arg(arg);
+        self
     }
 
-    pub fn stdout(self, output: OutputConfig) -> Self {
-        Self {
-            output_config: output,
-            ..self
-        }
+    pub fn args(mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Self {
+        self.cmd.args(args);
+        self
     }
 
-    pub fn stderr(self, errput: OutputConfig) -> Self {
-        Self {
-            errput_config: errput,
-            ..self
-        }
+    pub fn stdout(mut self, output: OutputConfig) -> Self {
+        self.cmd.stdout(output.to_stdio());
+        self.stdout_config = output;
+        self
+    }
+
+    pub fn stderr(mut self, errput: OutputConfig) -> Self {
+        self.cmd.stderr(errput.to_stdio());
+        self.stderr_config = errput;
+        self
+    }
+
+    pub fn kill_on_drop(mut self, doit: bool) -> Self {
+        self.kill_on_drop = doit;
+        self
     }
 }
 
@@ -280,29 +277,36 @@ where
         self,
         ctl: &mut PreControl<'_, Self::Actor>,
     ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
-        tracing::debug!(exe = self.exe, args = ?self.args, "Spawning process");
-        let mut cmd = Command::new(&self.exe);
-        cmd.args(&self.args);
-        cmd.stdin(self.input_config);
-        cmd.stdout(self.output_config.to_stdio());
-        cmd.stderr(self.errput_config.to_stdio());
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                tracing::debug!(
-                    error = &err as &dyn std::error::Error,
-                    "Could not spawn process"
-                );
-                return Err(err).context(SpawnSnafu);
+        let mut child = {
+            let mut cmd = self.cmd;
+            tracing::debug!(
+                exe = ?cmd.get_program(),
+                args = ?cmd.get_args().collect::<Vec<_>>(),
+                "Spawning process"
+            );
+            match cmd.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    tracing::debug!(
+                        error = &err as &dyn std::error::Error,
+                        "Could not spawn process"
+                    );
+                    // TODO: the exe (and args?) should be added here probably. And in all other
+                    // variants as well?
+                    return Err(err).context(SpawnSnafu);
+                }
             }
         };
 
-        // TODO: record this on the actor span?
-        let pid: Pid = child.id();
-        assert!(pid > 0, "a valid pid is 1 or greater, at least on linux");
-        tracing::debug!(pid, "Spawn success");
         let kill_guard = {
+            // TODO: record this on the actor span?
+            let pid: Pid = child.id();
+            assert!(pid > 0, "a valid pid is 1 or greater, at least on linux");
+            tracing::debug!(pid, "Spawn success");
+
+            let res = ctl.aux_ref().set(pid);
+            assert!(res.is_ok(), "this is only initialized here");
+
             let mut g = SoftKillGuard::new(pid);
             if !self.kill_on_drop {
                 g.defuse();
@@ -311,8 +315,8 @@ where
         };
 
         let input = I::create(&mut child.stdin);
-        self.output_config.start_job(ctl, child.stdout.take());
-        self.errput_config.start_job(ctl, child.stderr.take());
+        self.stdout_config.start_job(ctl, child.stdout.take());
+        self.stderr_config.start_job(ctl, child.stderr.take());
 
         Job::new(async move {
             debug_assert!(
@@ -369,9 +373,12 @@ where
     I: InputType,
 {
     type Corpse = OneError<ProcessError>;
+    type Aux = Arc<OnceLock<Pid>>;
 }
 
+#[derive(Debug)]
 pub struct InputLine(pub String);
+#[derive(Debug)]
 pub struct OutputLine {
     pub source: Std,
     pub line: String,
@@ -381,10 +388,8 @@ impl Receive<InputLine> for Process<Piped> {
     type Retval = ();
 
     async fn receive(&mut self, msg: InputLine, _ctl: &mut Control<Self>) -> Self::Retval {
-        // TODO: if this hangs it won't be possible to terminate the process? It will most likely be
-        // fine since since a C-c from a terminal will send sigint to the process as well, but I
-        // don't like that an actor can deadlock itself. I have written down ideas on possible
-        // solutions in another todo.
+        // NOTE: this write can hang, which isn't good, but the termination message will send a
+        // sigterm to the process, which will kill it and unblock the actor loop.
         let InputLine(msg) = msg;
         let msg = msg + "\n";
         if let Err(err) = self.input.handle.write(msg.as_bytes()).await {
@@ -400,6 +405,7 @@ impl Receive<InputLine> for Process<Piped> {
 impl<I: InputType> Receive<crate::signals::Interrupt> for Process<I> {
     type Retval = ();
 
+    #[tracing::instrument(skip_all)]
     async fn receive(
         &mut self,
         _msg: crate::signals::Interrupt,
@@ -410,6 +416,15 @@ impl<I: InputType> Receive<crate::signals::Interrupt> for Process<I> {
         // configure this in the egg and only have this interrupt message. This is mostly do deal
         // with non-cooperative processes.
         self.kill_guard.detonate();
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn pre_send(aux: &Self::Aux) {
+        // NOTE: this will make sure a blocked process actor still can be killed, even if the actor
+        // loop is blocked.
+        if let Some(pid) = aux.get() {
+            SoftKillGuard::new(*pid).detonate();
+        }
     }
 }
 
@@ -442,6 +457,7 @@ fn soft_kill(pid: Pid) -> io::Result<()> {
     Ok(())
 }
 
+// NOTE: i'm not using the kill_on_drop on command directly, since it sends sigkill by default
 #[derive(Debug)]
 struct SoftKillGuard {
     pid: Pid,
@@ -460,6 +476,7 @@ impl SoftKillGuard {
         self.defused = true;
     }
 
+    #[tracing::instrument(skip_all)]
     fn detonate(&mut self) {
         if self.defused {
             return;
@@ -476,7 +493,7 @@ impl SoftKillGuard {
 }
 
 impl Drop for SoftKillGuard {
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     fn drop(&mut self) {
         self.detonate();
     }

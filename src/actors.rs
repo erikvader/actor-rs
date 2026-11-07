@@ -16,3 +16,17 @@ pub mod stdin;
 // that the multiplexed actor can handle? Or should it be directly to the multiplexed actor, but it
 // is magically forwarded by the multiplexer?
 // TODO: create a meta actor that restarts a wrapped actor whenever it crashes?
+
+// TODO: it should be possible to create an actor that represents an actor in another process on
+// another computer. It would send messages the other is sending and its Address struct should be
+// able to accept everything that the other actor can, so it's pretty much transparent. Is
+// Address<Tcp<T>> enough? Or should maybe a Address<T> get returned and maybe an Address<Tcp>, to
+// control the connection itself, as well? In any case, i'm pretty sure this would only work if both
+// executables are linked to the same library crate that contain all alctors, i don't seee how the
+// type checking with Receive trait and such would work otherwise. Over the wire i guess a
+// serialized deliverable would need to be sent? I assume that i would probably need some kind of
+// unsafe code to promise that an arbitrary chunk of bytes is actually a message that the receiving
+// actor can process.
+
+// TODO: but first, create a simple variant of that, which can send and receive strings over a
+// datagram unix socket.

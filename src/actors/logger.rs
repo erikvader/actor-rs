@@ -7,6 +7,7 @@ pub struct Logger;
 
 impl Actor for Logger {
     type Corpse = NoError;
+    type Aux = ();
 }
 self_hatched!(Logger, "logger");
 

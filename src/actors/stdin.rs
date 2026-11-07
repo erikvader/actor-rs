@@ -138,6 +138,7 @@ impl Stdin {
 
 impl Actor for Stdin {
     type Corpse = OneError<StdinError>;
+    type Aux = ();
 }
 
 impl Receive<Interrupt> for Stdin {

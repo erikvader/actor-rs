@@ -26,7 +26,7 @@ pub fn thread_info_span() -> EnteredSpan {
 
     // RANT: the rust thread is can't be printed in a compact way as just a number, it has to
     // include the whole debug output with its type and stuff.
-    tracing::debug!(os_id, ?rust_id, name);
+    tracing::debug!(os_id, ?rust_id);
 
     entered
 }

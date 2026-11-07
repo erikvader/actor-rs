@@ -75,8 +75,14 @@ macro_rules! actor_error {
     note = "implement `Actor`"
 )]
 pub trait Actor: Sized + 'static {
-    // RANT: these, annoyingly, can't have default values
+    // RANT: these, annoyingly, can't have default values.
+    // https://github.com/rust-lang/rust/issues/29661
     type Corpse: Corpse<Error: std::error::Error> + Default;
+    // NOTE: I don't know it it's a mistake to initialize these with default instead of a custom
+    // method on the hatchable trait, but i want to do it like this for simplicity, and I don't
+    // think a more complicated init is needed.
+    // NOTE: These must be clone and send so they don't interfere with the requirements of AdrCore
+    type Aux: Send + Clone + Default;
 
     #[expect(
         async_fn_in_trait,
@@ -153,6 +159,7 @@ macro_rules! self_hatched {
 struct DummyActor;
 impl Actor for DummyActor {
     type Corpse = NoError;
+    type Aux = ();
 }
 self_hatched!(DummyActor, "dummy");
 
@@ -166,6 +173,7 @@ trait Controllable<A: Actor> {
 pub struct PreControl<'a, A: Actor> {
     ctl: &'a mut Control<A>,
     pre_summons: Vec<LocalBoxFuture<'static, ()>>,
+    aux: A::Aux,
 }
 
 impl<'a, A: Actor> Controllable<A> for PreControl<'a, A> {
@@ -179,10 +187,11 @@ impl<'a, A: Actor> Controllable<A> for PreControl<'a, A> {
 }
 
 impl<'a, A: Actor> PreControl<'a, A> {
-    fn new(ctl: &'a mut Control<A>) -> Self {
+    fn new(ctl: &'a mut Control<A>, aux: A::Aux) -> Self {
         Self {
             ctl,
             pre_summons: Vec::new(),
+            aux,
         }
     }
 
@@ -201,6 +210,10 @@ impl<'a, A: Actor> PreControl<'a, A> {
         let (fut, adr) = self.ctl.actor_builder().no_spawn(actor);
         self.pre_summons.push(fut.boxed_local());
         Attachment::new(adr, self)
+    }
+
+    pub fn aux_ref(&self) -> &A::Aux {
+        &self.aux
     }
 }
 
@@ -336,10 +349,14 @@ mod builder {
             }
         }
 
-        fn create_channel(&self, id: Id) -> (AdrCore<P::Actor>, AdrRcv<P::Actor>) {
+        fn create_channel(
+            &self,
+            id: Id,
+            aux: <P::Actor as Actor>::Aux,
+        ) -> (AdrCore<P::Actor>, AdrRcv<P::Actor>) {
             match self.mailbox_size {
-                MailboxSize::Unbounded => AdrCore::unbounded(id),
-                MailboxSize::Bounded(size) => AdrCore::bounded(id, size.get()),
+                MailboxSize::Unbounded => AdrCore::unbounded(id, aux),
+                MailboxSize::Bounded(size) => AdrCore::bounded(id, size.get(), aux),
             }
         }
 
@@ -369,7 +386,11 @@ mod builder {
             spawnable.adjust_builder(&mut self);
 
             let id = self.idgen.generate();
-            let (snd, rcv) = self.create_channel(id);
+            // NOTE: not sure whether this should be stored in Control or not. Right now im thinking
+            // that the actor only will need this when initializing it. It can always store it in
+            // its own struct if it needs this value.
+            let aux: <P::Actor as Actor>::Aux = Default::default();
+            let (snd, rcv) = self.create_channel(id, aux.clone());
             let (exit_snd, exit_rcv) = Self::create_exit_channel();
             debug!(id, "type" = type_name::<P::Actor>(), "Spawn new actor");
 
@@ -398,7 +419,8 @@ mod builder {
             // cuz it gets entered twice, but i don't feel like that special case is worth worrying
             // about. This is of course only the case if the future is spawned as a task on an executor
             // that is blocked on its event loop where thread_root_span is active.
-            let fut = actor_main(rcv, ctl, egg, home.clone(), self.yield_policy).instrument(span);
+            let fut =
+                actor_main(rcv, ctl, egg, home.clone(), self.yield_policy, aux).instrument(span);
             (fut, home)
         }
 
@@ -442,7 +464,9 @@ mod builder {
                     // TODO: this actually only needs to inspect the error, but that was very
                     // difficult to achieve with a mutex inside an async watch.
                     match weak.join_steal().await {
-                        Ok(()) => tracing::debug!("Exited without errors"),
+                        // NOTE: these are fine to have as >debug since the user has explicitly
+                        // chosen this attachment type and wants logs.
+                        Ok(()) => tracing::info!("Exited without errors"),
                         Err(e) => tracing::error!(
                             error = &e as &dyn std::error::Error,
                             "Exited with errors",
@@ -471,12 +495,17 @@ mod builder {
                     tracing::debug!(wait.type = type_name::<C>());
                     snafu::ResultExt::whatever_context(
                         weak.join_steal().await,
+                        // TODO: add some more context on the error itself, like the actor id?
                         "Actor exited with an error",
                     )
                 }
             })
             .then(async |_, ctl, res: Result<(), W>| {
-                tracing::debug!(?res, "Joined");
+                // TODO: not sure i want logs like these, even if they are TRACE. My thought was
+                // that it could be handy to see the flow of information in the whole framework, to
+                // see where things get stuck, but it's maybe too spammy to print whole error values
+                // everywhere?
+                tracing::trace!(?res, "Joined");
                 if let Err(e) = res {
                     let corpse: &mut MultiError<W> = ctl.corpse_mut();
                     corpse.push(e);
@@ -771,10 +800,6 @@ impl<A: Actor> Control<A> {
     fn take_corpse(&mut self) -> A::Corpse {
         std::mem::take(&mut self.corpse)
     }
-
-    fn as_pre_control(&mut self) -> PreControl<'_, A> {
-        PreControl::new(self)
-    }
 }
 
 pub use corpse::{Corpse, MultiError, NoError, OneError};
@@ -915,6 +940,12 @@ pub trait Receive<T>: Actor {
         reason = "i don't really understand what this is complaining about"
     )]
     async fn receive(&mut self, msg: T, ctl: &mut Control<Self>) -> Self::Retval;
+
+    // NOTE: this is not async since it also needs to be called in try_send and such.
+    // TODO: should this return a result<(), SendError>? It could, but why?
+    /// Can be used to unblock the actor to make sure this is received as soon as possible, which is
+    /// handy for termination messages.
+    fn pre_send(_aux: &Self::Aux) {}
 }
 
 type ErasedDeliverable<A> = Box<dyn Deliverable<A> + Send>;
@@ -970,6 +1001,7 @@ mod adr_core {
     pub(super) struct AdrCore<A: Actor> {
         sender: channel::Sender<ErasedDeliverable<A>>,
         id: Id,
+        aux: A::Aux,
     }
     assert_impl_all!(AdrCore<DummyActor>: Send);
 
@@ -978,30 +1010,48 @@ mod adr_core {
             Self {
                 sender: self.sender.clone(),
                 id: self.id,
+                aux: self.aux.clone(),
             }
         }
     }
 
     impl<A: Actor> AdrCore<A> {
-        pub fn unbounded(id: Id) -> (Self, AdrRcv<A>) {
+        pub fn unbounded(id: Id, aux: A::Aux) -> (Self, AdrRcv<A>) {
             let (snd, rcv) = channel::unbounded();
-            (Self { sender: snd, id }, rcv)
+            (
+                Self {
+                    sender: snd,
+                    id,
+                    aux,
+                },
+                rcv,
+            )
         }
 
-        pub fn bounded(id: Id, capacity: usize) -> (Self, AdrRcv<A>) {
+        pub fn bounded(id: Id, capacity: usize, aux: A::Aux) -> (Self, AdrRcv<A>) {
             let (snd, rcv) = channel::bounded(capacity);
-            (Self { sender: snd, id }, rcv)
+            (
+                Self {
+                    sender: snd,
+                    id,
+                    aux,
+                },
+                rcv,
+            )
         }
 
         pub fn id(&self) -> Id {
             self.id
         }
 
+        // TODO: should there be moving variants of downgrade and upgrade now when there is an aux
+        // field?
         pub fn downgrade(&self) -> WeakAdrCore<A> {
             let weak = self.sender.downgrade();
             WeakAdrCore {
                 sender: weak,
                 id: self.id,
+                aux: self.aux.clone(),
             }
         }
 
@@ -1048,6 +1098,7 @@ mod adr_core {
                 msg = type_name::<T>(),
                 "Send message"
             );
+            A::pre_send(&self.aux);
             let ticket = OneWayTicket {
                 msg,
                 erased: self.erased(),
@@ -1069,6 +1120,7 @@ mod adr_core {
                 return = type_name::<A::Retval>(),
                 "Send and receive"
             );
+            A::pre_send(&self.aux);
             let (returner, ret_rcv) = oneshot::async_channel::<A::Retval>();
             let package = Package {
                 msg,
@@ -1091,6 +1143,7 @@ mod adr_core {
                 msg = type_name::<T>(),
                 "Try send message"
             );
+            A::pre_send(&self.aux);
             let ticket = OneWayTicket {
                 msg,
                 erased: self.erased(),
@@ -1111,6 +1164,7 @@ mod adr_core {
                 msg = type_name::<T>(),
                 "Send blocking message"
             );
+            A::pre_send(&self.aux);
             let ticket = OneWayTicket {
                 msg,
                 erased: self.erased(),
@@ -1127,6 +1181,7 @@ mod adr_core {
         // are no receivers.
         sender: channel::WeakSender<ErasedDeliverable<A>>,
         id: Id,
+        aux: A::Aux,
     }
     assert_impl_all!(WeakAdrCore<DummyActor>: Send);
 
@@ -1135,6 +1190,7 @@ mod adr_core {
             Self {
                 sender: self.sender.clone(),
                 id: self.id,
+                aux: self.aux.clone(),
             }
         }
     }
@@ -1144,6 +1200,7 @@ mod adr_core {
             self.sender.upgrade().map(|snd| AdrCore {
                 sender: snd,
                 id: self.id,
+                aux: self.aux.clone(),
             })
         }
 
@@ -1934,6 +1991,7 @@ pub mod bg_job {
             self_hatched!(Alice, "alice");
             impl Actor for Alice {
                 type Corpse = NoError;
+                type Aux = ();
 
                 async fn enter(&mut self, ctl: &mut Control<Self>) {
                     Job::new(async {
@@ -2286,6 +2344,7 @@ mod secret_adr {
             self_hatched!(Bob, "bob");
             impl Actor for Bob {
                 type Corpse = OneError<Counter>;
+                type Aux = ();
 
                 async fn leave(self, ctl: &mut Control<Self>) {
                     ctl.corpse_mut().replace(Counter {
@@ -2356,6 +2415,7 @@ async fn actor_main<P: Hatchable>(
     egg: P,
     home_adr: Address<P::Actor>,
     yield_policy: YieldPolicy,
+    aux: <P::Actor as Actor>::Aux,
 ) {
     // XXX: make sure these are dropped in this specific reverse order. This way, if a thread
     // observes that the watch in the control has dropped, then it's guaranteed that it sees the
@@ -2367,7 +2427,7 @@ async fn actor_main<P: Hatchable>(
     let mut rcv = pin!(rcv);
     let egg = egg;
 
-    let Some(mut actor) = try_hatch(&mut ctl, egg, &home_adr).await else {
+    let Some(mut actor) = try_hatch(&mut ctl, egg, aux, &home_adr).await else {
         return;
     };
 
@@ -2388,16 +2448,19 @@ async fn actor_main<P: Hatchable>(
 async fn try_hatch<P: Hatchable>(
     ctl: &mut Control<P::Actor>,
     egg: P,
+    aux: <P::Actor as Actor>::Aux,
     // NOTE: to make sure the address is alive during hatch
     _home_adr: &Address<P::Actor>,
 ) -> Option<P::Actor> {
-    let mut pre = ctl.as_pre_control();
+    let mut pre = PreControl::new(ctl, aux);
     trace!("Before");
     let hatch_res = egg.hatch(&mut pre).await;
     trace!("After");
 
     match hatch_res {
         Ok(actor) => {
+            // NOTE: linear types would be great here, i.e. the compiler makes sure this struct is
+            // consumed explicitly and not implicitly dropped
             pre.finish();
             Some(actor)
         }
@@ -2407,7 +2470,7 @@ async fn try_hatch<P: Hatchable>(
             // user ever knowing. There should always be a parent actor that catches these kinds of
             // errors, and it's probably a mistake if it doesn't. It's probably fine to log error or
             // warning here, probably.
-            debug!(error = &err as &dyn std::error::Error);
+            trace!(error = &err as &dyn std::error::Error);
             if ctl
                 .exit_send
                 .send(State::Failed(Mutex::new(Some(err))))
@@ -2427,9 +2490,14 @@ async fn enter<A: Actor>(
     // NOTE: to make sure the address is alive during enter
     _home_adr: Address<A>,
 ) {
+    // TODO: what even is the point of enter anymore? What can and should be done here that can't be
+    // done on an egg?
     trace!("Before");
     actor.enter(ctl).await;
     trace!("After");
+
+    // TODO: should this be sent before or after enter?
+    let _: Result<_, _> = ctl.exit_send.send(State::Running);
 }
 
 #[instrument(skip_all, name = "leave")]
@@ -2438,11 +2506,11 @@ async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
     actor.leave(ctl).await;
     let exit_reason = ctl.take_corpse().to_error();
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    debug!("After");
+    trace!("After");
 
     match exit_reason {
         Some(err) => {
-            debug!(error = &err as &dyn std::error::Error);
+            trace!(error = &err as &dyn std::error::Error);
             if ctl
                 .exit_send
                 .send(State::Failed(Mutex::new(Some(err))))
@@ -2496,13 +2564,6 @@ async fn main_loop<A: Actor>(
                 Some(Event::Msg(delivery)) => {
                     // NOTE: the deliver method is responsible for logging and adding spans, since
                     // it has the concrete types.
-                    // TODO: if one of these blocks forever, then the whole actor locks up and there
-                    // is no way to terminate this delivery externally via another message. This is
-                    // a problem in e.g. the process actor. A possible solution is to have a
-                    // separate high-prio channel that will always execute as soon as something from
-                    // the normal queue returns Poll::Pending. Another solution is to maybe have per
-                    // actor anxillary data in each Address and per actor custom methods, so e.g.
-                    // process could save the pid there and a custom method could call kill.
                     delivery.deliver(actor, ctl).await
                 }
                 Some(Event::BgJob(delivery)) => {
@@ -2658,9 +2719,9 @@ impl Stage {
         let (heart, ex, sig_bomb, sig_guard) = take_essentials_drop_the_rest(self);
         let _span = debug_span!("stage").entered();
 
-        debug!(num_actors = heart.rune_count(), "Action!");
+        trace!(num_actors = heart.rune_count(), "Action!");
         let res = f(heart, &ex, sig_bomb);
-        debug!(?res, "Exited");
+        trace!(?res, "Exited");
 
         let executor = Rc::into_inner(ex).expect("There should only be one strong reference");
         drop(sig_guard);
@@ -2743,6 +2804,7 @@ mod tests {
             self_hatched!(Alice, "alice");
             impl Actor for Alice {
                 type Corpse = NoError;
+                type Aux = ();
             }
             impl Receive<i32> for Alice {
                 type Retval = i32;
@@ -2758,6 +2820,7 @@ mod tests {
             self_hatched!(Bob, "bob");
             impl Actor for Bob {
                 type Corpse = NoError;
+                type Aux = ();
 
                 async fn enter(&mut self, _ctl: &mut Control<Self>) {
                     info!("sending to alice");
@@ -2793,6 +2856,7 @@ mod tests {
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Corpse = OneError<NotSend>;
+                type Aux = ();
             }
             impl Receive<i32> for LocalAlice {
                 type Retval = NotSend;
@@ -2831,6 +2895,7 @@ mod tests {
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Corpse = NoError;
+                type Aux = ();
             }
             assert_not_impl_any!(LocalAlice: Send);
             assert_impl_all!(RemoteAddress<LocalAlice>: Send);
@@ -2843,6 +2908,7 @@ mod tests {
             self_hatched!(LocalAlice, "alice");
             impl Actor for LocalAlice {
                 type Corpse = OneError<NotSend>;
+                type Aux = ();
             }
             assert_impl_all!(LocalAlice: Send);
             assert_not_impl_any!(RemoteAddress<LocalAlice>: Send);

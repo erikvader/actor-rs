@@ -34,6 +34,7 @@ fn setup_tracing() {
     );
     // TODO: setup with systemd if started from a service
     let fmt = tracing_subscriber::fmt::layer()
+        .without_time()
         .with_writer(std::io::stdout)
         .with_ansi(use_ansi)
         .with_filter(fmt_filter);
@@ -65,14 +66,17 @@ fn inner_main(signals: &Signals) -> Result<(), Whatever> {
     stage.play_adhoc({
         let signals = signals.registry();
         async |ctl| {
-            let printer_adr = ctl
-                .pre_summon(actors::logger::Logger.span(actor_rs::deferred_info_span!("logger2")))
-                .aggregate();
+            // let printer_adr = ctl
+            //     .pre_summon(actors::logger::Logger.span(actor_rs::deferred_info_span!("logger2")))
+            //     .aggregate();
 
-            ctl.pre_summon(
-                actors::stdin::StdinEgg::new(printer_adr.secret()).interruptable(signals),
-            )
-            .aggregate();
+            // ctl.pre_summon(
+            //     actors::stdin::StdinEgg::new(printer_adr.secret()).interruptable(signals),
+            // )
+            // .aggregate();
+
+            let pegg = actors::process::ProcessEgg::new("ech").arg("hej");
+            ctl.pre_summon(pegg).aggregate();
 
             Ok(())
         }

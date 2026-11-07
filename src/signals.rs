@@ -331,6 +331,7 @@ pub struct SigTerminate<T> {
 
 impl<T: Termination> Termination for SigTerminate<T> {
     fn report(mut self) -> ExitCode {
+        // TODO: somehow add the main thread span here?
         let _span = debug_span!("sig_post_main").entered();
         let inner_code = self.wrapped.report();
         debug!(?inner_code);

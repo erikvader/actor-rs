@@ -86,6 +86,8 @@ impl<'a> fmt::Display for Formatter<'a> {
     }
 }
 
+// TODO: create a custom printer, don't use the snafu one at all. Print detailed traces like how
+// python does.
 pub struct Report {
     result: Result<(), Whatever>,
 }
@@ -143,14 +145,13 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         debug_assert!(!self.group.is_empty());
         if self.group.len() == 1 {
-            writeln!(f, "{}", self.group.first().unwrap())?;
+            write!(f, "{}", self.group.first().unwrap())?;
         } else {
             let mut iter = self.group.iter();
             write!(f, "Group: '{}'", iter.next().unwrap())?;
             for i in iter {
                 write!(f, ", '{}'", i)?;
             }
-            writeln!(f)?;
         }
 
         Ok(())

@@ -7,6 +7,7 @@ pub struct AdHoc;
 
 impl Actor for AdHoc {
     type Corpse = MultiError<Whatever>;
+    type Aux = ();
 }
 
 pub struct AdHocEgg<F> {
