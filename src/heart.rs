@@ -1,10 +1,15 @@
 use async_channel as channel;
-use snafu::Snafu;
 
-#[derive(Debug, Snafu)]
-#[snafu(display("{count} runes panicked when they were dropped"))]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[display("{count} runes panicked when they were dropped")]
 pub struct PanicError {
     count: u32,
+}
+
+impl PanicError {
+    pub fn count(&self) -> u32 {
+        self.count
+    }
 }
 
 #[derive(Clone)]
@@ -40,7 +45,7 @@ impl Heart {
         }
 
         if panicked > 0 {
-            PanicSnafu { count: panicked }.fail()
+            Err(PanicError { count: panicked })
         } else {
             Ok(())
         }

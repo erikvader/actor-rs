@@ -1,5 +1,5 @@
 // TODO: rename this module to thread_utils since there is only thread related functions here?
-use tracing::{info_span, span::EnteredSpan};
+use tracing::span::EnteredSpan;
 
 // TODO: fallback or support for other platforms
 #[cfg(target_os = "linux")]
@@ -22,9 +22,9 @@ pub fn thread_info_span() -> EnteredSpan {
 
     // TODO: it would be cool if the internal thread id could be appended to the name to make it
     // 100% unique. The name is nice since it is more describing than just a number.
-    let entered = info_span!("thread", name).entered();
+    let entered = tracing::info_span!("thread", name).entered();
 
-    // RANT: the rust thread is can't be printed in a compact way as just a number, it has to
+    // RANT: the rust thread id can't be printed in a compact way as just a number, it has to
     // include the whole debug output with its type and stuff.
     tracing::debug!(os_id, ?rust_id);
 

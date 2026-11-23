@@ -1,24 +1,23 @@
-use std::{pin::pin, sync::Arc};
+use std::pin::pin;
 
 use blocking::Unblock;
 use futures_util::{AsyncBufRead, AsyncBufReadExt, StreamExt, io::BufReader};
-use snafu::{ResultExt, Snafu};
+use rootcause_tracing::SpanExt;
 
 use crate::{
-    actor::{Actor, Control, Hatchable, OneError, PreControl, Receive, SecretAddress, bg_job::Job},
+    actor::{
+        Actor, Control, Hatchable, OneReport, PreControl, Receive, SecretAddress, bg_job::Job,
+    },
     actor_error, deferred_info_span,
     kill_switch::{Bomb, Tick},
     signals::Interrupt,
 };
 
-#[derive(Debug, Snafu, Clone)]
+#[derive(Debug, Clone, derive_more::Display, derive_more::Error)]
 pub enum StdinError {
-    #[snafu(display("Failed while reading the next line"))]
-    Reader {
-        #[snafu(source(from(std::io::Error, Arc::new)))]
-        source: Arc<std::io::Error>,
-    },
-    #[snafu(display("The receiver closed"))]
+    #[display("Failed while reading the next line")]
+    Reader,
+    #[display("The receiver closed")]
     Closed,
 }
 
@@ -97,8 +96,7 @@ impl Stdin {
                     match watch {
                         Tick::Tock(Ok(line)) => {
                             if send_to.send(Line(line)).await.is_err() {
-                                tracing::debug!("Receiver closed");
-                                res = ClosedSnafu.fail();
+                                res = Err(rootcause::report!(StdinError::Closed).attach_span());
                                 break;
                             }
                         }
@@ -109,8 +107,8 @@ impl Stdin {
                             // never causes silent data loss is to return early on any kind of error.
                             // What to do on certain errors depends on the context and what the Reader
                             // actually is, so i leave that for the future.
-                            tracing::debug!(?error, "Reader errored");
-                            res = Err(error).context(ReaderSnafu);
+                            let error = rootcause::report!(error);
+                            res = Err(error.context(StdinError::Reader).attach_span());
                             break;
                         }
                         Tick::Boom => {
@@ -126,8 +124,10 @@ impl Stdin {
         })
         .then(async |_: &mut Self, ctl: &mut _, res: Result<(), _>| {
             ctl.close_mailbox();
-            let prev = ctl.corpse_mut().replace_result(res);
-            assert!(prev.is_none());
+            if let Err(err) = res {
+                let prev = ctl.corpse_mut().replace(err);
+                assert!(prev.is_none());
+            }
         })
         .instrument(deferred_info_span!("bg_job"))
         .pre_start(ctl);
@@ -137,7 +137,7 @@ impl Stdin {
 }
 
 impl Actor for Stdin {
-    type Corpse = OneError<StdinError>;
+    type Corpse = OneReport<StdinError>;
     type Aux = ();
 }
 

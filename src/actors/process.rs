@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
     marker::PhantomData,
     process::{ExitStatus, Stdio},
@@ -7,30 +7,28 @@ use std::{
 };
 
 use async_process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use derive_more::{Display, Error};
 use futures_util::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, StreamExt, io::BufReader};
-use snafu::{ResultExt, Snafu};
+use rootcause::{handlers, prelude::ResultExt};
+use rootcause_tracing::SpanExt;
 
 use crate::{
-    actor::{Actor, Control, Hatchable, OneError, PreControl, Receive, SecretAddress, bg_job::Job},
-    actor_error, deferred_info_span,
+    actor::{
+        Actor, Control, Hatchable, OneReport, PreControl, Receive, SecretAddress, bg_job::Job,
+    },
+    actor_collect, actor_error, deferred_info_span,
 };
 
 type Pid = u32;
 
-#[derive(Debug, Clone, Snafu)]
+#[derive(Debug, Error, Display)]
 pub enum ProcessError {
-    #[snafu(display("Process failed to spawn"))]
-    Spawn {
-        #[snafu(source(from(std::io::Error, Arc::new)))]
-        source: Arc<std::io::Error>,
-    },
-    #[snafu(display("The process died with a non-zero exit status: {status}"))]
-    NonZero { status: ExitStatus },
-    #[snafu(display("Failed to wait for process termination"))]
-    Exit {
-        #[snafu(source(from(std::io::Error, Arc::new)))]
-        source: Arc<std::io::Error>,
-    },
+    #[display("Failed to spawn process")]
+    Spawn,
+    #[display("Process exited with non-zero exit status")]
+    NonZero,
+    #[display("Error while waiting for process termination")]
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,8 +53,28 @@ impl ChildStream for ChildStderr {
     }
 }
 
-// TODO: impl debug but skip the argument in SendLineUtf8? Or make SecretAddress also Debug?
-#[derive(Default)]
+#[derive(Clone, Debug, derive_more::Display)]
+#[display("cmd: {:?}", args)]
+pub struct CmdLine {
+    args: Vec<OsString>,
+}
+
+impl CmdLine {
+    fn new(cmd: &Command) -> Self {
+        let mut args = vec![cmd.get_program().to_owned()];
+        args.extend(cmd.get_args().map(ToOwned::to_owned));
+        Self { args }
+    }
+
+    pub fn exe(&self) -> &OsStr {
+        self.args
+            .first()
+            .expect("this is at least one element big")
+            .as_ref()
+    }
+}
+
+#[derive(Default, Debug)]
 pub enum OutputConfig {
     DevNull,
     Inherit,
@@ -161,18 +179,26 @@ impl From<InputConfig> for Stdio {
 
 pub trait InputType: crate::private::Sealed + 'static {
     fn create(handle: &mut Option<ChildStdin>) -> Self;
+    fn destroy(&mut self);
 }
 pub struct Piped {
-    handle: ChildStdin,
+    handle: Option<ChildStdin>,
 }
 pub struct Unpiped;
 impl crate::private::Sealed for Piped {}
 impl crate::private::Sealed for Unpiped {}
 impl InputType for Piped {
     fn create(handle: &mut Option<ChildStdin>) -> Self {
+        assert!(handle.is_some());
         Self {
-            handle: handle.take().expect("should be here"),
+            handle: handle.take(),
         }
+    }
+
+    fn destroy(&mut self) {
+        tracing::debug!("Dropping the stdin handle");
+        let old = self.handle.take();
+        assert!(old.is_some());
     }
 }
 impl InputType for Unpiped {
@@ -180,6 +206,8 @@ impl InputType for Unpiped {
         assert!(handle.is_none());
         Self
     }
+
+    fn destroy(&mut self) {}
 }
 
 // TODO: add ways to modify the environment?
@@ -187,7 +215,6 @@ impl InputType for Unpiped {
 // TODO: add a config to spawn the process in its own group? The kill could be sent to the entire
 // group in that case. Just a thought, not even sure it's a good idea. The stdlib has nightly API
 // for this
-// TODO: close the stdin handle if EOF is reached. Simply drop the ChildStdin.
 pub struct ProcessEgg<I: InputType> {
     cmd: Command,
     // NOTE: this function pointer is used to make sure it isn't affecting any auto traits of this
@@ -276,34 +303,29 @@ where
     async fn hatch(
         self,
         ctl: &mut PreControl<'_, Self::Actor>,
-    ) -> Result<Self::Actor, actor_error!(Self::Actor)> {
+    ) -> Result<Self::Actor, actor_collect!(Self::Actor)> {
+        let cmdline = CmdLine::new(&self.cmd);
+
         let mut child = {
             let mut cmd = self.cmd;
-            tracing::debug!(
-                exe = ?cmd.get_program(),
-                args = ?cmd.get_args().collect::<Vec<_>>(),
-                "Spawning process"
-            );
-            match cmd.spawn() {
-                Ok(child) => child,
-                Err(err) => {
-                    tracing::debug!(
-                        error = &err as &dyn std::error::Error,
-                        "Could not spawn process"
-                    );
-                    // TODO: the exe (and args?) should be added here probably. And in all other
-                    // variants as well?
-                    return Err(err).context(SpawnSnafu);
-                }
-            }
+            tracing::debug!("Spawning process: {cmdline}");
+            cmd.spawn()
+                .context(ProcessError::Spawn)
+                .attach(cmdline.clone())
+                .attach_span()?
         };
 
-        let kill_guard = {
-            // TODO: record this on the actor span?
-            let pid: Pid = child.id();
-            assert!(pid > 0, "a valid pid is 1 or greater, at least on linux");
-            tracing::debug!(pid, "Spawn success");
+        // TODO: record this on the actor span? Not sure if it will help much to see the pid on the
+        // span. This would require access to the span returned by Hatchable::span(), even if it is
+        // disabled or not. Values could be recorded incorrectly if this was simply recorded on the
+        // current span.
+        let pid: Pid = child.id();
+        assert!(pid > 0, "a valid pid is 1 or greater, at least on linux");
+        // NOTE: there is only one process per actor, so it's easy to relate all these logs to each
+        // other.
+        tracing::debug!(pid, "Spawn success");
 
+        let kill_guard = {
             let res = ctl.aux_ref().set(pid);
             assert!(res.is_ok(), "this is only initialized here");
 
@@ -324,19 +346,27 @@ where
                 "child::status drops stdin, but it should already have been taken at this point"
             );
             let status = child.status().await;
-            tracing::trace!(?status, "Process died");
+            if let Ok(status) = &status {
+                tracing::debug!("{status}");
+            }
             status
         })
         .then(
-            async |me, ctl: &mut Control<Process<_>>, status: Result<ExitStatus, _>| {
+            async move |me,
+                        ctl: &mut Control<Process<_>>,
+                        status: Result<ExitStatus, std::io::Error>| {
                 me.kill_guard.defuse();
                 match status {
-                    Ok(status) if status.success() => tracing::debug!("{status}"),
+                    Ok(status) if status.success() => (),
                     Ok(status) => {
-                        tracing::debug!("{status}");
-                        ctl.corpse_mut()
-                            .replace(NonZeroSnafu { status }.build())
-                            .expect("the error is only set here");
+                        let prev = ctl.corpse_mut().replace(
+                            rootcause::report!(ProcessError::NonZero)
+                                .attach(status)
+                                .attach(format!("pid: {pid}"))
+                                .attach(cmdline)
+                                .attach_span(),
+                        );
+                        debug_assert!(prev.is_none());
                     }
                     // RANT: i don't understand why this error case is here... It seems like, on linux
                     // at least, that rust already handles sporadic wakeups of the syscall, and the
@@ -344,9 +374,14 @@ where
                     // library to not mess up. So it feels like this is just extra complexity, but im
                     // handling it just in case.
                     Err(err) => {
-                        ctl.corpse_mut()
-                            .replace_result(Err(err).context(ExitSnafu))
-                            .expect("the error is only set here");
+                        let prev = ctl.corpse_mut().replace(
+                            rootcause::report!(err)
+                                .context(ProcessError::Wait)
+                                .attach(format!("pid: {pid}"))
+                                .attach(cmdline)
+                                .attach_span(),
+                        );
+                        debug_assert!(prev.is_none());
                     }
                 }
             },
@@ -372,8 +407,12 @@ impl<I> Actor for Process<I>
 where
     I: InputType,
 {
-    type Corpse = OneError<ProcessError>;
+    type Corpse = OneReport<ProcessError>;
     type Aux = Arc<OnceLock<Pid>>;
+
+    async fn mailbox_eof(&mut self, _ctl: &mut Control<Self>) {
+        self.input.destroy();
+    }
 }
 
 #[derive(Debug)]
@@ -392,8 +431,16 @@ impl Receive<InputLine> for Process<Piped> {
         // sigterm to the process, which will kill it and unblock the actor loop.
         let InputLine(msg) = msg;
         let msg = msg + "\n";
-        if let Err(err) = self.input.handle.write(msg.as_bytes()).await {
-            // NOTE: i think this pretty much only can error if the process has died
+        if let Err(err) = self
+            .input
+            .handle
+            .as_mut()
+            .expect("this is only dropped after all messages have been processed")
+            .write(msg.as_bytes())
+            .await
+        {
+            // NOTE: i think this pretty much only can error if the process has died already.
+            // Logging the error to make sure.
             tracing::debug!(
                 error = &err as &dyn std::error::Error,
                 "Failed to write to process"
@@ -457,7 +504,8 @@ fn soft_kill(pid: Pid) -> io::Result<()> {
     Ok(())
 }
 
-// NOTE: i'm not using the kill_on_drop on command directly, since it sends sigkill by default
+// NOTE: i'm not using the Command::kill_on_drop on command directly, since it sends sigkill by
+// default
 #[derive(Debug)]
 struct SoftKillGuard {
     pid: Pid,

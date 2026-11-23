@@ -9,7 +9,6 @@ use crate::{
     kill_switch::{self, Bomb},
     signals::{ActorGuard, SigRegistry, StageGuard},
     stream_utils::{YieldPolicy, yield_guard},
-    whatever::Whatever,
 };
 use async_channel as channel;
 use async_executor::LocalExecutor;
@@ -19,7 +18,12 @@ use futures_util::{
     FutureExt as _, StreamExt as _,
     stream::{self, FuturesUnordered},
 };
-use snafu::prelude::*;
+use rootcause::{
+    IntoReportCollection, Report,
+    markers::{Dynamic, Mutable, SendSync},
+    report_collection::ReportCollection,
+};
+use rootcause_tracing::SpanExt;
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 use std::{
     any::type_name,
@@ -67,8 +71,16 @@ macro_rules! actor_error {
     };
 }
 
+#[macro_export]
+macro_rules! actor_collect {
+    ($corp:ty) => {
+        <<$corp as $crate::actor::Actor>::Corpse as $crate::actor::Corpse>::Collect
+    };
+}
+
 // NOTE: this is Sized because that is required when using Self in function arguments
 // NOTE: this is 'static because basically every usage of an Actor requires 'static
+// TODO: remove since i don't know if this just hides the real error message or actually is useful
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not an actor",
     label = "this guy right here",
@@ -77,7 +89,7 @@ macro_rules! actor_error {
 pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values.
     // https://github.com/rust-lang/rust/issues/29661
-    type Corpse: Corpse<Error: std::error::Error> + Default;
+    type Corpse: Corpse + Default;
     // NOTE: I don't know it it's a mistake to initialize these with default instead of a custom
     // method on the hatchable trait, but i want to do it like this for simplicity, and I don't
     // think a more complicated init is needed.
@@ -129,7 +141,7 @@ pub trait Hatchable: Sized + 'static {
     async fn hatch(
         self,
         ctl: &mut PreControl<'_, Self::Actor>,
-    ) -> Result<Self::Actor, actor_error!(Self::Actor)>;
+    ) -> Result<Self::Actor, actor_collect!(Self::Actor)>;
 }
 
 #[macro_export]
@@ -145,7 +157,7 @@ macro_rules! self_hatched {
             async fn hatch(
                 self,
                 _ctl: &mut $crate::actor::PreControl<'_, Self::Actor>,
-            ) -> std::result::Result<Self::Actor, $crate::actor_error!(Self::Actor)> {
+            ) -> std::result::Result<Self::Actor, $crate::actor_collect!(Self::Actor)> {
                 Ok(self)
             }
         }
@@ -247,9 +259,6 @@ pub struct Control<A: Actor> {
     bg_jobs: FuturesUnordered<BoxedJob<A>>,
     idgen: IdGenerator,
     thread_root_span: Span,
-    // TODO: create a record method that can record values on the actor span, could be used for
-    // things like adding the process id to its span, for example, but i don't think i want to do
-    // that in that specific case.
     actor_span: Span,
     _signal_guard: Option<ActorGuard>,
     // HACK: these are last so they are dropped last, right before the task terminates. The actor is
@@ -372,7 +381,7 @@ mod builder {
             DeferredDirectSpan::new(move |parent| {
                 span!(
                     parent: parent,
-                    Level::DEBUG,
+                    Level::INFO,
                     "actor",
                     id,
                 )
@@ -443,6 +452,8 @@ mod builder {
     // but it is more like an attachment chooser.
     #[must_use = "must specify how this is to be attached to the current actor"]
     pub struct Attachment<'a, A: Actor, C: Actor> {
+        // NOTE: this doesn't need to be generic, since everything is fine with this being local,
+        // and this can always be upgraded to remote later.
         adr: Address<C>,
         ctl: &'a mut dyn Controllable<A>,
     }
@@ -467,8 +478,9 @@ mod builder {
                         // NOTE: these are fine to have as >debug since the user has explicitly
                         // chosen this attachment type and wants logs.
                         Ok(()) => tracing::info!("Exited without errors"),
-                        Err(e) => tracing::error!(
-                            error = &e as &dyn std::error::Error,
+                        Err(_) => tracing::error!(
+                            // TODO: print the error? Add some nice trait bound in that case
+                            // error = &e as &dyn std::error::Error,
                             "Exited with errors",
                         ),
                     }
@@ -483,31 +495,22 @@ mod builder {
             self.adr
         }
 
-        pub fn aggregate<W>(self) -> Address<C>
+        pub fn aggregate(self) -> Address<C>
         where
-            A: Actor<Corpse = MultiError<W>>,
-            W: snafu::FromString + std::fmt::Debug + 'static,
-            WaitError<actor_error!(C)>: Into<W::Source>,
+            A: Actor<Corpse = MultiReport<Dynamic>>,
+            actor_error!(C): IntoReportCollection<SendSync> + Clone,
         {
             bg_job::Job::new({
                 let mut weak = self.adr.downgrade();
                 async move {
                     tracing::debug!(wait.type = type_name::<C>());
-                    snafu::ResultExt::whatever_context(
-                        weak.join_steal().await,
-                        // TODO: add some more context on the error itself, like the actor id?
-                        "Actor exited with an error",
-                    )
+                    weak.join_report().await
                 }
             })
-            .then(async |_, ctl, res: Result<(), W>| {
-                // TODO: not sure i want logs like these, even if they are TRACE. My thought was
-                // that it could be handy to see the flow of information in the whole framework, to
-                // see where things get stuck, but it's maybe too spammy to print whole error values
-                // everywhere?
-                tracing::trace!(?res, "Joined");
+            .then(async |_, ctl, res: Result<(), Report<JoinError>>| {
+                tracing::trace!(is_err = res.is_err(), "Joined");
                 if let Err(e) = res {
-                    let corpse: &mut MultiError<W> = ctl.corpse_mut();
+                    let corpse: &mut MultiReport<Dynamic> = ctl.corpse_mut();
                     corpse.push(e);
                 }
             })
@@ -522,12 +525,14 @@ mod builder {
     }
 
     #[expect(private_bounds, reason = "The builder should be private")]
+    // TODO: remove since i don't know if this just hides the real error message or actually is useful
     #[diagnostic::on_unimplemented(
         message = "`{Self}` is not spawnable",
         label = "this guy right here",
         note = "either, create a dedicated `Hatchable` type and spawn that instead, or use the `self_hatched!` macro"
     )]
     pub trait Spawnable<P: Hatchable>: SpawnablePriv<P> {}
+    // TODO: remove since i don't know if this just hides the real error message or actually is useful
     #[diagnostic::do_not_recommend]
     impl<P: Hatchable, I: SpawnablePriv<P>> Spawnable<P> for I {}
 
@@ -592,6 +597,7 @@ mod builder {
             }
         }
     }
+    // TODO: remove since i don't know if this just hides the real error message or actually is useful
     #[diagnostic::do_not_recommend]
     impl<P: Hatchable, I: SpawnablePriv<P>> SpawnableExt<P> for I {}
 
@@ -790,7 +796,7 @@ impl<A: Actor> Control<A> {
     pub fn address(&self) -> Result<Address<A>, AddressClosedError> {
         // NOTE: This can fail if all addresses got dropped and/or a soft exit has been issued. It's
         // guaranteed to not fail in enter and message handlers, unless soft exiting.
-        self.home.upgrade().context(AddressClosedSnafu)
+        self.home.upgrade().ok_or(AddressClosedError)
     }
 
     pub fn corpse_mut(&mut self) -> &mut A::Corpse {
@@ -802,15 +808,20 @@ impl<A: Actor> Control<A> {
     }
 }
 
-pub use corpse::{Corpse, MultiError, NoError, OneError};
+pub use corpse::{Corpse, MultiReport, MultiReportCollect, NoError, OneError, OneReport};
 mod corpse {
     use std::convert::Infallible;
 
-    use crate::whatever::Group;
+    use rootcause::{
+        IntoReportCollection, Report,
+        markers::{Cloneable, SendSync},
+        report_collection::ReportCollection,
+    };
 
     pub trait Corpse {
         type Error;
-        fn to_error(self) -> Option<Self::Error>;
+        type Collect: Into<Self::Error>;
+        fn into_error(self) -> Option<Self::Error>;
     }
 
     pub struct OneError<E> {
@@ -825,8 +836,9 @@ mod corpse {
 
     impl<E> Corpse for OneError<E> {
         type Error = E;
+        type Collect = Self::Error;
 
-        fn to_error(self) -> Option<Self::Error> {
+        fn into_error(self) -> Option<Self::Error> {
             self.inner
         }
     }
@@ -835,12 +847,34 @@ mod corpse {
         pub fn replace(&mut self, error: E) -> Option<E> {
             self.inner.replace(error)
         }
+    }
 
-        pub fn replace_result(&mut self, result: Result<(), E>) -> Option<E> {
-            match result {
-                Ok(()) => None,
-                Err(e) => self.replace(e),
-            }
+    pub struct OneReport<C: ?Sized + 'static = rootcause::markers::Dynamic> {
+        // NOTE: this will always be SendSync, see the notes on MultiReport
+        inner: Option<Report<C, Cloneable>>,
+    }
+
+    impl<C: ?Sized> Default for OneReport<C> {
+        fn default() -> Self {
+            Self { inner: None }
+        }
+    }
+
+    impl<C: ?Sized> Corpse for OneReport<C> {
+        type Error = Report<C, Cloneable>;
+        type Collect = Self::Error;
+
+        fn into_error(self) -> Option<Self::Error> {
+            self.inner
+        }
+    }
+
+    impl<C: ?Sized> OneReport<C> {
+        pub fn replace(
+            &mut self,
+            error: impl Into<Report<C, Cloneable>>,
+        ) -> Option<Report<C, Cloneable>> {
+            self.inner.replace(error.into())
         }
     }
 
@@ -849,62 +883,139 @@ mod corpse {
 
     impl Corpse for NoError {
         type Error = Infallible;
+        type Collect = Self::Error;
 
-        fn to_error(self) -> Option<Self::Error> {
+        fn into_error(self) -> Option<Self::Error> {
             None
         }
     }
 
-    pub struct MultiError<E> {
-        errors: Vec<E>,
+    pub struct MultiReport<C: ?Sized + 'static = rootcause::markers::Dynamic> {
+        // NOTE: This will always be SendSync, never Local. It is way to annoying to try and support
+        // both modes everywhere, a lot of trait bounds on ObjectMarkerFor is needed, like
+        // everything that ever touches a Report. I also think i can survive with Reports only
+        // supporting send+sync types. Another weirdness is that every actor has to decide whether
+        // their Reports should be local or not. I could maybe force the error to be Send in the
+        // actor trait, like for Aux, but i dunno.
+        errors: ReportCollection<C>,
     }
 
-    impl<E> Default for MultiError<E> {
+    impl<C: ?Sized> Default for MultiReport<C> {
         fn default() -> Self {
-            Self { errors: Vec::new() }
+            Self {
+                errors: ReportCollection::new(),
+            }
         }
     }
 
-    impl<E> Corpse for MultiError<E> {
-        type Error = Group<E>;
+    impl<C: ?Sized> Corpse for MultiReport<C> {
+        type Error = ReportCollection<C>;
+        // RANT: there is for some reason not a From impl to create a one element report collection,
+        // that is only available with the IntoReportCollection trait, which the docs says is
+        // internal.
+        // https://docs.rs/rootcause/0.13.0/rootcause/trait.IntoReportCollection.html#internal-usage
+        type Collect = MultiReportCollect<C>;
 
-        fn to_error(self) -> Option<Self::Error> {
-            Group::new(self.errors)
+        fn into_error(self) -> Option<Self::Error> {
+            (!self.errors.is_empty()).then_some(self.errors)
         }
     }
 
-    impl<E> MultiError<E> {
-        pub fn push(&mut self, error: E) {
-            self.errors.push(error);
+    #[derive(derive_more::Into)]
+    pub struct MultiReportCollect<C: ?Sized + 'static>(ReportCollection<C>);
+
+    impl<T> From<T> for MultiReportCollect<T::Context>
+    where
+        T: IntoReportCollection<SendSync>,
+    {
+        fn from(value: T) -> Self {
+            Self(value.into_report_collection())
+        }
+    }
+
+    impl<C: ?Sized> MultiReport<C> {
+        pub fn push(&mut self, error: impl Into<Report<C, Cloneable>>) {
+            self.errors.push(error.into());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn multi_report_from_single_report() {
+            fn fun() -> Result<(), <MultiReport<String> as Corpse>::Collect> {
+                Err(rootcause::report!("hej".to_owned()))?;
+                Ok(())
+            }
+
+            let col: ReportCollection<String> = fun().unwrap_err().into();
+            assert_eq!(col.len(), 1);
+
+            let err = col.get(0).unwrap();
+            assert_eq!(err.children().len(), 0);
+            assert_eq!(err.current_context(), "hej");
+        }
+
+        #[test]
+        fn multi_report_from_report_collection() {
+            fn fun() -> Result<(), <MultiReport<String> as Corpse>::Collect> {
+                let col = rootcause::report!("hej".to_owned()).into_report_collection();
+                Err(col)?;
+                Ok(())
+            }
+
+            let col: ReportCollection<String> = fun().unwrap_err().into();
+            assert_eq!(col.len(), 1);
+
+            let err = col.get(0).unwrap();
+            assert_eq!(err.children().len(), 0);
+            assert_eq!(err.current_context(), "hej");
+        }
+
+        #[test]
+        fn multi_report_from_report_single_error() {
+            fn fun() -> Result<(), <MultiReport<std::io::Error> as Corpse>::Collect> {
+                Err(std::io::Error::other("hej"))?;
+                Ok(())
+            }
+
+            let col: ReportCollection<std::io::Error> = fun().unwrap_err().into();
+            assert_eq!(col.len(), 1);
+
+            let err = col.get(0).unwrap();
+            assert_eq!(err.children().len(), 0);
+            assert!(err.current_context().get_ref().is_some());
         }
     }
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(display("The address is closed"))]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[display("The address is closed")]
 pub struct AddressClosedError;
 
-#[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
-pub enum WaitError<T: std::error::Error + 'static> {
-    #[snafu(display("No error available, the actor must have panicked"))]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+// NOTE: this will not be std::Error when T = (), but that is maybe fine?
+pub enum JoinError<T = ()> {
+    #[display("No error available, the actor must have panicked")]
     Panicked,
-    #[snafu(display("Actor exited with an error"))]
+    #[display("Actor exited with an error")]
     Exited { source: T },
-    #[snafu(display("Actor exited with an error, but someone else stole it"))]
+    #[display("Actor exited with an error, but someone else stole it")]
     Stolen,
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
-pub enum TryWaitError<T: std::error::Error + 'static> {
-    #[snafu(display("No error available, the actor must have panicked"))]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[display("While try-joining: {_variant}")]
+pub enum TryJoinError<T = ()> {
+    #[display("No error available, the actor must have panicked")]
     Panicked,
-    #[snafu(display("The actor is still alive"))]
+    #[display("The actor is still alive")]
     StillAlive,
-    #[snafu(display("Actor exited with an error"))]
+    #[display("Actor exited with an error")]
     Exited { source: T },
-    #[snafu(display("Actor exited with an error, but someone else stole it"))]
+    #[display("Actor exited with an error, but someone else stole it")]
     Stolen,
 }
 
@@ -924,6 +1035,7 @@ type ExitRecv<E> = async_watch::Receiver<State<E>>;
 type ExitSend<E> = async_watch::Sender<State<E>>;
 
 // NOTE: both T and Retval are 'static everywhere, but it didn't help to add those here
+// TODO: remove since i don't know if this just hides the real error message or actually is useful
 #[diagnostic::on_unimplemented(
     message = "can't send messages of type `{T}` to actor `{Self}`",
     label = "this one",
@@ -985,7 +1097,6 @@ mod adr_core {
     };
     use async_channel as channel;
     use pin_project::pin_project;
-    use snafu::{OptionExt, Snafu};
     use static_assertions::assert_impl_all;
     use std::any::Any;
     use std::any::type_name;
@@ -1221,8 +1332,8 @@ mod adr_core {
         _inner: Box<dyn Any + Send>,
     }
 
-    #[derive(Debug, Snafu)]
-    #[snafu(display("Could not send message, actor dead :("))]
+    #[derive(Debug, derive_more::Display, derive_more::Error)]
+    #[display("Could not send message, actor dead :(")]
     // TODO: make these send errors return the value that was attempted to be sent? It's difficult to
     // get them back since they are erased in a Box, but it should be possible to downcast them back i
     // think.
@@ -1232,30 +1343,29 @@ mod adr_core {
 
     impl<T> From<channel::SendError<T>> for SendError {
         fn from(_value: channel::SendError<T>) -> Self {
-            SendSnafu.build()
+            SendError
         }
     }
 
-    #[derive(Debug, Snafu)]
-    #[snafu(module, context(suffix(false)))]
+    #[derive(Debug, derive_more::Display, derive_more::Error)]
     pub enum TrySendError {
-        #[snafu(display("Could not send message, mailbox full"))]
+        #[display("Could not send message, mailbox full")]
         Full,
-        #[snafu(display("Could not send message, actor dead :("))]
+        #[display("Could not send message, actor dead :(")]
         Closed,
     }
 
     impl<T> From<channel::TrySendError<T>> for TrySendError {
         fn from(value: channel::TrySendError<T>) -> Self {
             match value {
-                channel::TrySendError::Full(_) => try_send_error::Full.build(),
-                channel::TrySendError::Closed(_) => try_send_error::Closed.build(),
+                channel::TrySendError::Full(_) => TrySendError::Full,
+                channel::TrySendError::Closed(_) => TrySendError::Closed,
             }
         }
     }
 
-    #[derive(Debug, Snafu)]
-    #[snafu(display("Could not receive reply, actor dead :("))]
+    #[derive(Debug, derive_more::Display, derive_more::Error)]
+    #[display("Could not receive reply, actor dead :(")]
     pub struct ReplyError;
 
     #[must_use = "this does nothing unless polled"]
@@ -1274,7 +1384,7 @@ mod adr_core {
         ) -> std::task::Poll<Self::Output> {
             let this = self.project();
             let reply = std::task::ready!(this.recv.poll(cx));
-            std::task::Poll::Ready(reply.ok().context(ReplySnafu))
+            std::task::Poll::Ready(reply.map_err(|_| ReplyError))
         }
     }
 }
@@ -1362,7 +1472,7 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 
     /// Wait for the actor to die.
-    pub async fn join(self) -> Result<(), WaitError<actor_error!(A)>>
+    pub async fn join(self) -> Result<(), JoinError<actor_error!(A)>>
     where
         actor_error!(A): Clone,
     {
@@ -1372,44 +1482,80 @@ impl<A: Actor, S: Scope> GenericAddress<A, S> {
     }
 
     /// Wait for the actor to die.
-    pub async fn join_steal(self) -> Result<(), WaitError<actor_error!(A)>> {
+    pub async fn join_steal(self) -> Result<(), JoinError<actor_error!(A)>> {
         let mut weak = self.downgrade();
         drop(self);
         weak.join_steal().await
     }
 
-    pub fn try_join(&mut self) -> Result<(), TryWaitError<actor_error!(A)>>
+    pub async fn join_report(self) -> Result<(), Report<JoinError, Mutable>>
+    where
+        actor_error!(A): IntoReportCollection<SendSync> + Clone,
+    {
+        let mut weak = self.downgrade();
+        drop(self);
+        weak.join_report().await
+    }
+
+    pub fn try_join(&mut self) -> Result<(), TryJoinError<actor_error!(A)>>
     where
         actor_error!(A): Clone,
     {
         self.try_join_with_strategy(|opt| opt.as_mut().cloned())
     }
 
-    pub fn try_join_steal(&mut self) -> Result<(), TryWaitError<actor_error!(A)>> {
+    pub fn try_join_steal(&mut self) -> Result<(), TryJoinError<actor_error!(A)>> {
         self.try_join_with_strategy(Option::take)
+    }
+
+    pub fn try_join_report(&mut self) -> Result<(), Report<TryJoinError, Mutable>>
+    where
+        actor_error!(A): IntoReportCollection<SendSync> + Clone,
+    {
+        self.try_join().map_err(|je| {
+            match je {
+                TryJoinError::Panicked => {
+                    // RANT: it wasn't possible to use the macro here for some reason! It refused to
+                    // understand that it should try to use T.
+                    Report::new_custom::<rootcause::handlers::Display>(TryJoinError::<()>::Panicked)
+                }
+                TryJoinError::Stolen => {
+                    Report::new_custom::<rootcause::handlers::Display>(TryJoinError::<()>::Stolen)
+                }
+                TryJoinError::StillAlive => Report::new_custom::<rootcause::handlers::Display>(
+                    TryJoinError::<()>::StillAlive,
+                ),
+                TryJoinError::Exited { source } => {
+                    let col: ReportCollection<_, _> = source.into_report_collection();
+                    col.context(TryJoinError::Exited { source: () })
+                }
+            }
+            .attach(format!("while try-joining on actor {}", self.core.id()))
+            .attach_span()
+        })
     }
 
     #[expect(clippy::type_complexity, reason = "you can be complex!")]
     fn try_join_with_strategy(
         &mut self,
         strategy: fn(&mut Option<actor_error!(A)>) -> Option<actor_error!(A)>,
-    ) -> Result<(), TryWaitError<actor_error!(A)>> {
+    ) -> Result<(), TryJoinError<actor_error!(A)>> {
         let dead = self.core.is_dead();
         match &*self.status.borrow() {
             // NOTE: this panic detection is not perfect, since the actor could panic in other
             // states than these. But this is the best that can be done by only looking at the
             // watch. I don't feel like it is worth it to include a Heart/rune or something to
             // detect whether any drop or watch::send panicked.
-            State::Initializing | State::Running if dead => try_wait_error::Panicked.fail(),
-            State::Initializing | State::Running => try_wait_error::StillAlive.fail(),
+            State::Initializing | State::Running if dead => Err(TryJoinError::Panicked),
+            State::Initializing | State::Running => Err(TryJoinError::StillAlive),
             State::Failed(e) => {
                 let mut guard = e.lock().unwrap();
                 let err = strategy(&mut guard);
 
                 if let Some(err) = err {
-                    Err(err).context(try_wait_error::Exited)
+                    Err(TryJoinError::Exited { source: err })
                 } else {
-                    try_wait_error::Stolen.fail()
+                    Err(TryJoinError::Stolen)
                 }
             }
             State::Exited => Ok(()),
@@ -1468,22 +1614,55 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
     // addresses.
 
     /// Wait for the actor to die.
-    pub async fn join(&mut self) -> Result<(), WaitError<actor_error!(A)>>
+    pub async fn join(&mut self) -> Result<(), JoinError<actor_error!(A)>>
     where
         actor_error!(A): Clone,
     {
         self.join_with_strategy(|opt| opt.as_mut().cloned()).await
     }
 
-    pub async fn join_steal(&mut self) -> Result<(), WaitError<actor_error!(A)>> {
+    pub async fn join_steal(&mut self) -> Result<(), JoinError<actor_error!(A)>> {
         self.join_with_strategy(Option::take).await
+    }
+
+    pub async fn join_report(&mut self) -> Result<(), Report<JoinError, Mutable>>
+    where
+        // RANT: the documentation recommends using Into<ReportCollection> instead and says that
+        // IntoReportCollection is more for internal usage, but the trait can convert from more
+        // types than Into can, like a single Report into a one element collection, so i have to use
+        // this "internal" trait to not miss out. It also seems like i got lucky here, since
+        // IntoReport is more strict than Into<Report>, it can't for example convert an arbitrary C
+        // into Dynamic just from the types, an into_dynamic is needed. But here in this case, the
+        // context isn't restricted to a specific type, it is arbitrary, which is fine since it is
+        // swallowed in .context(). I hope that more From implemenentations on ReportCollection are
+        // added in the future. rootcause=0.13.0
+        actor_error!(A): IntoReportCollection<SendSync> + Clone,
+    {
+        self.join().await.map_err(|je| {
+            match je {
+                JoinError::Panicked => {
+                    // RANT: it wasn't possible to use the macro here for some reason! It refused to
+                    // understand that it should try to use T.
+                    Report::new_custom::<rootcause::handlers::Display>(JoinError::<()>::Panicked)
+                }
+                JoinError::Stolen => {
+                    Report::new_custom::<rootcause::handlers::Display>(JoinError::<()>::Stolen)
+                }
+                JoinError::Exited { source } => {
+                    let col: ReportCollection<_, _> = source.into_report_collection();
+                    col.context(JoinError::Exited { source: () })
+                }
+            }
+            .attach(format!("while joining on actor id={}", self.core.id()))
+            .attach_span()
+        })
     }
 
     #[expect(clippy::type_complexity, reason = "you can be complex!")]
     async fn join_with_strategy(
         &mut self,
         strategy: fn(&mut Option<actor_error!(A)>) -> Option<actor_error!(A)>,
-    ) -> Result<(), WaitError<actor_error!(A)>> {
+    ) -> Result<(), JoinError<actor_error!(A)>> {
         let mut dead = false;
         loop {
             match &*self.status.borrow() {
@@ -1491,16 +1670,16 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
                 // states than these. But this is the best that can be done by only looking at the
                 // watch. I don't feel like it is worth it to include a Heart/rune or something to
                 // detect whether any drop or watch::send panicked.
-                State::Initializing | State::Running if dead => return wait_error::Panicked.fail(),
+                State::Initializing | State::Running if dead => return Err(JoinError::Panicked),
                 State::Initializing | State::Running => (),
                 State::Failed(e) => {
                     let mut guard = e.lock().unwrap();
                     let err = strategy(&mut guard);
 
                     return if let Some(err) = err {
-                        Err(err).context(wait_error::Exited)
+                        Err(JoinError::Exited { source: err })
                     } else {
-                        wait_error::Stolen.fail()
+                        Err(JoinError::Stolen)
                     };
                 }
                 State::Exited => return Ok(()),
@@ -2091,14 +2270,19 @@ mod secret_adr {
     };
     #[cfg(test)]
     use async_channel as channel;
+    use derive_more::Debug;
     use futures_core::future::LocalBoxFuture;
     use futures_util::FutureExt;
     use static_assertions::{assert_impl_all, assert_not_impl_any};
     use std::{marker::PhantomData, rc::Rc};
 
     // TODO: create a weak secret address?
+    // TODO: will the T type_name get included somewhere in the debug output?
+    #[derive(Debug)]
     pub struct SecretAddress<T> {
+        #[debug("Box<dyn>")]
         secret: Box<dyn SecretSend<T> + Send>,
+        #[debug(skip)] // TODO: is #[debug(ignore)] different?
         _scope: PhantomData<T>,
     }
     assert_not_impl_any!(SecretAddress<Rc<()>>: Send);
@@ -2332,8 +2516,8 @@ mod secret_adr {
 
         #[test]
         fn multi_send_can_send_both_halves() {
-            #[derive(Debug, Snafu, Clone)]
-            #[snafu(display("Counted this much {count}"))]
+            #[derive(Debug, Clone, derive_more::Display)]
+            #[display("Counted this much {count}")]
             struct Counter {
                 count: i32,
             }
@@ -2397,7 +2581,7 @@ mod secret_adr {
 
             let err = res.expect_err("should have returned an err");
             match err {
-                WaitError::Exited {
+                JoinError::Exited {
                     source: Counter { count },
                 } => assert_eq!(count, 12),
                 e => panic!("returned the wrong thing: {e:?}"),
@@ -2466,14 +2650,9 @@ async fn try_hatch<P: Hatchable>(
         }
         Err(err) => {
             drop(pre);
-            // TODO: should these be at the error level? The process could malfunction without the
-            // user ever knowing. There should always be a parent actor that catches these kinds of
-            // errors, and it's probably a mistake if it doesn't. It's probably fine to log error or
-            // warning here, probably.
-            trace!(error = &err as &dyn std::error::Error);
             if ctl
                 .exit_send
-                .send(State::Failed(Mutex::new(Some(err))))
+                .send(State::Failed(Mutex::new(Some(err.into()))))
                 .is_err()
             {
                 debug!("Failed to send failure, no receivers");
@@ -2504,13 +2683,12 @@ async fn enter<A: Actor>(
 async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
     trace!("Before");
     actor.leave(ctl).await;
-    let exit_reason = ctl.take_corpse().to_error();
+    let exit_reason = ctl.take_corpse().into_error();
     // NOTE: this is logged before all runes and stuff have dropped, but whatever
-    trace!("After");
+    trace!(is_err = exit_reason.is_some(), "After");
 
     match exit_reason {
         Some(err) => {
-            trace!(error = &err as &dyn std::error::Error);
             if ctl
                 .exit_send
                 .send(State::Failed(Mutex::new(Some(err))))
@@ -2579,12 +2757,20 @@ async fn main_loop<A: Actor>(
     .await;
 }
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
 pub enum StageError {
-    #[snafu(display("One or more actors panicked"))]
-    ActorPanic { source: PanicError },
-    #[snafu(display("Abruptly interrupted"))]
+    #[display("{count} actors panicked")]
+    ActorPanic { count: u32 },
+    #[display("Abruptly interrupted")]
     Interrupted,
+}
+
+impl From<PanicError> for StageError {
+    fn from(value: PanicError) -> Self {
+        Self::ActorPanic {
+            count: value.count(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2657,8 +2843,6 @@ impl Stage {
         )
     }
 
-    // TODO: remove this method and only use the adhoc one? There shouldn't be any need for this one
-    // to be public anymore?
     pub fn summon<P: Hatchable>(&self, actor: impl Spawnable<P>) -> Address<P::Actor> {
         self.actor_builder().spawn(actor)
     }
@@ -2667,22 +2851,34 @@ impl Stage {
         self.play_internal(|heart, ex, bomb| {
             block_on(ex.run(async {
                 match bomb.attach_future(heart.wait()).await {
-                    kill_switch::Tick::Tock(res) => res.context(ActorPanicSnafu),
-                    kill_switch::Tick::Boom => InterruptedSnafu.fail(),
+                    kill_switch::Tick::Tock(res) => res.map_err(Into::into),
+                    kill_switch::Tick::Boom => Err(StageError::Interrupted),
                 }
             }))
         })
     }
 
-    pub fn play_adhoc<F>(self, func: F) -> Result<(), Whatever>
+    pub fn play_adhoc<F>(self, func: F) -> Result<(), Report>
     where
         F: AsyncFnOnce(&mut PreControl<AdHoc>) -> Result<(), actor_error!(AdHoc)> + 'static,
     {
+        let mut failures = ReportCollection::<Dynamic>::new();
+
         let adr = self.summon(AdHocEgg::new(func)).downgrade();
-        self.play().whatever_context("Stage failed")?;
-        adr.take_error()
-            .map_or(Ok(()), Err)
-            .whatever_context("The adhoc actor failed")
+        if let Err(err) = self.play() {
+            failures.push(rootcause::report!(err).into());
+        }
+        if let Some(err) = adr.take_error() {
+            failures.extend(err);
+        }
+
+        if !failures.is_empty() {
+            return Err(failures
+                .context("AdHoc stage failed")
+                .into_dynamic()
+                .attach_span());
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2702,7 +2898,7 @@ impl Stage {
                 .wait()
                 .now_or_never()
                 .expect("all actors should be dead")
-                .context(ActorPanicSnafu)
+                .map_err(Into::into)
         })
         .expect("Actor(s) panicked");
     }
@@ -2721,7 +2917,7 @@ impl Stage {
 
         trace!(num_actors = heart.rune_count(), "Action!");
         let res = f(heart, &ex, sig_bomb);
-        trace!(?res, "Exited");
+        trace!(is_err = res.is_err(), "Exited");
 
         let executor = Rc::into_inner(ex).expect("There should only be one strong reference");
         drop(sig_guard);
@@ -2791,8 +2987,8 @@ mod tests {
         use crate::utils::thread_info_span;
         use tracing::info;
 
-        #[derive(Debug, Snafu, Clone, Default)]
-        #[snafu(display("I am not sendable between threads"))]
+        #[derive(Debug, Clone, Default, derive_more::Display)]
+        #[display("I am not sendable between threads")]
         struct NotSend {
             inner: Rc<()>,
         }
@@ -2869,6 +3065,7 @@ mod tests {
             let main_stage = Stage::new();
             let local_adr = main_stage.summon(LocalAlice);
             let remote_adr = local_adr.remote();
+            assert_not_impl_any!(RemoteAddress<LocalAlice>: Send);
 
             // NOTE: the whole test is to see if this compiles even though the retval is non-send.
             let _fut = remote_adr.send(5);
@@ -2885,6 +3082,7 @@ mod tests {
             // TODO: check that secretsend can't be sent to another thread if it's local
             // TODO: check that a remote address can't send local messages
             // TODO: check whether retval sendness affects a oneway send
+            // TODO: what about Aux?
         }
 
         #[test]

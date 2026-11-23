@@ -1,12 +1,9 @@
-use crate::{
-    actor::{Actor, Hatchable, MultiError, PreControl},
-    whatever::Whatever,
-};
+use crate::actor::{Actor, Hatchable, MultiReport, PreControl};
 
 pub struct AdHoc;
 
 impl Actor for AdHoc {
-    type Corpse = MultiError<Whatever>;
+    type Corpse = MultiReport;
     type Aux = ();
 }
 
@@ -35,7 +32,7 @@ where
     async fn hatch(
         self,
         ctl: &mut crate::actor::PreControl<'_, Self::Actor>,
-    ) -> Result<Self::Actor, crate::actor_error!(Self::Actor)> {
+    ) -> Result<Self::Actor, crate::actor_collect!(Self::Actor)> {
         tracing::debug!(closure.type = std::any::type_name::<F>());
         (self.func)(ctl).await?;
         Ok(AdHoc)

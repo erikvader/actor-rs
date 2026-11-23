@@ -12,6 +12,7 @@ async-process = "2.5.0"
 async-watch = "0.3.1"
 #NOTE: this has a tracing feature, which i assume just adds logs, which i don't want
 blocking = { version = "1.6.2", default-features = false }
+derive_more = { version = "2.1.1", features = ["debug", "display", "error", "from", "into"] }
 futures-core = "0.3.32"
 #NOTE: this includes so many various things i don't use, so i only include the features i
 #actually use
@@ -20,11 +21,11 @@ libc = "0.2.191"
 #NOTE: this one has no default features, so i have to activate these here
 oneshot = { version = "0.2.1", features = ["async", "std"] }
 pin-project = "1.1.13"
+rootcause = "0.13.0"
+rootcause-tracing = "0.13.0"
 signal-hook = "0.4.4"
-snafu = "0.9.0"
 static_assertions = "1.1.0"
 tracing = "0.1.44"
-tracing-error = "0.2.1"
 
 [dev-dependencies]
 anstream = "1.0.0"
@@ -54,3 +55,4 @@ unnameable_types = "warn"
 [lints.clippy]
 #NOTE: I want all of them documented, all usages of unsafe must explain themselves
 undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

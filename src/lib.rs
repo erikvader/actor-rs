@@ -14,7 +14,9 @@ mod kill_switch;
 pub mod signals;
 mod stream_utils;
 
-pub mod whatever; // TODO: should this really be here?
+// NOTE: this will be part of the public API
+pub use rootcause;
+pub use rootcause_tracing;
 
 #[doc(hidden)]
 mod private {
