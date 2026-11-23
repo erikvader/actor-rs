@@ -8,6 +8,7 @@ pub mod utils;
 pub mod actor;
 pub mod actors;
 pub mod deferred_span;
+pub mod fmt_utils;
 mod heart;
 mod kill_switch;
 pub mod signals;

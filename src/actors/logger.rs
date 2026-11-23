@@ -18,15 +18,3 @@ impl<T: std::fmt::Debug> Receive<T> for Logger {
         tracing::info!("{msg:?}");
     }
 }
-
-#[repr(transparent)]
-pub struct Display<T: std::fmt::Display>(T);
-
-impl<T> std::fmt::Debug for Display<T>
-where
-    T: std::fmt::Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
