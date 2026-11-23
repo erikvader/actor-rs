@@ -89,11 +89,15 @@ macro_rules! actor_collect {
 pub trait Actor: Sized + 'static {
     // RANT: these, annoyingly, can't have default values.
     // https://github.com/rust-lang/rust/issues/29661
+    // NOTE: Whether this is std::error::Error, Clone, Send etc. is optional. The different address
+    // types will just have different capabilities, this is on purpose.
     type Corpse: Corpse + Default;
     // NOTE: I don't know it it's a mistake to initialize these with default instead of a custom
     // method on the hatchable trait, but i want to do it like this for simplicity, and I don't
     // think a more complicated init is needed.
-    // NOTE: These must be clone and send so they don't interfere with the requirements of AdrCore
+    // NOTE: This must be clone and Send so it don't interfere with the requirements of AdrCore. The
+    // Send requirement can probably be removed to make the sendness of SecretAddress optional, not
+    // sure if it is worth it.
     type Aux: Send + Clone + Default;
 
     #[expect(
@@ -894,9 +898,8 @@ mod corpse {
         // NOTE: This will always be SendSync, never Local. It is way to annoying to try and support
         // both modes everywhere, a lot of trait bounds on ObjectMarkerFor is needed, like
         // everything that ever touches a Report. I also think i can survive with Reports only
-        // supporting send+sync types. Another weirdness is that every actor has to decide whether
-        // their Reports should be local or not. I could maybe force the error to be Send in the
-        // actor trait, like for Aux, but i dunno.
+        // supporting send+sync types.
+        // TODO: support local reports as well
         errors: ReportCollection<C>,
     }
 
@@ -1109,6 +1112,7 @@ mod adr_core {
     // priority channel, this is to prevent that import channel to be accidentaly flooded by low
     // priority messages. I dont see the harm in sending high prio messages on the low prio
     // messages, except for that it was probably a mistake?
+    // TODO: create a custom priority channel
     pub(super) struct AdrCore<A: Actor> {
         sender: channel::Sender<ErasedDeliverable<A>>,
         id: Id,
@@ -1697,6 +1701,8 @@ impl<A: Actor, S: Scope> GenericWeakAddress<A, S> {
 }
 
 impl<A: Actor> Address<A> {
+    // NOTE: it is possible to create a remote address that itself isn't Send, for example if the
+    // A::Error isn't Send. This is on purpose.
     pub fn remote(&self) -> RemoteAddress<A> {
         let c = self.core.clone();
         let b = self.status.clone();
@@ -2069,7 +2075,9 @@ pub mod bg_job {
             let fut = {
                 let span = span.clone();
                 async move {
+                    tracing::trace!("Job started");
                     let output = self.future.await;
+                    tracing::trace!("Job future done, sending sync point");
                     let deliv = SyncPointDeliv {
                         span,
                         output,
@@ -2114,7 +2122,9 @@ pub mod bg_job {
         {
             let span = self.span.create_or(ctl.actor_span());
             let fut = async {
+                tracing::trace!("Job started");
                 let output: () = self.future.await;
+                tracing::trace!("Job future done, no sync point");
                 // NOTE: () is a zero-sized type, so the box is not actually allocating anything
                 let erased: ErasedLocalDeliverable<A> = Box::new(output);
                 erased
@@ -2149,7 +2159,9 @@ pub mod bg_job {
         ) -> LocalBoxFuture<'a, ()> {
             let Self { span, output, sync } = *self;
             async {
+                tracing::trace!("Job sync point started");
                 sync(actor, ctl, output).await;
+                tracing::trace!("Job sync point done");
             }
             .instrument(span)
             .boxed_local()
@@ -2606,10 +2618,14 @@ async fn actor_main<P: Hatchable>(
     // receiver also has dropped, for example. Also, the control needs to be dropped last to make
     // sure the rune that marks this actor as alive to the stage is dropped as late as possible. The
     // actor/egg should be dropped first of these so the actor drop itself is visible to other
-    // thread when they see that it is dead.
+    // thread when they see that it is dead. I'm also assuming that any drops that writes to atomic
+    // variables are using Release ordering, or better, to make sure other threads can see the
+    // previous drops when observing a later drop.
     let mut ctl = ctl;
     let mut rcv = pin!(rcv);
     let egg = egg;
+
+    tracing::trace!("Actor initializing");
 
     let Some(mut actor) = try_hatch(&mut ctl, egg, aux, &home_adr).await else {
         return;
@@ -2634,12 +2650,13 @@ async fn try_hatch<P: Hatchable>(
     egg: P,
     aux: <P::Actor as Actor>::Aux,
     // NOTE: to make sure the address is alive during hatch
+    // TODO: is this needed with my custom priority queue?
     _home_adr: &Address<P::Actor>,
 ) -> Option<P::Actor> {
     let mut pre = PreControl::new(ctl, aux);
     trace!("Before");
     let hatch_res = egg.hatch(&mut pre).await;
-    trace!("After");
+    trace!(is_err = hatch_res.is_err(), "After");
 
     match hatch_res {
         Ok(actor) => {
@@ -2649,13 +2666,19 @@ async fn try_hatch<P: Hatchable>(
             Some(actor)
         }
         Err(err) => {
+            tracing::trace!("Transitioning to Failed state");
             drop(pre);
             if ctl
                 .exit_send
                 .send(State::Failed(Mutex::new(Some(err.into()))))
                 .is_err()
             {
-                debug!("Failed to send failure, no receivers");
+                // NOTE: i find it okay here to log an error, since some potentially valuable
+                // debugging and crash info disappeared into the aether, this is certainly a
+                // mistake.
+                tracing::error!(
+                    "An actor could'nt hatch due to an error, but there are not addresses left, so the error got dropped"
+                );
             }
             None
         }
@@ -2676,6 +2699,7 @@ async fn enter<A: Actor>(
     trace!("After");
 
     // TODO: should this be sent before or after enter?
+    tracing::trace!("Transitioning to running state");
     let _: Result<_, _> = ctl.exit_send.send(State::Running);
 }
 
@@ -2689,15 +2713,22 @@ async fn leave<A: Actor>(ctl: &mut Control<A>, actor: A) {
 
     match exit_reason {
         Some(err) => {
+            tracing::trace!("Transitioning to failed state");
             if ctl
                 .exit_send
                 .send(State::Failed(Mutex::new(Some(err))))
                 .is_err()
             {
-                debug!("Failed to send failure, no receivers");
+                // NOTE: i find it okay here to log an error, since some potentially valuable
+                // debugging and crash info disappeared into the aether, this is certainly a
+                // mistake.
+                tracing::error!(
+                    "An actor exited due to an error, but there are not addresses left, so the error got dropped"
+                );
             }
         }
         None => {
+            tracing::trace!("Transitioning to exited state");
             let _: Result<_, _> = ctl.exit_send.send(State::Exited);
         }
     }
